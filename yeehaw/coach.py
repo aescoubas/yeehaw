@@ -8,13 +8,23 @@ from pathlib import Path
 from . import db
 from .agents import resolve_command
 from .git_repo import GitRepoInfo
-from .tmux import attach_session, ensure_session, ensure_window, send_text
+from .tmux import attach_session, ensure_session, ensure_window, list_windows, send_text
 
 
 def _safe_session_name(prefix: str, stem: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", stem.strip()).strip("-") or "session"
     suffix = uuid.uuid4().hex[:6]
     return f"{prefix}-{slug}-{suffix}"[:60]
+
+
+def _ensure_window_alive(session_name: str, window_name: str, agent: str) -> None:
+    windows = set(list_windows(session_name))
+    if window_name in windows:
+        return
+    raise RuntimeError(
+        f"Agent '{agent}' exited before initialization in session '{session_name}'. "
+        "Check agent CLI installation/auth configuration."
+    )
 
 
 def _roadmap_coach_prompt(project_name: str, project_root: str, output_path: str, guidelines: str) -> str:
@@ -101,6 +111,7 @@ def start_project_coach(
     target = f"{session_name}:project-coach.0"
 
     time.sleep(warmup_seconds)
+    _ensure_window_alive(session_name, "project-coach", agent)
 
     out_path = Path(guidelines_output)
     if not out_path.is_absolute():
@@ -113,6 +124,8 @@ def start_project_coach(
         allow_non_git=allow_non_git,
     )
     send_text(target, prompt, press_enter=True)
+    time.sleep(0.25)
+    _ensure_window_alive(session_name, "project-coach", agent)
 
     if attach:
         attach_session(session_name)
@@ -143,6 +156,7 @@ def start_roadmap_coach(
     target = f"{session_name}:coach.0"
 
     time.sleep(warmup_seconds)
+    _ensure_window_alive(session_name, "coach", agent)
 
     out_path = Path(output_path)
     if not out_path.is_absolute():
@@ -155,6 +169,8 @@ def start_roadmap_coach(
         guidelines=str(project["guidelines"]),
     )
     send_text(target, prompt, press_enter=True)
+    time.sleep(0.25)
+    _ensure_window_alive(session_name, "coach", agent)
 
     if attach:
         attach_session(session_name)
