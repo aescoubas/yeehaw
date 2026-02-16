@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yeehaw"
+version = "0.1.0"
+description = "tmux-based CLI agent harness with roadmap orchestration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+yeehaw = "yeehaw.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["yeehaw*"]
