@@ -83,6 +83,10 @@ Dashboard controls:
 - `Tab`: switch focus between `Projects` and `Runs`
 - `Enter` on `Projects`: apply project selection and jump to `Runs`
 - `n`: open `Create Run` modal for selected project (roadmap path + agent)
+- `w`: run guided workflow for selected project:
+  - launch interactive roadmap coach session in tmux
+  - validate generated roadmap when you detach
+  - confirm handoff and launch coding run
 - `j` / `k` or arrows: move selection in focused panel
 - `PgUp` / `PgDn`: jump selection in focused panel
 - `g` / `G`: first/last run

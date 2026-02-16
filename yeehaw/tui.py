@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from . import db
+from .coach import start_roadmap_coach
+from .roadmap import RoadmapValidationError, load_roadmap
 
 
 FOCUS_PROJECTS = "projects"
@@ -189,6 +191,15 @@ def _default_roadmap_path(project_root: str) -> str:
     return "roadmap.md"
 
 
+def _resolve_roadmap_path(project_root: str, roadmap_path_input: str) -> Path:
+    roadmap_path = Path(roadmap_path_input).expanduser()
+    if not roadmap_path.is_absolute():
+        roadmap_path = (Path(project_root) / roadmap_path).resolve()
+    else:
+        roadmap_path = roadmap_path.resolve()
+    return roadmap_path
+
+
 def _prompt_new_run_modal(
     stdscr: curses.window,
     palette: dict[str, int],
@@ -288,6 +299,209 @@ def _prompt_new_run_modal(
             pass
 
 
+def _prompt_workflow_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    project_name: str,
+    roadmap_default: str,
+    coach_agent_default: str = "codex",
+    coding_agent_default: str = "codex",
+) -> tuple[str, str, str] | None:
+    values = [roadmap_default, coach_agent_default, coding_agent_default]
+    labels = ["Roadmap path", "Coach agent", "Coding agent"]
+    active = 0
+    error_message = ""
+
+    stdscr.nodelay(False)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(88, len(project_name) + 32), max(30, w - 4))
+            box_h = 13
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+
+            panel = _new_panel(stdscr, y, x, box_h, box_w, "Roadmap Workflow", palette["border"])
+            if panel is None:
+                return None
+            panel.keypad(True)
+
+            _safe_add(panel, 1, 2, f"Project: {project_name}", palette["info"])
+            _safe_add(panel, 10, 2, "Tab/Up/Down switch field | Enter continue | Esc cancel", palette["muted"])
+
+            if error_message:
+                _safe_add(panel, 11, 2, error_message, palette["failed"])
+
+            for i, label in enumerate(labels):
+                y_field = 3 + (i * 2)
+                _safe_add(panel, y_field, 2, f"{label}:", palette["muted"])
+                field_x = 18
+                field_w = max(12, box_w - field_x - 3)
+                attr = palette["selected"] if i == active else palette["info"]
+                _safe_add(panel, y_field, field_x, " " * field_w, attr)
+                _safe_add(panel, y_field, field_x, values[i], attr)
+
+                if i == active:
+                    cursor_x = field_x + min(len(values[i]), max(0, field_w - 1))
+                    try:
+                        panel.move(y_field, cursor_x)
+                    except curses.error:
+                        pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+
+            if key in (27,):  # Esc
+                return None
+            if key in (9, curses.KEY_DOWN):
+                active = (active + 1) % len(values)
+                error_message = ""
+                continue
+            if key == curses.KEY_UP:
+                active = (active - 1) % len(values)
+                error_message = ""
+                continue
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                roadmap = values[0].strip()
+                coach_agent = values[1].strip()
+                coding_agent = values[2].strip()
+                if not roadmap:
+                    error_message = "Roadmap path cannot be empty."
+                    active = 0
+                    continue
+                if not coach_agent:
+                    error_message = "Coach agent cannot be empty."
+                    active = 1
+                    continue
+                if not coding_agent:
+                    error_message = "Coding agent cannot be empty."
+                    active = 2
+                    continue
+                return roadmap, coach_agent, coding_agent
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                values[active] = values[active][:-1]
+                error_message = ""
+                continue
+            if key == 21:  # Ctrl+U
+                values[active] = ""
+                error_message = ""
+                continue
+            if 32 <= key <= 126:
+                values[active] += chr(key)
+                error_message = ""
+                continue
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+def _prompt_confirm_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    title: str,
+    lines: list[str],
+    hint: str = "Enter confirm | Esc cancel",
+) -> bool:
+    stdscr.nodelay(False)
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(80, max((len(line) for line in lines), default=0) + 8), max(30, w - 4))
+            box_h = max(8, len(lines) + 5)
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+
+            panel = _new_panel(stdscr, y, x, box_h, box_w, title, palette["border"])
+            if panel is None:
+                return False
+            panel.keypad(True)
+
+            for idx, line in enumerate(lines):
+                _safe_add(panel, 1 + idx, 2, line, palette["info"])
+            _safe_add(panel, box_h - 2, 2, hint, palette["muted"])
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+
+            if key in (27, ord("n"), ord("N")):
+                return False
+            if key in (10, 13, curses.KEY_ENTER, 343, ord("y"), ord("Y")):
+                return True
+    finally:
+        stdscr.nodelay(True)
+
+
+def _with_curses_paused(stdscr: curses.window, fn):
+    try:
+        curses.def_prog_mode()
+        curses.endwin()
+    except curses.error:
+        pass
+    try:
+        return fn()
+    finally:
+        try:
+            curses.reset_prog_mode()
+        except curses.error:
+            pass
+        try:
+            stdscr.erase()
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+
+def _start_and_validate_workflow(
+    stdscr: curses.window,
+    resolved_db: Path,
+    project_name: str,
+    project_root: str,
+    roadmap_path_input: str,
+    coach_agent: str,
+    coding_agent: str,
+) -> tuple[bool, str, str]:
+    roadmap_path = _resolve_roadmap_path(project_root, roadmap_path_input)
+
+    try:
+        session_name = _with_curses_paused(
+            stdscr,
+            lambda: start_roadmap_coach(
+                project_name=project_name,
+                output_path=roadmap_path,
+                agent=coach_agent,
+                db_path=resolved_db,
+                attach=True,
+            ),
+        )
+    except Exception as exc:
+        return False, f"Roadmap coach failed: {exc}", str(roadmap_path)
+
+    if not roadmap_path.exists():
+        return False, f"Roadmap not found after coach session {session_name}: {roadmap_path}", str(roadmap_path)
+
+    try:
+        roadmap = load_roadmap(roadmap_path, default_agent=coding_agent)
+    except RoadmapValidationError as exc:
+        return False, f"Roadmap validation failed: {exc}", str(roadmap_path)
+
+    stage_count = sum(len(track.stages) for track in roadmap.tracks)
+    return (
+        True,
+        f"Validated roadmap '{roadmap.name}' ({len(roadmap.tracks)} tracks, {stage_count} stages).",
+        str(roadmap_path),
+    )
+
+
 def _launch_run_in_background(
     resolved_db: Path,
     project_name: str,
@@ -295,11 +509,7 @@ def _launch_run_in_background(
     roadmap_path_input: str,
     default_agent: str,
 ) -> tuple[bool, str]:
-    roadmap_path = Path(roadmap_path_input).expanduser()
-    if not roadmap_path.is_absolute():
-        roadmap_path = (Path(project_root) / roadmap_path).resolve()
-    else:
-        roadmap_path = roadmap_path.resolve()
+    roadmap_path = _resolve_roadmap_path(project_root, roadmap_path_input)
 
     if not roadmap_path.exists():
         return False, f"Roadmap not found: {roadmap_path}"
@@ -419,7 +629,13 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
             if h < 20 or w < 110:
                 _safe_add(stdscr, 0, 0, "Terminal too small for dashboard. Resize to at least 110x20.", palette["failed"])
-                _safe_add(stdscr, 2, 0, "Controls: Tab switch focus | n new run | q quit | r refresh", palette["muted"])
+                _safe_add(
+                    stdscr,
+                    2,
+                    0,
+                    "Controls: Tab switch focus | n new run | w roadmap workflow | q quit | r refresh",
+                    palette["muted"],
+                )
                 stdscr.refresh()
                 key = stdscr.getch()
                 if key in (ord("q"), ord("Q")):
@@ -475,7 +691,7 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                     2,
                     (
                         f"DB: {resolved_db} | Filter: {current_project_label} | Updated: {time.strftime('%H:%M:%S')} | "
-                        "Tab switch focus  j/k move  Enter apply  n new run  r refresh  q quit"
+                        "Tab switch focus  j/k move  Enter apply  n new run  w roadmap workflow  r refresh  q quit"
                     ),
                     palette["header"],
                 )
@@ -644,6 +860,76 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                     default_agent=agent_value,
                 )
                 ui_message = msg
+                ui_message_attr = palette["running"] if success else palette["failed"]
+                if success:
+                    focus = FOCUS_RUNS
+                    selected_run_idx = 0
+                    force_refresh = True
+                continue
+
+            if key in (ord("w"), ord("W")):
+                if selected_project_idx == 0 or not projects:
+                    ui_message = "Select a specific project first to run roadmap workflow."
+                    ui_message_attr = palette["warn"]
+                    continue
+
+                project = projects[selected_project_idx - 1]
+                project_name = str(project["name"])
+                project_root = str(project["root_path"])
+
+                roadmap_default = _default_roadmap_path(project_root)
+                workflow_result = _prompt_workflow_modal(
+                    stdscr=stdscr,
+                    palette=palette,
+                    project_name=project_name,
+                    roadmap_default=roadmap_default,
+                    coach_agent_default="codex",
+                    coding_agent_default="codex",
+                )
+                if workflow_result is None:
+                    ui_message = "Roadmap workflow cancelled."
+                    ui_message_attr = palette["muted"]
+                    continue
+
+                roadmap_value, coach_agent, coding_agent = workflow_result
+                validated, msg, resolved_roadmap = _start_and_validate_workflow(
+                    stdscr=stdscr,
+                    resolved_db=resolved_db,
+                    project_name=project_name,
+                    project_root=project_root,
+                    roadmap_path_input=roadmap_value,
+                    coach_agent=coach_agent,
+                    coding_agent=coding_agent,
+                )
+                if not validated:
+                    ui_message = msg
+                    ui_message_attr = palette["failed"]
+                    continue
+
+                should_launch = _prompt_confirm_modal(
+                    stdscr=stdscr,
+                    palette=palette,
+                    title="Roadmap Validated",
+                    lines=[
+                        msg,
+                        f"Roadmap path: {resolved_roadmap}",
+                        f"Coding agent: {coding_agent}",
+                    ],
+                    hint="Enter hand off to coding agent | Esc cancel",
+                )
+                if not should_launch:
+                    ui_message = "Roadmap validated; handoff cancelled."
+                    ui_message_attr = palette["warn"]
+                    continue
+
+                success, launch_msg = _launch_run_in_background(
+                    resolved_db=resolved_db,
+                    project_name=project_name,
+                    project_root=project_root,
+                    roadmap_path_input=resolved_roadmap,
+                    default_agent=coding_agent,
+                )
+                ui_message = launch_msg
                 ui_message_attr = palette["running"] if success else palette["failed"]
                 if success:
                     focus = FOCUS_RUNS
