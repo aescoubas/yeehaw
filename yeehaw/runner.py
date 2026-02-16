@@ -337,10 +337,6 @@ def run_roadmap(
                     db.add_event(conn, run_id, "info", "Run completed successfully")
                 break
 
-            if active_count == 0 and any_awaiting:
-                db.set_run_status(conn, run_id, "awaiting_input", finished=False)
-                break
-
             time.sleep(max(poll_seconds, 0.5))
 
     except (TmuxError, Exception) as exc:

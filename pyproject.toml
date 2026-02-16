@@ -12,8 +12,18 @@ dependencies = [
   "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
 [project.scripts]
 yeehaw = "yeehaw.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["yeehaw*"]
+
+[tool.pytest.ini_options]
+addopts = "-q --cov=yeehaw --cov-report=term-missing --cov-fail-under=100"
+testpaths = ["tests"]

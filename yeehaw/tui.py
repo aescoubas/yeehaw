@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import curses
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from . import db
+
+
+FOCUS_PROJECTS = "projects"
+FOCUS_RUNS = "runs"
 
 
 def _trim(text: str, width: int) -> str:
@@ -52,6 +59,7 @@ def _init_colors() -> dict[str, int]:
             "header": curses.A_BOLD,
             "border": curses.A_NORMAL,
             "selected": curses.A_REVERSE,
+            "focused": curses.A_BOLD,
             "muted": curses.A_DIM,
             "running": curses.A_BOLD,
             "awaiting_input": curses.A_BOLD,
@@ -72,11 +80,13 @@ def _init_colors() -> dict[str, int]:
     curses.init_pair(6, curses.COLOR_RED, -1)                    # failed / error
     curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)   # selected row
     curses.init_pair(8, curses.COLOR_WHITE, -1)                  # info/muted
+    curses.init_pair(9, curses.COLOR_MAGENTA, -1)                # focused panel title
 
     return {
         "header": curses.color_pair(1) | curses.A_BOLD,
         "border": curses.color_pair(2),
         "selected": curses.color_pair(7) | curses.A_BOLD,
+        "focused": curses.color_pair(9) | curses.A_BOLD,
         "muted": curses.color_pair(8) | curses.A_DIM,
         "running": curses.color_pair(3) | curses.A_BOLD,
         "awaiting_input": curses.color_pair(4) | curses.A_BOLD,
@@ -120,6 +130,233 @@ def _fetch_status_counts(conn) -> dict[str, int]:
     return counts
 
 
+def _fetch_runs(conn, project_name: str | None, limit: int = 200) -> list[Any]:
+    if project_name is None:
+        return conn.execute(
+            """
+            SELECT r.id, p.name AS project_name, rm.name AS roadmap_name,
+                   r.status, r.tmux_session, r.created_at, r.updated_at, r.finished_at
+            FROM runs r
+            JOIN projects p ON p.id = r.project_id
+            JOIN roadmaps rm ON rm.id = r.roadmap_id
+            ORDER BY r.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return conn.execute(
+        """
+        SELECT r.id, p.name AS project_name, rm.name AS roadmap_name,
+               r.status, r.tmux_session, r.created_at, r.updated_at, r.finished_at
+        FROM runs r
+        JOIN projects p ON p.id = r.project_id
+        JOIN roadmaps rm ON rm.id = r.roadmap_id
+        WHERE p.name = ?
+        ORDER BY r.id DESC
+        LIMIT ?
+        """,
+        (project_name, limit),
+    ).fetchall()
+
+
+def _fetch_run_counts_per_project(conn) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT p.name AS project_name, COUNT(r.id) AS c
+        FROM projects p
+        LEFT JOIN runs r ON r.project_id = p.id
+        GROUP BY p.id
+        """
+    ).fetchall()
+    return {str(r["project_name"]): int(r["c"]) for r in rows}
+
+
+def _window_start(selected_idx: int, total: int, max_rows: int) -> int:
+    if total <= max_rows:
+        return 0
+    start = selected_idx - max_rows // 2
+    start = max(0, start)
+    return min(start, total - max_rows)
+
+
+def _default_roadmap_path(project_root: str) -> str:
+    root = Path(project_root)
+    candidates = ("roadmap.md", "roadmap.yaml", "roadmap.yml")
+    for candidate in candidates:
+        if (root / candidate).exists():
+            return candidate
+    return "roadmap.md"
+
+
+def _prompt_new_run_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    project_name: str,
+    roadmap_default: str,
+    agent_default: str = "codex",
+) -> tuple[str, str] | None:
+    values = [roadmap_default, agent_default]
+    labels = ["Roadmap path", "Default agent"]
+    active = 0
+    error_message = ""
+
+    stdscr.nodelay(False)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(84, len(project_name) + 28), max(30, w - 4))
+            box_h = 11
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+
+            panel = _new_panel(stdscr, y, x, box_h, box_w, "Create Run", palette["border"])
+            if panel is None:
+                return None
+            panel.keypad(True)
+
+            _safe_add(panel, 1, 2, f"Project: {project_name}", palette["info"])
+            _safe_add(panel, 8, 2, "Tab/Up/Down switch field | Enter launch | Esc cancel", palette["muted"])
+
+            if error_message:
+                _safe_add(panel, 9, 2, error_message, palette["failed"])
+
+            for i, label in enumerate(labels):
+                y_field = 3 + (i * 2)
+                _safe_add(panel, y_field, 2, f"{label}:", palette["muted"])
+                field_x = 18
+                field_w = max(12, box_w - field_x - 3)
+                attr = palette["selected"] if i == active else palette["info"]
+                _safe_add(panel, y_field, field_x, " " * field_w, attr)
+                _safe_add(panel, y_field, field_x, values[i], attr)
+
+                if i == active:
+                    cursor_x = field_x + min(len(values[i]), max(0, field_w - 1))
+                    try:
+                        panel.move(y_field, cursor_x)
+                    except curses.error:
+                        pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+
+            if key in (27,):  # Esc
+                return None
+            if key in (9, curses.KEY_DOWN):
+                active = (active + 1) % len(values)
+                error_message = ""
+                continue
+            if key == curses.KEY_UP:
+                active = (active - 1) % len(values)
+                error_message = ""
+                continue
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                roadmap = values[0].strip()
+                agent = values[1].strip()
+                if not roadmap:
+                    error_message = "Roadmap path cannot be empty."
+                    active = 0
+                    continue
+                if not agent:
+                    error_message = "Default agent cannot be empty."
+                    active = 1
+                    continue
+                return roadmap, agent
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                values[active] = values[active][:-1]
+                error_message = ""
+                continue
+            if key == 21:  # Ctrl+U
+                values[active] = ""
+                error_message = ""
+                continue
+            if 32 <= key <= 126:
+                values[active] += chr(key)
+                error_message = ""
+                continue
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+def _launch_run_in_background(
+    resolved_db: Path,
+    project_name: str,
+    project_root: str,
+    roadmap_path_input: str,
+    default_agent: str,
+) -> tuple[bool, str]:
+    roadmap_path = Path(roadmap_path_input).expanduser()
+    if not roadmap_path.is_absolute():
+        roadmap_path = (Path(project_root) / roadmap_path).resolve()
+    else:
+        roadmap_path = roadmap_path.resolve()
+
+    if not roadmap_path.exists():
+        return False, f"Roadmap not found: {roadmap_path}"
+
+    package_root = Path(__file__).resolve().parent.parent
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{package_root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(package_root)
+    )
+
+    log_dir = Path(project_root) / ".yeehaw"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "run-launch.log"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "yeehaw.cli",
+        "--db",
+        str(resolved_db),
+        "run",
+        "start",
+        "--project",
+        project_name,
+        "--roadmap",
+        str(roadmap_path),
+        "--default-agent",
+        default_agent,
+    ]
+    cmd_line = " ".join(cmd)
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Launch run\n")
+            log_file.write(f"project={project_name}\n")
+            log_file.write(f"project_root={project_root}\n")
+            log_file.write(f"roadmap={roadmap_path}\n")
+            log_file.write(f"cmd={cmd_line}\n\n")
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=project_root,
+                stdout=log_file,
+                stderr=log_file,
+                env=env,
+                start_new_session=True,
+            )
+        time.sleep(0.35)
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            return False, f"Run launch failed (exit {rc}). See {log_path}"
+    except Exception as exc:
+        return False, f"Failed to launch run: {exc}"
+
+    return True, f"Launched run for {project_name} (pid {proc.pid})"
+
+
 def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> None:
     resolved_db = Path(db_path).resolve() if db_path else db.default_db_path()
     conn = db.connect(resolved_db)
@@ -127,31 +364,47 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
     def _draw(stdscr: curses.window) -> None:
         curses.curs_set(0)
         stdscr.nodelay(True)
+        stdscr.keypad(True)
         palette = _init_colors()
 
-        selected_idx = 0
+        selected_project_idx = 0
+        selected_run_idx = 0
+        focus = FOCUS_PROJECTS
+
         force_refresh = True
         last_refresh = 0.0
 
+        projects: list[Any] = []
         runs: list[Any] = []
         tracks: list[Any] = []
         events: list[Any] = []
+        run_counts_by_project: dict[str, int] = {}
         status_counts: dict[str, int] = {}
-        project_count = 0
         total_runs = 0
+        ui_message = ""
+        ui_message_attr = palette["muted"]
 
         while True:
             now = time.monotonic()
             if force_refresh or now - last_refresh >= max(0.2, refresh_seconds):
-                runs = db.latest_runs(conn, limit=50)
-                selected_idx = max(0, min(selected_idx, len(runs) - 1)) if runs else 0
+                projects = db.list_projects(conn)
+                run_counts_by_project = _fetch_run_counts_per_project(conn)
 
-                project_count = int(conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()["c"])
-                total_runs = int(conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"])
+                project_options_count = len(projects) + 1  # +1 = All Projects
+                selected_project_idx = max(0, min(selected_project_idx, project_options_count - 1))
+
+                selected_project_name = None
+                if selected_project_idx > 0 and projects:
+                    selected_project_name = str(projects[selected_project_idx - 1]["name"])
+
+                runs = _fetch_runs(conn, selected_project_name, limit=200)
+                selected_run_idx = max(0, min(selected_run_idx, len(runs) - 1)) if runs else 0
+
                 status_counts = _fetch_status_counts(conn)
+                total_runs = int(conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"])
 
                 if runs:
-                    selected_run_id = int(runs[selected_idx]["id"])
+                    selected_run_id = int(runs[selected_run_idx]["id"])
                     tracks = db.run_tracks(conn, selected_run_id)
                     events = db.run_events(conn, selected_run_id, limit=60)
                 else:
@@ -164,9 +417,9 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
             h, w = stdscr.getmaxyx()
             stdscr.erase()
 
-            if h < 20 or w < 90:
-                _safe_add(stdscr, 0, 0, "Terminal too small for dashboard. Resize to at least 90x20.", palette["failed"])
-                _safe_add(stdscr, 2, 0, "Controls: q quit | r refresh", palette["muted"])
+            if h < 20 or w < 110:
+                _safe_add(stdscr, 0, 0, "Terminal too small for dashboard. Resize to at least 110x20.", palette["failed"])
+                _safe_add(stdscr, 2, 0, "Controls: Tab switch focus | n new run | q quit | r refresh", palette["muted"])
                 stdscr.refresh()
                 key = stdscr.getch()
                 if key in (ord("q"), ord("Q")):
@@ -178,43 +431,58 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
             header_h = 3
             stats_h = 5
-            footer_h = 2
+            footer_h = 3
             body_y = header_h + stats_h
             body_h = h - body_y - footer_h
 
-            left_w = int(w * 0.46)
-            left_w = max(40, min(left_w, w - 36))
-            right_w = w - left_w
+            projects_w = max(28, int(w * 0.24))
+            runs_w = max(40, int(w * 0.34))
+            right_w = w - projects_w - runs_w
 
             tracks_h = max(8, body_h // 2)
             events_h = body_h - tracks_h
 
+            projects_title = "Projects"
+            runs_title = "Runs"
+            if focus == FOCUS_PROJECTS:
+                projects_title += " [FOCUS]"
+            else:
+                runs_title += " [FOCUS]"
+
             header = _new_panel(stdscr, 0, 0, header_h, w, "YEEHAW DASHBOARD", palette["border"])
             stats = _new_panel(stdscr, header_h, 0, stats_h, w, "System", palette["border"])
-            runs_panel = _new_panel(stdscr, body_y, 0, body_h, left_w, "Runs", palette["border"])
-            tracks_panel = _new_panel(stdscr, body_y, left_w, tracks_h, right_w, "Tracks (Selected Run)", palette["border"])
+            projects_panel = _new_panel(stdscr, body_y, 0, body_h, projects_w, projects_title, palette["border"])
+            runs_panel = _new_panel(stdscr, body_y, projects_w, body_h, runs_w, runs_title, palette["border"])
+            tracks_panel = _new_panel(stdscr, body_y, projects_w + runs_w, tracks_h, right_w, "Tracks", palette["border"])
             events_panel = _new_panel(
                 stdscr,
                 body_y + tracks_h,
-                left_w,
+                projects_w + runs_w,
                 events_h,
                 right_w,
-                "Recent Events (Selected Run)",
+                "Events",
                 palette["border"],
             )
 
             if header:
+                current_project_label = "All Projects"
+                if selected_project_idx > 0 and projects:
+                    current_project_label = str(projects[selected_project_idx - 1]["name"])
+
                 _safe_add(
                     header,
                     1,
                     2,
-                    f"DB: {resolved_db} | Updated: {time.strftime('%H:%M:%S')} | q quit  j/k move  r refresh",
+                    (
+                        f"DB: {resolved_db} | Filter: {current_project_label} | Updated: {time.strftime('%H:%M:%S')} | "
+                        "Tab switch focus  j/k move  Enter apply  n new run  r refresh  q quit"
+                    ),
                     palette["header"],
                 )
 
             if stats:
                 cards = [
-                    ("Projects", str(project_count), palette["info"]),
+                    ("Projects", str(len(projects)), palette["info"]),
                     ("Runs", str(total_runs), palette["info"]),
                     ("Running", str(status_counts.get("running", 0)), palette["running"]),
                     ("Awaiting", str(status_counts.get("awaiting_input", 0)), palette["awaiting_input"]),
@@ -231,26 +499,58 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                         _safe_add(stats, 1, x + card_w - 1, "|", palette["border"])
                         _safe_add(stats, 2, x + card_w - 1, "|", palette["border"])
 
+            if projects_panel:
+                rows_available = projects_panel.getmaxyx()[0] - 2
+                total_options = len(projects) + 1
+                start = _window_start(selected_project_idx, total_options, rows_available)
+
+                for visible in range(rows_available):
+                    idx = start + visible
+                    if idx >= total_options:
+                        break
+
+                    y = 1 + visible
+                    if idx == 0:
+                        label = "All Projects"
+                        run_count = len(_fetch_runs(conn, None, limit=1000000)) if False else total_runs
+                    else:
+                        project = projects[idx - 1]
+                        name = str(project["name"])
+                        label = name
+                        run_count = run_counts_by_project.get(name, 0)
+
+                    line = f"{label} ({run_count})"
+                    if idx == selected_project_idx:
+                        attr = palette["selected"] if focus == FOCUS_PROJECTS else (palette["selected"] | curses.A_DIM)
+                        _safe_add(projects_panel, y, 2, line, attr)
+                    else:
+                        _safe_add(projects_panel, y, 2, line, palette["info"])
+
             if runs_panel:
                 if not runs:
-                    _safe_add(runs_panel, 1, 2, "No runs yet.", palette["muted"])
+                    _safe_add(runs_panel, 1, 2, "No runs for selected project.", palette["muted"])
                 else:
-                    max_rows = runs_panel.getmaxyx()[0] - 2
-                    for idx, run in enumerate(runs[:max_rows]):
+                    rows_available = runs_panel.getmaxyx()[0] - 2
+                    start = _window_start(selected_run_idx, len(runs), rows_available)
+
+                    for visible in range(rows_available):
+                        idx = start + visible
+                        if idx >= len(runs):
+                            break
+                        run = runs[idx]
                         status = str(run["status"])
-                        line = (
-                            f"#{run['id']:<4} {status:<14} "
-                            f"{run['project_name']}/{run['roadmap_name']}"
-                        )
-                        if idx == selected_idx:
-                            _safe_add(runs_panel, 1 + idx, 1, ">", palette["selected"])
-                            _safe_add(runs_panel, 1 + idx, 3, line, palette["selected"])
+                        line = f"#{run['id']:<4} {status:<14} {run['roadmap_name']}"
+
+                        y = 1 + visible
+                        if idx == selected_run_idx:
+                            attr = palette["selected"] if focus == FOCUS_RUNS else (palette["selected"] | curses.A_DIM)
+                            _safe_add(runs_panel, y, 2, line, attr)
                         else:
-                            _safe_add(runs_panel, 1 + idx, 3, line, _status_attr(status, palette))
+                            _safe_add(runs_panel, y, 2, line, _status_attr(status, palette))
 
             if tracks_panel:
                 if not runs:
-                    _safe_add(tracks_panel, 1, 2, "Select a run to inspect tracks.", palette["muted"])
+                    _safe_add(tracks_panel, 1, 2, "No run selected.", palette["muted"])
                 elif not tracks:
                     _safe_add(tracks_panel, 1, 2, "No track data.", palette["muted"])
                 else:
@@ -272,7 +572,7 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
             if events_panel:
                 if not runs:
-                    _safe_add(events_panel, 1, 2, "No events yet.", palette["muted"])
+                    _safe_add(events_panel, 1, 2, "No events.", palette["muted"])
                 else:
                     max_rows = events_panel.getmaxyx()[0] - 2
                     for idx, event in enumerate(events[:max_rows]):
@@ -288,15 +588,17 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
             footer = _new_panel(stdscr, h - footer_h, 0, footer_h, w, "", palette["border"])
             if footer:
-                if runs:
-                    selected = runs[selected_idx]
+                if ui_message:
+                    _safe_add(footer, 1, 2, ui_message, ui_message_attr)
+                elif runs:
+                    selected = runs[selected_run_idx]
                     detail = (
-                        f"Selected run #{selected['id']} | status={selected['status']} | "
-                        f"session={selected['tmux_session']}"
+                        f"Run #{selected['id']} | project={selected['project_name']} | "
+                        f"status={selected['status']} | session={selected['tmux_session']}"
                     )
-                    _safe_add(footer, 0, 2, detail, _status_attr(str(selected["status"]), palette))
+                    _safe_add(footer, 1, 2, detail, _status_attr(str(selected["status"]), palette))
                 else:
-                    _safe_add(footer, 0, 2, "No runs available", palette["muted"])
+                    _safe_add(footer, 1, 2, "No runs for selected project", palette["muted"])
 
             stdscr.refresh()
 
@@ -305,25 +607,104 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                 return
             if key in (ord("r"), ord("R")):
                 force_refresh = True
-            elif key in (curses.KEY_DOWN, ord("j"), ord("J")) and runs:
-                selected_idx = min(len(runs) - 1, selected_idx + 1)
-                force_refresh = True
-            elif key in (curses.KEY_UP, ord("k"), ord("K")) and runs:
-                selected_idx = max(0, selected_idx - 1)
-                force_refresh = True
-            elif key in (curses.KEY_NPAGE,) and runs:
-                selected_idx = min(len(runs) - 1, selected_idx + 10)
-                force_refresh = True
-            elif key in (curses.KEY_PPAGE,) and runs:
-                selected_idx = max(0, selected_idx - 10)
-                force_refresh = True
-            elif key in (ord("g"),) and runs:
-                selected_idx = 0
-                force_refresh = True
-            elif key in (ord("G"),) and runs:
-                selected_idx = len(runs) - 1
-                force_refresh = True
+                continue
+            if key == 9:  # Tab
+                focus = FOCUS_RUNS if focus == FOCUS_PROJECTS else FOCUS_PROJECTS
+                continue
+            if key in (ord("n"), ord("N")):
+                if selected_project_idx == 0 or not projects:
+                    ui_message = "Select a specific project first to create a run."
+                    ui_message_attr = palette["warn"]
+                    continue
 
-            time.sleep(0.06)
+                project = projects[selected_project_idx - 1]
+                project_name = str(project["name"])
+                project_root = str(project["root_path"])
+
+                roadmap_default = _default_roadmap_path(project_root)
+                modal_result = _prompt_new_run_modal(
+                    stdscr=stdscr,
+                    palette=palette,
+                    project_name=project_name,
+                    roadmap_default=roadmap_default,
+                    agent_default="codex",
+                )
+                if modal_result is None:
+                    ui_message = "Run creation cancelled."
+                    ui_message_attr = palette["muted"]
+                    continue
+
+                roadmap_value, agent_value = modal_result
+
+                success, msg = _launch_run_in_background(
+                    resolved_db=resolved_db,
+                    project_name=project_name,
+                    project_root=project_root,
+                    roadmap_path_input=roadmap_value,
+                    default_agent=agent_value,
+                )
+                ui_message = msg
+                ui_message_attr = palette["running"] if success else palette["failed"]
+                if success:
+                    focus = FOCUS_RUNS
+                    selected_run_idx = 0
+                    force_refresh = True
+                continue
+
+            if key in (10, 13):
+                if focus == FOCUS_PROJECTS:
+                    selected_run_idx = 0
+                    focus = FOCUS_RUNS
+                    force_refresh = True
+                continue
+
+            if focus == FOCUS_PROJECTS:
+                total_options = len(projects) + 1
+                if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                    selected_project_idx = min(total_options - 1, selected_project_idx + 1)
+                    selected_run_idx = 0
+                    force_refresh = True
+                elif key in (curses.KEY_UP, ord("k"), ord("K")):
+                    selected_project_idx = max(0, selected_project_idx - 1)
+                    selected_run_idx = 0
+                    force_refresh = True
+                elif key in (curses.KEY_NPAGE,):
+                    selected_project_idx = min(total_options - 1, selected_project_idx + 10)
+                    selected_run_idx = 0
+                    force_refresh = True
+                elif key in (curses.KEY_PPAGE,):
+                    selected_project_idx = max(0, selected_project_idx - 10)
+                    selected_run_idx = 0
+                    force_refresh = True
+                elif key in (ord("g"),):
+                    selected_project_idx = 0
+                    selected_run_idx = 0
+                    force_refresh = True
+                elif key in (ord("G"),):
+                    selected_project_idx = total_options - 1
+                    selected_run_idx = 0
+                    force_refresh = True
+            else:
+                if runs:
+                    if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                        selected_run_idx = min(len(runs) - 1, selected_run_idx + 1)
+                        force_refresh = True
+                    elif key in (curses.KEY_UP, ord("k"), ord("K")):
+                        selected_run_idx = max(0, selected_run_idx - 1)
+                        force_refresh = True
+                    elif key in (curses.KEY_NPAGE,):
+                        selected_run_idx = min(len(runs) - 1, selected_run_idx + 10)
+                        force_refresh = True
+                    elif key in (curses.KEY_PPAGE,):
+                        selected_run_idx = max(0, selected_run_idx - 10)
+                        force_refresh = True
+                    elif key in (ord("g"),):
+                        selected_run_idx = 0
+                        force_refresh = True
+                    elif key in (ord("G"),):
+                        selected_run_idx = len(runs) - 1
+                        force_refresh = True
+
+            time.sleep(0.05)
 
     curses.wrapper(_draw)

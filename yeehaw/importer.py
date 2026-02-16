@@ -86,9 +86,6 @@ def _choose_name(conn, preferred: str, root_path: str) -> str:
     if existing is None:
         return preferred
 
-    if str(existing["root_path"]) == root_path:
-        return preferred
-
     i = 2
     while True:
         candidate = f"{preferred}-{i}"

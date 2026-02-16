@@ -80,8 +80,11 @@ yeehaw tui
 
 Dashboard controls:
 
-- `j` / `k` or arrows: move selected run
-- `PgUp` / `PgDn`: jump run list
+- `Tab`: switch focus between `Projects` and `Runs`
+- `Enter` on `Projects`: apply project selection and jump to `Runs`
+- `n`: open `Create Run` modal for selected project (roadmap path + agent)
+- `j` / `k` or arrows: move selection in focused panel
+- `PgUp` / `PgDn`: jump selection in focused panel
 - `g` / `G`: first/last run
 - `r`: refresh
 - `q`: quit
@@ -143,3 +146,14 @@ Override:
 
 - `YEEHAW_DB=/path/to/yeehaw.db`
 - `yeehaw --db /path/to/yeehaw.db ...`
+
+## Testing
+
+Install dev dependencies and run tests with coverage:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Coverage is enforced at 100% for the automated test target.
