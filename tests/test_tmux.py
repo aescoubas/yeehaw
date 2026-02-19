@@ -90,9 +90,35 @@ def test_send_text_capture_attach(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pane == "pane"
 
     monkeypatch.setattr(tmux, "ensure_tmux_available", lambda: None)
-    monkeypatch.setattr(tmux.subprocess, "run", lambda *_a, **_k: _Proc(0))
+    attach_calls: list[list[str]] = []
+    monkeypatch.setattr(tmux.subprocess, "run", lambda args, **_k: attach_calls.append(args) or _Proc(0))
+    monkeypatch.delenv("TMUX", raising=False)
     tmux.attach_session("s")
+    assert attach_calls[-1][1] == "attach-session"
+
+    monkeypatch.setenv("TMUX", "1")
+    tmux.attach_session("s")
+    assert attach_calls[-1][1] == "switch-client"
 
     monkeypatch.setattr(tmux.subprocess, "run", lambda *_a, **_k: _Proc(1))
+    monkeypatch.setenv("TMUX", "1")
+    with pytest.raises(tmux.TmuxError, match="switch-client"):
+        tmux.attach_session("s")
+
+    monkeypatch.delenv("TMUX", raising=False)
     with pytest.raises(tmux.TmuxError):
         tmux.attach_session("s")
+
+
+def test_send_keys_and_kill_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(tmux, "_run_tmux", lambda args, **_k: calls.append(args) or tmux.TmuxResult("", ""))
+
+    tmux.send_keys("s:0.0")
+    assert calls == []
+
+    tmux.send_keys("s:0.0", "C-c")
+    assert calls and calls[-1][0] == "send-keys"
+
+    tmux.kill_session("s")
+    assert calls[-1][0] == "kill-session"

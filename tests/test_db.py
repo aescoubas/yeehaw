@@ -34,6 +34,19 @@ def test_connect_and_migrate(tmp_path: Path) -> None:
     db._migrate_projects_table(old)
     cols = {r["name"] for r in old.execute("PRAGMA table_info(projects)").fetchall()}
     assert {"git_remote_url", "default_branch", "head_sha"}.issubset(cols)
+    old.execute(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY,
+            batch_id INTEGER,
+            project_id INTEGER,
+            title TEXT
+        )
+        """
+    )
+    db._migrate_tasks_table(old)
+    task_cols = {r["name"] for r in old.execute("PRAGMA table_info(tasks)").fetchall()}
+    assert "worktree_path" in task_cols
 
 
 def test_project_and_roadmap_and_run_lifecycle(conn: sqlite3.Connection) -> None:
@@ -98,3 +111,115 @@ def test_create_project_runtime_error_branch() -> None:
 
     with pytest.raises(RuntimeError, match="failed to upsert project"):
         db.create_project(FakeConn(), "n", "/r", "g")
+
+
+def test_scheduler_and_task_tables(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    pid = db.create_project(conn, "sched", str(tmp_path / "repo"), "guidelines")
+
+    cfg = db.scheduler_config(conn)
+    assert int(cfg["max_global_sessions"]) == 20
+
+    db.update_scheduler_config(
+        conn,
+        max_global_sessions=30,
+        max_project_sessions=12,
+        default_stuck_minutes=9,
+        auto_reassign=False,
+        preemption_enabled=False,
+    )
+    cfg2 = db.scheduler_config(conn)
+    assert int(cfg2["max_global_sessions"]) == 30
+    assert int(cfg2["max_project_sessions"]) == 12
+    assert int(cfg2["default_stuck_minutes"]) == 9
+    assert int(cfg2["auto_reassign"]) == 0
+    assert int(cfg2["preemption_enabled"]) == 0
+
+    batch_id = db.create_task_batch(
+        conn,
+        project_id=pid,
+        name="b1",
+        source_text="src",
+        roadmap_path="/tmp/r.md",
+        roadmap_text="raw",
+        status="draft",
+    )
+    db.set_task_batch_status(conn, batch_id, "ready")
+    db.update_task_batch_roadmap(conn, batch_id, "/tmp/r2.md", "raw2")
+    batches = db.list_task_batches(conn, project_id=pid, limit=10)
+    assert batches and int(batches[0]["id"]) == batch_id
+    assert db.get_task_batch(conn, batch_id) is not None
+
+    t1 = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T1", description="d1", priority="high", preferred_agent="codex")
+    t2 = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T2", description="d2", priority="low")
+    assert len(db.list_tasks(conn, batch_id=batch_id, limit=20)) >= 2
+    assert db.get_task(conn, t1) is not None
+    assert db.count_active_tasks(conn) == 0
+
+    db.mark_task_dispatching(conn, t1, "codex", "b", str(tmp_path / "repo" / ".yeehaw" / "worktrees" / "task-1-a1"), "sha", "sess", "sess:task.0")
+    db.set_task_state(conn, t1, "running", last_output_hash="h1", loop_count=1)
+    db.touch_task_progress(conn, t1, last_output_hash="h2")
+    db.touch_task_progress(conn, t1)
+    db.set_task_state(conn, t2, "awaiting_input", blocked_question="q?")
+    db.set_task_resume_ready(conn, t2)
+    assert db.count_active_tasks(conn) >= 1
+    queued = db.next_queued_tasks(conn, limit=10)
+    assert isinstance(queued, list)
+
+    db.add_task_event(conn, t1, "info", "m1")
+    assert db.task_events(conn, t1, limit=5)
+
+    alert_id = db.create_alert(conn, level="warn", kind="stuck", message="m", task_id=t1, project_id=pid)
+    assert db.list_alerts(conn, only_open=True, limit=10)
+    db.resolve_alert(conn, alert_id)
+    assert db.list_alerts(conn, only_open=False, limit=10)
+
+    sess_id = db.create_agent_session(conn, t1, pid, "codex", "running", "sess", "sess:task.0")
+    db.heartbeat_agent_session(conn, sess_id, progress=False)
+    db.heartbeat_agent_session(conn, sess_id, progress=True)
+    db.set_agent_session_status(conn, sess_id, "completed", ended=True)
+    assert isinstance(db.active_agent_sessions(conn), list)
+
+    reply_id = db.save_operator_reply(conn, t1, "Q", "A")
+    assert reply_id > 0
+
+    rev_id = db.add_roadmap_revision(conn, project_id=pid, batch_id=batch_id, path="/tmp/r.md", source="manual", raw_text="x")
+    assert rev_id > 0
+    assert db.roadmap_revision_count(conn, pid, batch_id=batch_id) >= 1
+    cp_id = db.add_phase_checkpoint(conn, t1, "summary", "dec", "ctx")
+    assert cp_id > 0
+    assert db.list_task_batches(conn, project_id=None, limit=20)
+    assert db.list_tasks(conn, status="running", project_id=pid, batch_id=batch_id, limit=20)
+    assert db.roadmap_revision_count(conn, pid) >= 1
+
+
+def test_scheduler_config_missing_row_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Cur:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, *_a, **_k):
+            self.calls += 1
+            if self.calls <= 2:
+                return _Cur(None)
+            return _Cur({"max_global_sessions": 1, "max_project_sessions": 1, "default_stuck_minutes": 1, "auto_reassign": 1, "preemption_enabled": 1})
+
+        def commit(self):
+            return None
+
+    c = _Conn()
+    row = db.scheduler_config(c)
+    assert row is not None
+
+    class _BadConn(_Conn):
+        def execute(self, *_a, **_k):
+            return _Cur(None)
+
+    with pytest.raises(RuntimeError, match="scheduler config row missing"):
+        db.scheduler_config(_BadConn())

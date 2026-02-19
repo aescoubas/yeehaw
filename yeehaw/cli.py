@@ -8,6 +8,11 @@ from . import db
 from .coach import start_project_coach, start_roadmap_coach
 from .git_repo import GitRepoError, GitRepoInfo, detect_repo
 from .importer import import_projects
+from .orchestrator import (
+    GlobalScheduler,
+    create_batch_from_task_list,
+    replan_batch_from_roadmap,
+)
 from .roadmap import RoadmapValidationError, load_roadmap
 from .runner import run_roadmap
 from .tui import run_tui
@@ -228,6 +233,121 @@ def cmd_tui(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_batch_create(args: argparse.Namespace) -> int:
+    if args.tasks_file:
+        task_text = Path(args.tasks_file).read_text(encoding="utf-8")
+    else:
+        task_text = args.tasks
+    if not task_text or not task_text.strip():
+        print("Task list cannot be empty", file=sys.stderr)
+        return 2
+
+    batch_id = create_batch_from_task_list(
+        project_name=args.project,
+        batch_name=args.name,
+        task_list_text=task_text,
+        planner_agent=args.planner_agent,
+        db_path=args.db,
+        timeout_minutes=args.timeout_minutes,
+    )
+    print(f"Batch created and queued: id={batch_id}")
+    return 0
+
+
+def cmd_batch_replan(args: argparse.Namespace) -> int:
+    replan_batch_from_roadmap(
+        batch_id=args.batch_id,
+        roadmap_path=args.roadmap,
+        db_path=args.db,
+    )
+    print(f"Batch replanned: id={args.batch_id}")
+    return 0
+
+
+def cmd_task_list(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    status = args.status if args.status else None
+    project_id = None
+    if args.project:
+        project = db.get_project(conn, args.project)
+        if project is None:
+            print(f"Project '{args.project}' not found", file=sys.stderr)
+            return 2
+        project_id = int(project["id"])
+
+    tasks = db.list_tasks(conn, status=status, project_id=project_id, limit=args.limit)
+    if not tasks:
+        print("No tasks found")
+        return 0
+    for row in tasks:
+        print(
+            f"#{row['id']} [{row['status']}] p={row['project_name']} "
+            f"prio={row['priority']} agent={row['assigned_agent'] or row['preferred_agent'] or '-'} "
+            f"title={row['title']}"
+        )
+        if row["blocked_question"]:
+            print(f"  question: {row['blocked_question']}")
+    return 0
+
+
+def cmd_task_reply(args: argparse.Namespace) -> int:
+    scheduler = GlobalScheduler(db_path=args.db)
+    scheduler.reply_to_task(args.task_id, args.answer)
+    print(f"Reply sent to task #{args.task_id}")
+    return 0
+
+
+def cmd_task_pause(args: argparse.Namespace) -> int:
+    scheduler = GlobalScheduler(db_path=args.db)
+    scheduler.pause_task(args.task_id)
+    print(f"Task paused/requeued: #{args.task_id}")
+    return 0
+
+
+def cmd_scheduler_start(args: argparse.Namespace) -> int:
+    scheduler = GlobalScheduler(db_path=args.db, poll_seconds=args.poll_seconds, max_attempts=args.max_attempts)
+    scheduler.run_forever()
+    return 0
+
+
+def cmd_scheduler_tick(args: argparse.Namespace) -> int:
+    scheduler = GlobalScheduler(db_path=args.db, poll_seconds=args.poll_seconds, max_attempts=args.max_attempts)
+    stats = scheduler.tick()
+    print(
+        "tick:"
+        f" dispatched={stats.dispatched}"
+        f" completed={stats.completed}"
+        f" awaiting_input={stats.awaiting_input}"
+        f" reassigned={stats.reassigned}"
+        f" failed={stats.failed}"
+    )
+    return 0
+
+
+def cmd_scheduler_config(args: argparse.Namespace) -> int:
+    conn = db.connect(args.db)
+    if args.set:
+        db.update_scheduler_config(
+            conn,
+            max_global_sessions=args.max_global,
+            max_project_sessions=args.max_project,
+            default_stuck_minutes=args.stuck_minutes,
+            auto_reassign=args.auto_reassign,
+            preemption_enabled=args.preemption_enabled,
+        )
+
+    cfg = db.scheduler_config(conn)
+    print(
+        "scheduler-config "
+        f"max_global={cfg['max_global_sessions']} "
+        f"max_project={cfg['max_project_sessions']} "
+        f"stuck_minutes={cfg['default_stuck_minutes']} "
+        f"auto_reassign={cfg['auto_reassign']} "
+        f"preemption_enabled={cfg['preemption_enabled']}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="yeehaw", description="tmux-based CLI agent harness")
     parser.add_argument("--db", help="sqlite db path (default: ./.yeehaw/yeehaw.db)")
@@ -313,6 +433,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui = sub.add_parser("tui", help="open monitoring TUI")
     p_tui.add_argument("--refresh-seconds", type=float, default=1.0)
     p_tui.set_defaults(func=cmd_tui)
+
+    p_batch = sub.add_parser("batch", help="task batch operations")
+    sub_batch = p_batch.add_subparsers(dest="batch_command", required=True)
+
+    p_batch_create = sub_batch.add_parser("create", help="create a batch from free-form task list using planner agent")
+    p_batch_create.add_argument("--project", required=True)
+    p_batch_create.add_argument("--name", required=True)
+    p_batch_create.add_argument("--tasks", help="free-form task list text")
+    p_batch_create.add_argument("--tasks-file", help="path to free-form task list text file")
+    p_batch_create.add_argument("--planner-agent", default="codex")
+    p_batch_create.add_argument("--timeout-minutes", type=int, default=20)
+    p_batch_create.set_defaults(func=cmd_batch_create)
+
+    p_batch_replan = sub_batch.add_parser("replan", help="apply edited roadmap to an existing batch")
+    p_batch_replan.add_argument("--batch-id", required=True, type=int)
+    p_batch_replan.add_argument("--roadmap", required=True)
+    p_batch_replan.set_defaults(func=cmd_batch_replan)
+
+    p_task = sub.add_parser("task", help="task operations")
+    sub_task = p_task.add_subparsers(dest="task_command", required=True)
+
+    p_task_list = sub_task.add_parser("list", help="list tasks")
+    p_task_list.add_argument("--project")
+    p_task_list.add_argument("--status")
+    p_task_list.add_argument("--limit", type=int, default=200)
+    p_task_list.set_defaults(func=cmd_task_list)
+
+    p_task_reply = sub_task.add_parser("reply", help="answer a blocked task and resume it")
+    p_task_reply.add_argument("--task-id", required=True, type=int)
+    p_task_reply.add_argument("--answer", required=True)
+    p_task_reply.set_defaults(func=cmd_task_reply)
+
+    p_task_pause = sub_task.add_parser("pause", help="preempt and requeue a task")
+    p_task_pause.add_argument("--task-id", required=True, type=int)
+    p_task_pause.set_defaults(func=cmd_task_pause)
+
+    p_scheduler = sub.add_parser("scheduler", help="global scheduler operations")
+    sub_scheduler = p_scheduler.add_subparsers(dest="scheduler_command", required=True)
+
+    p_scheduler_start = sub_scheduler.add_parser("start", help="run the global scheduler loop")
+    p_scheduler_start.add_argument("--poll-seconds", type=float, default=2.0)
+    p_scheduler_start.add_argument("--max-attempts", type=int, default=4)
+    p_scheduler_start.set_defaults(func=cmd_scheduler_start)
+
+    p_scheduler_tick = sub_scheduler.add_parser("tick", help="run one scheduler tick")
+    p_scheduler_tick.add_argument("--poll-seconds", type=float, default=2.0)
+    p_scheduler_tick.add_argument("--max-attempts", type=int, default=4)
+    p_scheduler_tick.set_defaults(func=cmd_scheduler_tick)
+
+    p_scheduler_config = sub_scheduler.add_parser("config", help="show or update scheduler config")
+    p_scheduler_config.add_argument("--set", action="store_true")
+    p_scheduler_config.add_argument("--max-global", type=int)
+    p_scheduler_config.add_argument("--max-project", type=int)
+    p_scheduler_config.add_argument("--stuck-minutes", type=int)
+    p_scheduler_config.add_argument("--auto-reassign", action=argparse.BooleanOptionalAction, default=None)
+    p_scheduler_config.add_argument("--preemption-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p_scheduler_config.set_defaults(func=cmd_scheduler_config)
 
     return parser
 

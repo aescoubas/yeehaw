@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -65,6 +66,12 @@ def send_text(target: str, text: str, press_enter: bool = True) -> None:
         _run_tmux(["send-keys", "-t", target, "Enter"])
 
 
+def send_keys(target: str, *keys: str) -> None:
+    if not keys:
+        return
+    _run_tmux(["send-keys", "-t", target, *keys])
+
+
 def capture_pane(target: str, lines: int = 1200) -> str:
     result = _run_tmux(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"])
     return result.stdout
@@ -72,6 +79,15 @@ def capture_pane(target: str, lines: int = 1200) -> str:
 
 def attach_session(session: str) -> None:
     ensure_tmux_available()
+    if os.environ.get("TMUX"):
+        proc = subprocess.run(["tmux", "switch-client", "-t", session], check=False)
+        if proc.returncode != 0:
+            raise TmuxError(f"tmux switch-client failed for {session}")
+        return
     proc = subprocess.run(["tmux", "attach-session", "-t", session], check=False)
     if proc.returncode != 0:
         raise TmuxError(f"tmux attach-session failed for {session}")
+
+
+def kill_session(session: str) -> None:
+    _run_tmux(["kill-session", "-t", session], check=False)

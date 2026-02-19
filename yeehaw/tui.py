@@ -10,7 +10,10 @@ from typing import Any
 
 from . import db
 from .coach import start_roadmap_coach
+from .git_repo import GitRepoError, detect_repo
+from .orchestrator import GlobalScheduler, create_batch_from_task_list
 from .roadmap import RoadmapValidationError, load_roadmap
+from .tmux import TmuxError, capture_pane, kill_session, list_windows, send_text
 
 
 FOCUS_PROJECTS = "projects"
@@ -172,6 +175,84 @@ def _fetch_run_counts_per_project(conn) -> dict[str, int]:
         """
     ).fetchall()
     return {str(r["project_name"]): int(r["c"]) for r in rows}
+
+
+def _fetch_tasks(conn, project_name: str | None, limit: int = 250) -> list[Any]:
+    if project_name is None:
+        return conn.execute(
+            """
+            SELECT t.id, t.project_id, p.name AS project_name, t.batch_id, t.title, t.priority,
+                   t.status, t.assigned_agent, t.preferred_agent, t.blocked_question,
+                   t.branch_name, t.updated_at
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            ORDER BY t.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return conn.execute(
+        """
+        SELECT t.id, t.project_id, p.name AS project_name, t.batch_id, t.title, t.priority,
+               t.status, t.assigned_agent, t.preferred_agent, t.blocked_question,
+               t.branch_name, t.updated_at
+        FROM tasks t
+        JOIN projects p ON p.id = t.project_id
+        WHERE p.name = ?
+        ORDER BY t.id DESC
+        LIMIT ?
+        """,
+        (project_name, limit),
+    ).fetchall()
+
+
+def _fetch_task_status_counts(conn) -> dict[str, int]:
+    counts = {
+        "queued": 0,
+        "running": 0,
+        "awaiting_input": 0,
+        "stuck": 0,
+        "completed": 0,
+        "failed": 0,
+        "other": 0,
+    }
+    rows = conn.execute("SELECT status, COUNT(*) AS c FROM tasks GROUP BY status").fetchall()
+    for row in rows:
+        status = str(row["status"]).lower()
+        c = int(row["c"])
+        if status in counts:
+            counts[status] = c
+        else:
+            counts["other"] += c
+    return counts
+
+
+def _fetch_open_alerts(conn, limit: int = 100) -> list[Any]:
+    return conn.execute(
+        """
+        SELECT a.id, a.task_id, a.level, a.kind, a.message, a.created_at, p.name AS project_name
+        FROM alerts a
+        LEFT JOIN projects p ON p.id = a.project_id
+        WHERE a.status = 'open'
+        ORDER BY a.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def _fetch_task_events(conn, task_id: int, limit: int = 60) -> list[Any]:
+    return conn.execute(
+        """
+        SELECT created_at, level, message
+        FROM task_events
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (task_id, limit),
+    ).fetchall()
 
 
 def _window_start(selected_idx: int, total: int, max_rows: int) -> int:
@@ -441,6 +522,264 @@ def _prompt_confirm_modal(
         stdscr.nodelay(True)
 
 
+def _prompt_add_project_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+) -> tuple[str, str, str] | None:
+    values = ["", "", ""]
+    labels = ["Project root path", "Project name (optional)", "Guidelines file (optional)"]
+    active = 0
+    error_message = ""
+
+    stdscr.nodelay(False)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(96, 86), max(30, w - 4))
+            box_h = 13
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+            panel = _new_panel(stdscr, y, x, box_h, box_w, "Add Project", palette["border"])
+            if panel is None:
+                return None
+            panel.keypad(True)
+
+            _safe_add(panel, 1, 2, "Enter repository path. Name and guidelines are optional.", palette["info"])
+            _safe_add(panel, 10, 2, "Tab/Up/Down switch field | Enter save | Esc cancel", palette["muted"])
+            if error_message:
+                _safe_add(panel, 11, 2, error_message, palette["failed"])
+
+            for i, label in enumerate(labels):
+                y_field = 3 + (i * 2)
+                _safe_add(panel, y_field, 2, f"{label}:", palette["muted"])
+                field_x = 30
+                field_w = max(12, box_w - field_x - 3)
+                attr = palette["selected"] if i == active else palette["info"]
+                _safe_add(panel, y_field, field_x, " " * field_w, attr)
+                _safe_add(panel, y_field, field_x, values[i], attr)
+                if i == active:
+                    cursor_x = field_x + min(len(values[i]), max(0, field_w - 1))
+                    try:
+                        panel.move(y_field, cursor_x)
+                    except curses.error:
+                        pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+            if key in (27,):
+                return None
+            if key in (9, curses.KEY_DOWN):
+                active = (active + 1) % len(values)
+                error_message = ""
+                continue
+            if key == curses.KEY_UP:
+                active = (active - 1) % len(values)
+                error_message = ""
+                continue
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                root = values[0].strip()
+                name = values[1].strip()
+                guidelines_file = values[2].strip()
+                if not root:
+                    error_message = "Project root path cannot be empty."
+                    active = 0
+                    continue
+                return root, name, guidelines_file
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                values[active] = values[active][:-1]
+                error_message = ""
+                continue
+            if key == 21:
+                values[active] = ""
+                error_message = ""
+                continue
+            if 32 <= key <= 126:
+                values[active] += chr(key)
+                error_message = ""
+                continue
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+def _prompt_batch_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    project_name: str,
+) -> tuple[str, str, str] | None:
+    values = ["Roadmap Batch", "codex", ""]
+    labels = ["Batch name", "Planner agent", "Task list (use ';' between items)"]
+    active = 0
+    error_message = ""
+
+    stdscr.nodelay(False)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(106, len(project_name) + 44), max(30, w - 4))
+            box_h = 13
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+            panel = _new_panel(stdscr, y, x, box_h, box_w, "Create Batch", palette["border"])
+            if panel is None:
+                return None
+            panel.keypad(True)
+
+            _safe_add(panel, 1, 2, f"Project: {project_name}", palette["info"])
+            _safe_add(panel, 10, 2, "Tab/Up/Down switch field | Enter create | Esc cancel", palette["muted"])
+            if error_message:
+                _safe_add(panel, 11, 2, error_message, palette["failed"])
+
+            for i, label in enumerate(labels):
+                y_field = 3 + (i * 2)
+                _safe_add(panel, y_field, 2, f"{label}:", palette["muted"])
+                field_x = 36
+                field_w = max(12, box_w - field_x - 3)
+                attr = palette["selected"] if i == active else palette["info"]
+                _safe_add(panel, y_field, field_x, " " * field_w, attr)
+                _safe_add(panel, y_field, field_x, values[i], attr)
+                if i == active:
+                    cursor_x = field_x + min(len(values[i]), max(0, field_w - 1))
+                    try:
+                        panel.move(y_field, cursor_x)
+                    except curses.error:
+                        pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+            if key in (27,):
+                return None
+            if key in (9, curses.KEY_DOWN):
+                active = (active + 1) % len(values)
+                error_message = ""
+                continue
+            if key == curses.KEY_UP:
+                active = (active - 1) % len(values)
+                error_message = ""
+                continue
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                name = values[0].strip()
+                agent = values[1].strip()
+                task_text = values[2].strip()
+                if not name:
+                    error_message = "Batch name cannot be empty."
+                    active = 0
+                    continue
+                if not agent:
+                    error_message = "Planner agent cannot be empty."
+                    active = 1
+                    continue
+                if not task_text:
+                    error_message = "Task list cannot be empty."
+                    active = 2
+                    continue
+                normalized = "\n".join(
+                    [item.strip() for item in task_text.split(";") if item.strip()]
+                )
+                return name, agent, normalized
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                values[active] = values[active][:-1]
+                error_message = ""
+                continue
+            if key == 21:
+                values[active] = ""
+                error_message = ""
+                continue
+            if 32 <= key <= 126:
+                values[active] += chr(key)
+                error_message = ""
+                continue
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+def _prompt_task_reply_modal(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    task_id: int,
+    question: str,
+) -> str | None:
+    value = ""
+    error_message = ""
+    stdscr.nodelay(False)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(92, len(question) + 12), max(30, w - 4))
+            box_h = 10
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+            panel = _new_panel(stdscr, y, x, box_h, box_w, f"Reply Task #{task_id}", palette["border"])
+            if panel is None:
+                return None
+            panel.keypad(True)
+            _safe_add(panel, 1, 2, f"Question: {question}", palette["warn"])
+            _safe_add(panel, 6, 2, "Enter send | Esc cancel", palette["muted"])
+            if error_message:
+                _safe_add(panel, 7, 2, error_message, palette["failed"])
+            field_x = 2
+            field_w = max(12, box_w - field_x - 3)
+            _safe_add(panel, 3, field_x, " " * field_w, palette["selected"])
+            _safe_add(panel, 3, field_x, value, palette["selected"])
+            try:
+                panel.move(3, field_x + min(len(value), max(0, field_w - 1)))
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+            if key in (27,):
+                return None
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                answer = value.strip()
+                if not answer:
+                    error_message = "Reply cannot be empty."
+                    continue
+                return answer
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                value = value[:-1]
+                error_message = ""
+                continue
+            if key == 21:
+                value = ""
+                error_message = ""
+                continue
+            if 32 <= key <= 126:
+                value += chr(key)
+                error_message = ""
+                continue
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
 def _with_curses_paused(stdscr: curses.window, fn):
     try:
         curses.def_prog_mode()
@@ -461,8 +800,108 @@ def _with_curses_paused(stdscr: curses.window, fn):
             pass
 
 
+def _run_roadmap_coach_inline(
+    stdscr: curses.window,
+    palette: dict[str, int],
+    session_name: str,
+    project_name: str,
+) -> tuple[bool, str]:
+    target = f"{session_name}:coach.0"
+    input_text = ""
+    pane_text = ""
+    note = "Esc continue workflow | Enter send message | Ctrl+U clear"
+
+    stdscr.nodelay(True)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            box_h = max(12, h - 4)
+            box_w = max(50, w - 4)
+            y = max(0, (h - box_h) // 2)
+            x = max(0, (w - box_w) // 2)
+
+            panel = _new_panel(stdscr, y, x, box_h, box_w, f"Roadmap Coach [{project_name}]", palette["border"])
+            if panel is None:
+                return False, "Terminal too small for inline coach chat."
+            panel.keypad(True)
+            panel.nodelay(True)
+
+            coach_alive = True
+            try:
+                coach_alive = "coach" in set(list_windows(session_name))
+            except TmuxError:
+                coach_alive = False
+
+            if coach_alive:
+                try:
+                    pane_text = capture_pane(target, lines=1800)
+                except TmuxError as exc:
+                    coach_alive = False
+                    note = f"Coach capture failed: {exc}. Press Esc to continue."
+            else:
+                note = "Coach session ended. Press Esc to continue workflow."
+
+            inner_h, inner_w = panel.getmaxyx()
+            _safe_add(panel, 1, 2, note, palette["muted"] if coach_alive else palette["warn"])
+
+            log_top = 3
+            input_y = inner_h - 3
+            max_log_rows = max(1, input_y - log_top)
+            lines = pane_text.splitlines()
+            visible = lines[-max_log_rows:]
+            for idx, line in enumerate(visible):
+                _safe_add(panel, log_top + idx, 2, line, palette["info"])
+
+            _safe_add(panel, input_y, 2, "You:", palette["focused"])
+            field_x = 7
+            field_w = max(8, inner_w - field_x - 3)
+            _safe_add(panel, input_y, field_x, " " * field_w, palette["selected"])
+            _safe_add(panel, input_y, field_x, input_text, palette["selected"])
+            try:
+                panel.move(input_y, field_x + min(len(input_text), max(0, field_w - 1)))
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            panel.refresh()
+            key = panel.getch()
+
+            if key in (27,):  # Esc
+                return True, "Inline roadmap coach conversation ended."
+            if key in (10, 13, curses.KEY_ENTER, 343):
+                if not coach_alive:
+                    return True, "Coach session already ended."
+                answer = input_text.strip()
+                if answer:
+                    send_text(target, answer, press_enter=True)
+                    input_text = ""
+                continue
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                input_text = input_text[:-1]
+                continue
+            if key == 21:  # Ctrl+U
+                input_text = ""
+                continue
+            if 32 <= key <= 126:
+                input_text += chr(key)
+                continue
+            time.sleep(0.05)
+    finally:
+        stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
 def _start_and_validate_workflow(
     stdscr: curses.window,
+    palette: dict[str, int],
     resolved_db: Path,
     project_name: str,
     project_root: str,
@@ -471,20 +910,32 @@ def _start_and_validate_workflow(
     coding_agent: str,
 ) -> tuple[bool, str, str]:
     roadmap_path = _resolve_roadmap_path(project_root, roadmap_path_input)
+    session_name = ""
 
     try:
-        session_name = _with_curses_paused(
-            stdscr,
-            lambda: start_roadmap_coach(
-                project_name=project_name,
-                output_path=roadmap_path,
-                agent=coach_agent,
-                db_path=resolved_db,
-                attach=True,
-            ),
+        session_name = start_roadmap_coach(
+            project_name=project_name,
+            output_path=roadmap_path,
+            agent=coach_agent,
+            db_path=resolved_db,
+            attach=False,
         )
+        inline_ok, inline_msg = _run_roadmap_coach_inline(
+            stdscr=stdscr,
+            palette=palette,
+            session_name=session_name,
+            project_name=project_name,
+        )
+        if not inline_ok:
+            return False, f"Roadmap coach failed: {inline_msg}", str(roadmap_path)
     except Exception as exc:
         return False, f"Roadmap coach failed: {exc}", str(roadmap_path)
+    finally:
+        if session_name:
+            try:
+                kill_session(session_name)
+            except Exception:
+                pass
 
     if not roadmap_path.exists():
         return False, f"Roadmap not found after coach session {session_name}: {roadmap_path}", str(roadmap_path)
@@ -567,9 +1018,47 @@ def _launch_run_in_background(
     return True, f"Launched run for {project_name} (pid {proc.pid})"
 
 
+def _add_project_from_root(conn, root_input: str, name: str, guidelines_file: str) -> tuple[bool, str]:
+    root_path = Path(root_input).expanduser().resolve()
+    if not root_path.exists():
+        return False, f"Path does not exist: {root_path}"
+
+    guidelines = ""
+    if guidelines_file.strip():
+        gpath = Path(guidelines_file).expanduser().resolve()
+        if not gpath.exists():
+            return False, f"Guidelines file not found: {gpath}"
+        guidelines = gpath.read_text(encoding="utf-8").strip()
+
+    try:
+        repo_info = detect_repo(root_path)
+    except GitRepoError:
+        repo_info = None
+
+    if repo_info is None:
+        project_root = str(root_path)
+        project_name = name.strip() or root_path.name
+        db.create_project(conn, project_name, project_root, guidelines)
+        return True, f"Project added: {project_name} (non-git)"
+
+    project_root = repo_info.root_path
+    project_name = name.strip() or Path(project_root).name
+    db.create_project(
+        conn,
+        project_name,
+        project_root,
+        guidelines,
+        git_remote_url=repo_info.remote_url,
+        default_branch=repo_info.default_branch,
+        head_sha=repo_info.head_sha,
+    )
+    return True, f"Project added: {project_name}"
+
+
 def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> None:
     resolved_db = Path(db_path).resolve() if db_path else db.default_db_path()
     conn = db.connect(resolved_db)
+    scheduler_box: dict[str, GlobalScheduler | None] = {"obj": None}
 
     def _draw(stdscr: curses.window) -> None:
         curses.curs_set(0)
@@ -579,23 +1068,49 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
         selected_project_idx = 0
         selected_run_idx = 0
+        selected_task_idx = 0
         focus = FOCUS_PROJECTS
+        list_mode = "runs"  # runs|tasks
+        auto_scheduler = False
 
         force_refresh = True
         last_refresh = 0.0
 
         projects: list[Any] = []
         runs: list[Any] = []
+        tasks: list[Any] = []
         tracks: list[Any] = []
         events: list[Any] = []
+        task_events: list[Any] = []
+        alerts: list[Any] = []
         run_counts_by_project: dict[str, int] = {}
         status_counts: dict[str, int] = {}
+        task_status_counts: dict[str, int] = {}
         total_runs = 0
+        total_tasks = 0
         ui_message = ""
         ui_message_attr = palette["muted"]
 
         while True:
             now = time.monotonic()
+            if auto_scheduler:
+                try:
+                    scheduler_box["obj"] = scheduler_box["obj"] or GlobalScheduler(db_path=resolved_db)
+                    stats = scheduler_box["obj"].tick()
+                    if any([stats.dispatched, stats.completed, stats.awaiting_input, stats.reassigned, stats.failed]):
+                        ui_message = (
+                            f"Scheduler tick: +{stats.dispatched} dispatched, "
+                            f"+{stats.completed} completed, "
+                            f"+{stats.awaiting_input} awaiting input, "
+                            f"+{stats.reassigned} reassigned, "
+                            f"+{stats.failed} failed"
+                        )
+                        ui_message_attr = palette["info"]
+                except Exception as exc:
+                    ui_message = f"Scheduler tick failed: {exc}"
+                    ui_message_attr = palette["failed"]
+                    auto_scheduler = False
+
             if force_refresh or now - last_refresh >= max(0.2, refresh_seconds):
                 projects = db.list_projects(conn)
                 run_counts_by_project = _fetch_run_counts_per_project(conn)
@@ -609,17 +1124,29 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
                 runs = _fetch_runs(conn, selected_project_name, limit=200)
                 selected_run_idx = max(0, min(selected_run_idx, len(runs) - 1)) if runs else 0
+                tasks = _fetch_tasks(conn, selected_project_name, limit=300)
+                selected_task_idx = max(0, min(selected_task_idx, len(tasks) - 1)) if tasks else 0
 
                 status_counts = _fetch_status_counts(conn)
+                task_status_counts = _fetch_task_status_counts(conn)
                 total_runs = int(conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"])
+                total_tasks = int(conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"])
+                alerts = _fetch_open_alerts(conn, limit=100)
 
-                if runs:
+                if list_mode == "runs" and runs:
                     selected_run_id = int(runs[selected_run_idx]["id"])
                     tracks = db.run_tracks(conn, selected_run_id)
                     events = db.run_events(conn, selected_run_id, limit=60)
+                    task_events = []
+                elif list_mode == "tasks" and tasks:
+                    selected_task_id = int(tasks[selected_task_idx]["id"])
+                    tracks = []
+                    task_events = _fetch_task_events(conn, selected_task_id, limit=60)
+                    events = []
                 else:
                     tracks = []
                     events = []
+                    task_events = []
 
                 last_refresh = now
                 force_refresh = False
@@ -660,6 +1187,8 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
 
             projects_title = "Projects"
             runs_title = "Runs"
+            if list_mode == "tasks":
+                runs_title = "Tasks"
             if focus == FOCUS_PROJECTS:
                 projects_title += " [FOCUS]"
             else:
@@ -691,7 +1220,7 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                     2,
                     (
                         f"DB: {resolved_db} | Filter: {current_project_label} | Updated: {time.strftime('%H:%M:%S')} | "
-                        "Tab switch focus  j/k move  Enter apply  n new run  w roadmap workflow  r refresh  q quit"
+                        "Tab focus  v runs/tasks  j/k move  Enter apply  n run  w workflow  b batch  a add project  y reply  s tick  z auto  r refresh  q quit"
                     ),
                     palette["header"],
                 )
@@ -700,6 +1229,7 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                 cards = [
                     ("Projects", str(len(projects)), palette["info"]),
                     ("Runs", str(total_runs), palette["info"]),
+                    ("Tasks", str(total_tasks), palette["info"]),
                     ("Running", str(status_counts.get("running", 0)), palette["running"]),
                     ("Awaiting", str(status_counts.get("awaiting_input", 0)), palette["awaiting_input"]),
                     ("Completed", str(status_counts.get("completed", 0)), palette["completed"]),
@@ -743,55 +1273,77 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                         _safe_add(projects_panel, y, 2, line, palette["info"])
 
             if runs_panel:
-                if not runs:
+                if list_mode == "runs" and not runs:
                     _safe_add(runs_panel, 1, 2, "No runs for selected project.", palette["muted"])
+                elif list_mode == "tasks" and not tasks:
+                    _safe_add(runs_panel, 1, 2, "No tasks for selected project.", palette["muted"])
                 else:
                     rows_available = runs_panel.getmaxyx()[0] - 2
-                    start = _window_start(selected_run_idx, len(runs), rows_available)
+                    selected_idx = selected_run_idx if list_mode == "runs" else selected_task_idx
+                    collection = runs if list_mode == "runs" else tasks
+                    start = _window_start(selected_idx, len(collection), rows_available)
 
                     for visible in range(rows_available):
                         idx = start + visible
-                        if idx >= len(runs):
+                        if idx >= len(collection):
                             break
-                        run = runs[idx]
-                        status = str(run["status"])
-                        line = f"#{run['id']:<4} {status:<14} {run['roadmap_name']}"
+                        row = collection[idx]
+                        status = str(row["status"])
+                        if list_mode == "runs":
+                            line = f"#{row['id']:<4} {status:<14} {row['roadmap_name']}"
+                        else:
+                            agent = row["assigned_agent"] or row["preferred_agent"] or "-"
+                            line = f"#{row['id']:<4} {status:<14} {agent:<8} {row['title']}"
 
                         y = 1 + visible
-                        if idx == selected_run_idx:
+                        if idx == selected_idx:
                             attr = palette["selected"] if focus == FOCUS_RUNS else (palette["selected"] | curses.A_DIM)
                             _safe_add(runs_panel, y, 2, line, attr)
                         else:
                             _safe_add(runs_panel, y, 2, line, _status_attr(status, palette))
 
             if tracks_panel:
-                if not runs:
-                    _safe_add(tracks_panel, 1, 2, "No run selected.", palette["muted"])
-                elif not tracks:
-                    _safe_add(tracks_panel, 1, 2, "No track data.", palette["muted"])
-                else:
-                    row = 1
-                    max_rows = tracks_panel.getmaxyx()[0] - 2
-                    for track in tracks:
-                        if row >= max_rows:
-                            break
-                        status = str(track["status"])
-                        line = (
-                            f"[{status}] {track['track_id']}  "
-                            f"agent={track['agent']}  stage={track['current_stage_index']}"
-                        )
-                        _safe_add(tracks_panel, row, 2, line, _status_attr(status, palette))
-                        row += 1
-                        if track["waiting_question"] and row < max_rows:
-                            _safe_add(tracks_panel, row, 4, f"Q: {track['waiting_question']}", palette["awaiting_input"])
+                if list_mode == "runs":
+                    if not runs:
+                        _safe_add(tracks_panel, 1, 2, "No run selected.", palette["muted"])
+                    elif not tracks:
+                        _safe_add(tracks_panel, 1, 2, "No track data.", palette["muted"])
+                    else:
+                        row = 1
+                        max_rows = tracks_panel.getmaxyx()[0] - 2
+                        for track in tracks:
+                            if row >= max_rows:
+                                break
+                            status = str(track["status"])
+                            line = (
+                                f"[{status}] {track['track_id']}  "
+                                f"agent={track['agent']}  stage={track['current_stage_index']}"
+                            )
+                            _safe_add(tracks_panel, row, 2, line, _status_attr(status, palette))
                             row += 1
+                            if track["waiting_question"] and row < max_rows:
+                                _safe_add(tracks_panel, row, 4, f"Q: {track['waiting_question']}", palette["awaiting_input"])
+                                row += 1
+                else:
+                    if not alerts:
+                        _safe_add(tracks_panel, 1, 2, "No open alerts.", palette["muted"])
+                    else:
+                        max_rows = tracks_panel.getmaxyx()[0] - 2
+                        for idx, alert in enumerate(alerts[:max_rows]):
+                            level = str(alert["level"]).lower()
+                            attr = palette["warn"] if level == "warn" else palette["error"] if level == "error" else palette["info"]
+                            line = f"#{alert['id']} [{level}] task={alert['task_id'] or '-'} {alert['kind']}: {alert['message']}"
+                            _safe_add(tracks_panel, 1 + idx, 2, line, attr)
 
             if events_panel:
-                if not runs:
+                if list_mode == "runs" and not runs:
                     _safe_add(events_panel, 1, 2, "No events.", palette["muted"])
+                elif list_mode == "tasks" and not tasks:
+                    _safe_add(events_panel, 1, 2, "No task events.", palette["muted"])
                 else:
                     max_rows = events_panel.getmaxyx()[0] - 2
-                    for idx, event in enumerate(events[:max_rows]):
+                    active_events = events if list_mode == "runs" else task_events
+                    for idx, event in enumerate(active_events[:max_rows]):
                         ts = str(event["created_at"])[11:19]
                         level = str(event["level"]).lower()
                         level_attr = palette["info"]
@@ -806,15 +1358,23 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
             if footer:
                 if ui_message:
                     _safe_add(footer, 1, 2, ui_message, ui_message_attr)
-                elif runs:
+                elif list_mode == "runs" and runs:
                     selected = runs[selected_run_idx]
                     detail = (
                         f"Run #{selected['id']} | project={selected['project_name']} | "
                         f"status={selected['status']} | session={selected['tmux_session']}"
                     )
                     _safe_add(footer, 1, 2, detail, _status_attr(str(selected["status"]), palette))
+                elif list_mode == "tasks" and tasks:
+                    selected_task = tasks[selected_task_idx]
+                    detail = (
+                        f"Task #{selected_task['id']} | project={selected_task['project_name']} | "
+                        f"status={selected_task['status']} | agent={selected_task['assigned_agent'] or selected_task['preferred_agent'] or '-'} "
+                        f"| auto_scheduler={'on' if auto_scheduler else 'off'}"
+                    )
+                    _safe_add(footer, 1, 2, detail, _status_attr(str(selected_task["status"]), palette))
                 else:
-                    _safe_add(footer, 1, 2, "No runs for selected project", palette["muted"])
+                    _safe_add(footer, 1, 2, "No items for selected project", palette["muted"])
 
             stdscr.refresh()
 
@@ -826,6 +1386,104 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                 continue
             if key == 9:  # Tab
                 focus = FOCUS_RUNS if focus == FOCUS_PROJECTS else FOCUS_PROJECTS
+                continue
+            if key in (ord("v"), ord("V")):
+                list_mode = "tasks" if list_mode == "runs" else "runs"
+                focus = FOCUS_RUNS
+                force_refresh = True
+                continue
+            if key in (ord("s"),):
+                try:
+                    scheduler_box["obj"] = scheduler_box["obj"] or GlobalScheduler(db_path=resolved_db)
+                    stats = scheduler_box["obj"].tick()
+                    ui_message = (
+                        f"Scheduler tick: +{stats.dispatched} dispatched, +{stats.completed} completed, "
+                        f"+{stats.awaiting_input} awaiting, +{stats.reassigned} reassigned, +{stats.failed} failed"
+                    )
+                    ui_message_attr = palette["info"]
+                    force_refresh = True
+                except Exception as exc:
+                    ui_message = f"Scheduler tick failed: {exc}"
+                    ui_message_attr = palette["failed"]
+                continue
+            if key in (ord("z"), ord("Z")):
+                auto_scheduler = not auto_scheduler
+                ui_message = f"Auto scheduler {'enabled' if auto_scheduler else 'disabled'}."
+                ui_message_attr = palette["running"] if auto_scheduler else palette["muted"]
+                continue
+            if key in (ord("a"), ord("A")):
+                modal = _prompt_add_project_modal(stdscr, palette)
+                if modal is None:
+                    ui_message = "Add project cancelled."
+                    ui_message_attr = palette["muted"]
+                    continue
+                root_path, name_value, guidelines_file = modal
+                success, msg = _add_project_from_root(conn, root_path, name_value, guidelines_file)
+                ui_message = msg
+                ui_message_attr = palette["running"] if success else palette["failed"]
+                if success:
+                    force_refresh = True
+                continue
+            if key in (ord("b"), ord("B")):
+                if selected_project_idx == 0 or not projects:
+                    ui_message = "Select a specific project first to create a task batch."
+                    ui_message_attr = palette["warn"]
+                    continue
+                project = projects[selected_project_idx - 1]
+                project_name = str(project["name"])
+                batch_modal = _prompt_batch_modal(stdscr, palette, project_name)
+                if batch_modal is None:
+                    ui_message = "Batch creation cancelled."
+                    ui_message_attr = palette["muted"]
+                    continue
+                batch_name, planner_agent, task_text = batch_modal
+                try:
+                    batch_id = create_batch_from_task_list(
+                        project_name=project_name,
+                        batch_name=batch_name,
+                        task_list_text=task_text,
+                        planner_agent=planner_agent,
+                        db_path=resolved_db,
+                    )
+                    ui_message = f"Batch #{batch_id} created and queued for project {project_name}."
+                    ui_message_attr = palette["running"]
+                    force_refresh = True
+                    list_mode = "tasks"
+                    focus = FOCUS_RUNS
+                except Exception as exc:
+                    ui_message = f"Batch creation failed: {exc}"
+                    ui_message_attr = palette["failed"]
+                continue
+            if key in (ord("y"), ord("Y")):
+                if list_mode != "tasks" or not tasks:
+                    ui_message = "Switch to tasks view and select an awaiting_input task."
+                    ui_message_attr = palette["warn"]
+                    continue
+                selected_task = tasks[selected_task_idx]
+                if str(selected_task["status"]) != "awaiting_input":
+                    ui_message = "Selected task is not awaiting input."
+                    ui_message_attr = palette["warn"]
+                    continue
+                question = str(selected_task["blocked_question"] or "").strip() or "Agent requested input."
+                answer = _prompt_task_reply_modal(
+                    stdscr=stdscr,
+                    palette=palette,
+                    task_id=int(selected_task["id"]),
+                    question=question,
+                )
+                if answer is None:
+                    ui_message = "Reply cancelled."
+                    ui_message_attr = palette["muted"]
+                    continue
+                try:
+                    scheduler_box["obj"] = scheduler_box["obj"] or GlobalScheduler(db_path=resolved_db)
+                    scheduler_box["obj"].reply_to_task(int(selected_task["id"]), answer)
+                    ui_message = f"Reply sent to task #{selected_task['id']}."
+                    ui_message_attr = palette["running"]
+                    force_refresh = True
+                except Exception as exc:
+                    ui_message = f"Failed to send reply: {exc}"
+                    ui_message_attr = palette["failed"]
                 continue
             if key in (ord("n"), ord("N")):
                 if selected_project_idx == 0 or not projects:
@@ -894,6 +1552,7 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                 roadmap_value, coach_agent, coding_agent = workflow_result
                 validated, msg, resolved_roadmap = _start_and_validate_workflow(
                     stdscr=stdscr,
+                    palette=palette,
                     resolved_db=resolved_db,
                     project_name=project_name,
                     project_root=project_root,
@@ -971,24 +1630,43 @@ def run_tui(db_path: str | Path | None = None, refresh_seconds: float = 1.0) -> 
                     selected_run_idx = 0
                     force_refresh = True
             else:
-                if runs:
+                collection = runs if list_mode == "runs" else tasks
+                if collection:
                     if key in (curses.KEY_DOWN, ord("j"), ord("J")):
-                        selected_run_idx = min(len(runs) - 1, selected_run_idx + 1)
+                        if list_mode == "runs":
+                            selected_run_idx = min(len(collection) - 1, selected_run_idx + 1)
+                        else:
+                            selected_task_idx = min(len(collection) - 1, selected_task_idx + 1)
                         force_refresh = True
                     elif key in (curses.KEY_UP, ord("k"), ord("K")):
-                        selected_run_idx = max(0, selected_run_idx - 1)
+                        if list_mode == "runs":
+                            selected_run_idx = max(0, selected_run_idx - 1)
+                        else:
+                            selected_task_idx = max(0, selected_task_idx - 1)
                         force_refresh = True
                     elif key in (curses.KEY_NPAGE,):
-                        selected_run_idx = min(len(runs) - 1, selected_run_idx + 10)
+                        if list_mode == "runs":
+                            selected_run_idx = min(len(collection) - 1, selected_run_idx + 10)
+                        else:
+                            selected_task_idx = min(len(collection) - 1, selected_task_idx + 10)
                         force_refresh = True
                     elif key in (curses.KEY_PPAGE,):
-                        selected_run_idx = max(0, selected_run_idx - 10)
+                        if list_mode == "runs":
+                            selected_run_idx = max(0, selected_run_idx - 10)
+                        else:
+                            selected_task_idx = max(0, selected_task_idx - 10)
                         force_refresh = True
                     elif key in (ord("g"),):
-                        selected_run_idx = 0
+                        if list_mode == "runs":
+                            selected_run_idx = 0
+                        else:
+                            selected_task_idx = 0
                         force_refresh = True
                     elif key in (ord("G"),):
-                        selected_run_idx = len(runs) - 1
+                        if list_mode == "runs":
+                            selected_run_idx = len(collection) - 1
+                        else:
+                            selected_task_idx = len(collection) - 1
                         force_refresh = True
 
             time.sleep(0.05)

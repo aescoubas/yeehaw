@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from yeehaw import db, tui
+from yeehaw.git_repo import GitRepoInfo
 from yeehaw.roadmap import RoadmapDef, StageDef, TrackDef
 
 
@@ -348,6 +349,111 @@ def test_prompt_confirm_modal_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tui._prompt_confirm_modal(s5, palette, "T", ["L"]) is False
 
 
+def test_prompt_add_project_batch_and_reply_modals(monkeypatch: pytest.MonkeyPatch) -> None:
+    palette = {"border": 0, "info": 0, "muted": 0, "failed": 0, "selected": 0, "warn": 0}
+    monkeypatch.setattr(tui.curses, "curs_set", lambda *_a, **_k: None)
+
+    s1 = FakeWindow(30, 140, [27])
+    assert tui._prompt_add_project_modal(s1, palette) is None
+
+    keys = [10, ord("/"), ord("t"), ord("m"), ord("p"), 9, ord("p"), 9, ord("g"), 10]
+    s2 = FakeWindow(30, 140, keys)
+    root, name, g = tui._prompt_add_project_modal(s2, palette)
+    assert root == "/tmp"
+    assert name == "p"
+    assert g == "g"
+
+    s3 = FakeWindow(30, 140, [27])
+    assert tui._prompt_batch_modal(s3, palette, "proj") is None
+    s4 = FakeWindow(30, 140, [10, 27])
+    assert tui._prompt_batch_modal(s4, palette, "proj") is None
+
+    s5 = FakeWindow(30, 140, [ord("B"), 9, ord("c"), ord("o"), ord("d"), ord("e"), ord("x"), 9, ord("a"), ord(";"), ord("b"), 10])
+    name2, agent2, tasks2 = tui._prompt_batch_modal(s5, palette, "proj")
+    assert name2.startswith("Roadmap Batch")
+    assert agent2.endswith("codex")
+    assert tasks2 == "a\nb"
+
+    s6 = FakeWindow(30, 140, [27])
+    assert tui._prompt_task_reply_modal(s6, palette, 1, "Q?") is None
+    s7 = FakeWindow(30, 140, [10, ord("x"), 10])
+    assert tui._prompt_task_reply_modal(s7, palette, 1, "Q?") == "x"
+
+    monkeypatch.setattr(tui, "_new_panel", lambda *_a, **_k: None)
+    s8 = FakeWindow(30, 140, [10])
+    assert tui._prompt_add_project_modal(s8, palette) is None
+
+
+def test_new_modals_extra_branches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    palette = {"border": 0, "info": 0, "muted": 0, "failed": 0, "selected": 0, "warn": 0}
+    monkeypatch.setattr(
+        tui.curses,
+        "curs_set",
+        lambda *_a, **_k: (_ for _ in ()).throw(tui.curses.error("x")),
+    )
+    s1 = FakeWindow(30, 140, [tui.curses.KEY_DOWN, tui.curses.KEY_UP, tui.curses.KEY_BACKSPACE, 21, ord("/"), 10])
+    s1.raise_on_move = True
+    assert tui._prompt_add_project_modal(s1, palette)[0] == "/"
+
+    s2 = FakeWindow(30, 140, [tui.curses.KEY_DOWN, tui.curses.KEY_UP, tui.curses.KEY_BACKSPACE, 21, ord("n"), 9, ord("a"), 9, ord("x"), 10])
+    s2.raise_on_move = True
+    assert tui._prompt_batch_modal(s2, palette, "p")[0].endswith("n")
+
+    s3 = FakeWindow(30, 140, [tui.curses.KEY_BACKSPACE, 21, ord("a"), 10])
+    s3.raise_on_move = True
+    assert tui._prompt_task_reply_modal(s3, palette, 1, "Q") == "a"
+
+    monkeypatch.setattr(tui, "_new_panel", lambda *_a, **_k: None)
+    assert tui._prompt_batch_modal(FakeWindow(30, 140, [10]), palette, "p") is None
+    assert tui._prompt_task_reply_modal(FakeWindow(30, 140, [10]), palette, 1, "Q") is None
+
+    conn = db.connect(tmp_path / "db.sqlite")
+    root = tmp_path / "repo"
+    root.mkdir()
+    g = tmp_path / "guidelines.md"
+    g.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(tui, "detect_repo", lambda *_a, **_k: (_ for _ in ()).throw(tui.GitRepoError("x")))
+    ok, _msg = tui._add_project_from_root(conn, str(root), "n", str(g))
+    assert ok is True
+
+
+def test_fetch_task_helpers_and_add_project_from_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, conn) -> None:
+    pid = db.create_project(conn, "proj", str(tmp_path / "repo"), "g")
+    batch_id = db.create_task_batch(conn, project_id=pid, name="b", source_text="s", status="queued")
+    task_id = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T1", description="d1")
+    db.set_task_state(conn, task_id, "awaiting_input", blocked_question="q?")
+    db.set_task_state(conn, task_id, "mystery")
+    db.add_task_event(conn, task_id, "warn", "w")
+    db.create_alert(conn, level="warn", kind="blocked", message="m", task_id=task_id, project_id=pid)
+
+    assert tui._fetch_tasks(conn, None)
+    assert tui._fetch_tasks(conn, "proj")
+    counts = tui._fetch_task_status_counts(conn)
+    assert counts["other"] >= 1
+    assert tui._fetch_open_alerts(conn)
+    assert tui._fetch_task_events(conn, task_id)
+
+    ok, msg = tui._add_project_from_root(conn, str(tmp_path / "missing"), "", "")
+    assert ok is False and "does not exist" in msg
+
+    root = tmp_path / "root"
+    root.mkdir()
+    ok2, msg2 = tui._add_project_from_root(conn, str(root), "", str(tmp_path / "no-guidelines.md"))
+    assert ok2 is False and "Guidelines file not found" in msg2
+
+    monkeypatch.setattr(tui, "detect_repo", lambda *_a, **_k: (_ for _ in ()).throw(tui.GitRepoError("bad")))
+    ok3, msg3 = tui._add_project_from_root(conn, str(root), "name", "")
+    assert ok3 is True and "non-git" in msg3
+
+    monkeypatch.setattr(
+        tui,
+        "detect_repo",
+        lambda *_a, **_k: GitRepoInfo(root_path=str(root), remote_url="u", default_branch="main", head_sha="sha"),
+    )
+    ok4, msg4 = tui._add_project_from_root(conn, str(root), "", "")
+    assert ok4 is True and "Project added" in msg4
+
+
 def test_with_curses_paused(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(tui.curses, "def_prog_mode", lambda: calls.append("def"))
@@ -376,20 +482,98 @@ def test_with_curses_paused(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tui._with_curses_paused(bad, lambda: "done") == "done"
 
 
+def test_run_roadmap_coach_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    palette = {
+        "border": 0,
+        "info": 0,
+        "muted": 0,
+        "warn": 0,
+        "focused": 0,
+        "selected": 0,
+    }
+    monkeypatch.setattr(tui.curses, "curs_set", lambda *_a, **_k: None)
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+
+    # Happy path: send a message, then exit.
+    s1 = FakeWindow(30, 140, [ord("h"), ord("i"), 10, 27])
+    monkeypatch.setattr(tui, "list_windows", lambda *_a, **_k: ["coach"])
+    monkeypatch.setattr(tui, "capture_pane", lambda *_a, **_k: "agent line")
+    sent: list[str] = []
+    monkeypatch.setattr(tui, "send_text", lambda _t, text, press_enter=True: sent.append(text))
+    ok, msg = tui._run_roadmap_coach_inline(s1, palette, "sess", "p")
+    assert ok is True
+    assert "ended" in msg.lower()
+    assert sent == ["hi"]
+
+    # Enter when session is gone exits cleanly.
+    s2 = FakeWindow(30, 140, [10])
+    monkeypatch.setattr(tui, "list_windows", lambda *_a, **_k: ["control"])
+    ok2, msg2 = tui._run_roadmap_coach_inline(s2, palette, "sess", "p")
+    assert ok2 is True
+    assert "already ended" in msg2
+
+    # Small terminal/panel creation failure.
+    monkeypatch.setattr(tui, "_new_panel", lambda *_a, **_k: None)
+    s3 = FakeWindow(30, 140, [27])
+    ok3, msg3 = tui._run_roadmap_coach_inline(s3, palette, "sess", "p")
+    assert ok3 is False
+    assert "too small" in msg3.lower()
+
+
+def test_run_roadmap_coach_inline_edge_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    palette = {
+        "border": 0,
+        "info": 0,
+        "muted": 0,
+        "warn": 0,
+        "focused": 0,
+        "selected": 0,
+    }
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+
+    # list_windows tmux error -> treated as ended.
+    monkeypatch.setattr(tui, "list_windows", lambda *_a, **_k: (_ for _ in ()).throw(tui.TmuxError("x")))
+    monkeypatch.setattr(tui, "capture_pane", lambda *_a, **_k: "ignored")
+    monkeypatch.setattr(tui.curses, "curs_set", lambda *_a, **_k: (_ for _ in ()).throw(tui.curses.error("x")))
+    ok1, msg1 = tui._run_roadmap_coach_inline(FakeWindow(30, 140, [10]), palette, "sess", "p")
+    assert ok1 is True
+    assert "already ended" in msg1
+
+    # capture_pane tmux error branch + move error branch.
+    monkeypatch.setattr(tui, "list_windows", lambda *_a, **_k: ["coach"])
+    monkeypatch.setattr(tui, "capture_pane", lambda *_a, **_k: (_ for _ in ()).throw(tui.TmuxError("cap")))
+    w2 = FakeWindow(30, 140, [27])
+    w2.raise_on_move = True
+    ok2, msg2 = tui._run_roadmap_coach_inline(w2, palette, "sess", "p")
+    assert ok2 is True
+    assert "ended" in msg2.lower()
+
+    # Backspace + Ctrl+U + idle(-1) branches.
+    monkeypatch.setattr(tui.curses, "curs_set", lambda *_a, **_k: None)
+    monkeypatch.setattr(tui, "capture_pane", lambda *_a, **_k: "agent")
+    monkeypatch.setattr(tui, "list_windows", lambda *_a, **_k: ["coach"])
+    w3 = FakeWindow(30, 140, [ord("a"), tui.curses.KEY_BACKSPACE, ord("b"), 21, -1, 27])
+    ok3, msg3 = tui._run_roadmap_coach_inline(w3, palette, "sess", "p")
+    assert ok3 is True
+    assert "ended" in msg3.lower()
+
+
 def test_start_and_validate_workflow_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     stdscr = FakeWindow()
+    palette = {"border": 0, "info": 0, "muted": 0, "warn": 0, "focused": 0, "selected": 0}
     project_root = tmp_path / "proj"
     project_root.mkdir()
     db_path = tmp_path / "db.sqlite"
 
-    monkeypatch.setattr(tui, "_with_curses_paused", lambda _s, fn: fn())
     monkeypatch.setattr(
         tui,
         "start_roadmap_coach",
         lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
+    monkeypatch.setattr(tui, "kill_session", lambda *_a, **_k: None)
     ok, msg, path = tui._start_and_validate_workflow(
         stdscr,
+        palette,
         db_path,
         "p",
         str(project_root),
@@ -402,8 +586,10 @@ def test_start_and_validate_workflow_paths(monkeypatch: pytest.MonkeyPatch, tmp_
     assert path.endswith("roadmap.md")
 
     monkeypatch.setattr(tui, "start_roadmap_coach", lambda *_a, **_k: "sess")
+    monkeypatch.setattr(tui, "_run_roadmap_coach_inline", lambda *_a, **_k: (False, "inline-boom"))
     ok2, msg2, path2 = tui._start_and_validate_workflow(
         stdscr,
+        palette,
         db_path,
         "p",
         str(project_root),
@@ -412,9 +598,42 @@ def test_start_and_validate_workflow_paths(monkeypatch: pytest.MonkeyPatch, tmp_
         "codex",
     )
     assert ok2 is False
-    assert "Roadmap not found after coach session sess" in msg2
+    assert "Roadmap coach failed: inline-boom" in msg2
     assert path2.endswith("roadmap.md")
 
+    monkeypatch.setattr(tui, "_run_roadmap_coach_inline", lambda *_a, **_k: (True, "ok"))
+    ok_missing, msg_missing, _ = tui._start_and_validate_workflow(
+        stdscr,
+        palette,
+        db_path,
+        "p",
+        str(project_root),
+        "roadmap.md",
+        "codex",
+        "codex",
+    )
+    assert ok_missing is False
+    assert "Roadmap not found after coach session sess" in msg_missing
+
+    monkeypatch.setattr(
+        tui,
+        "kill_session",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("kill")),
+    )
+    ok_missing2, msg_missing2, _ = tui._start_and_validate_workflow(
+        stdscr,
+        palette,
+        db_path,
+        "p",
+        str(project_root),
+        "still-missing.md",
+        "codex",
+        "codex",
+    )
+    assert ok_missing2 is False
+    assert "Roadmap not found after coach session sess" in msg_missing2
+
+    monkeypatch.setattr(tui, "kill_session", lambda *_a, **_k: None)
     roadmap_path = project_root / "roadmap.md"
     roadmap_path.write_text("### bad", encoding="utf-8")
     monkeypatch.setattr(
@@ -424,6 +643,7 @@ def test_start_and_validate_workflow_paths(monkeypatch: pytest.MonkeyPatch, tmp_
     )
     ok3, msg3, _ = tui._start_and_validate_workflow(
         stdscr,
+        palette,
         db_path,
         "p",
         str(project_root),
@@ -440,6 +660,7 @@ def test_start_and_validate_workflow_paths(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setattr(tui, "load_roadmap", lambda *_a, **_k: rm)
     ok4, msg4, resolved = tui._start_and_validate_workflow(
         stdscr,
+        palette,
         db_path,
         "p",
         str(project_root),
@@ -639,4 +860,233 @@ def test_run_tui_run_focus_navigation(monkeypatch: pytest.MonkeyPatch, tmp_path:
     ctr = {"v": 0.0}
     monkeypatch.setattr(tui.time, "monotonic", lambda: ctr.__setitem__("v", ctr["v"] + 1.0) or ctr["v"])
 
+    tui.run_tui(db_path=db_path, refresh_seconds=0.01)
+
+
+def test_run_tui_new_scheduler_and_task_actions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    conn = db.connect(db_path)
+    pid = db.create_project(conn, "p1", "/tmp/p1", "g")
+    batch_id = db.create_task_batch(conn, project_id=pid, name="b", source_text="s", status="queued")
+    task_id = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T", description="d")
+    conn.execute(
+        "UPDATE tasks SET status='awaiting_input', blocked_question='q?', tmux_target='sess:task.0', assigned_agent='codex' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    keys = [
+        ord("a"),
+        tui.curses.KEY_DOWN,
+        ord("b"),
+        ord("s"),
+        ord("z"),
+        ord("v"),
+        ord("y"),
+        ord("q"),
+    ]
+    _patch_curses(monkeypatch, keys, size=(34, 150), has_colors=False)
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+    ctr = {"v": 0.0}
+    monkeypatch.setattr(tui.time, "monotonic", lambda: ctr.__setitem__("v", ctr["v"] + 1.0) or ctr["v"])
+
+    monkeypatch.setattr(tui, "_prompt_add_project_modal", lambda *_a, **_k: ("/tmp/p2", "", ""))
+    monkeypatch.setattr(tui, "_add_project_from_root", lambda *_a, **_k: (True, "added"))
+    monkeypatch.setattr(tui, "_prompt_batch_modal", lambda *_a, **_k: ("B1", "codex", "t1\nt2"))
+    monkeypatch.setattr(tui, "create_batch_from_task_list", lambda **_k: 9)
+    monkeypatch.setattr(tui, "_prompt_task_reply_modal", lambda *_a, **_k: "answer")
+
+    class _Stats:
+        dispatched = 1
+        completed = 0
+        awaiting_input = 1
+        reassigned = 0
+        failed = 0
+
+    class _Scheduler:
+        def __init__(self, **_k):
+            self.replies: list[tuple[int, str]] = []
+
+        def tick(self):
+            return _Stats()
+
+        def reply_to_task(self, task_id: int, answer: str) -> None:
+            self.replies.append((task_id, answer))
+
+    monkeypatch.setattr(tui, "GlobalScheduler", _Scheduler)
+    tui.run_tui(db_path=db_path, refresh_seconds=0.01)
+
+
+def test_run_tui_new_error_paths_and_task_navigation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    conn = db.connect(db_path)
+    pid = db.create_project(conn, "p1", "/tmp/p1", "g")
+    batch_id = db.create_task_batch(conn, project_id=pid, name="b", source_text="s", status="queued")
+    task_id = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T", description="d")
+    conn.execute(
+        "UPDATE tasks SET status='running', blocked_question='', tmux_target='sess:task.0', assigned_agent='codex' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+    db.create_alert(conn, level="warn", kind="stuck", message="stuck", task_id=task_id, project_id=pid)
+
+    keys = [
+        ord("z"),  # enable auto scheduler
+        ord("s"),  # manual tick failure path
+        ord("a"),  # add cancelled
+        ord("b"),  # batch warn when project filter not selected
+        ord("v"),  # tasks mode
+        ord("y"),  # selected task not awaiting
+        tui.curses.KEY_DOWN,
+        tui.curses.KEY_UP,
+        tui.curses.KEY_NPAGE,
+        tui.curses.KEY_PPAGE,
+        ord("g"),
+        ord("G"),
+        ord("q"),
+    ]
+    _patch_curses(monkeypatch, keys, size=(34, 150), has_colors=False)
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+    ctr = {"v": 0.0}
+    monkeypatch.setattr(tui.time, "monotonic", lambda: ctr.__setitem__("v", ctr["v"] + 1.0) or ctr["v"])
+    monkeypatch.setattr(tui, "_prompt_add_project_modal", lambda *_a, **_k: None)
+
+    class _SchedErr:
+        def __init__(self, **_k):
+            return
+
+        def tick(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tui, "GlobalScheduler", _SchedErr)
+    tui.run_tui(db_path=db_path, refresh_seconds=0.01)
+
+
+def test_run_tui_batch_cancel_fail_and_reply_cancel_or_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    conn = db.connect(db_path)
+    pid = db.create_project(conn, "p1", "/tmp/p1", "g")
+    batch_id = db.create_task_batch(conn, project_id=pid, name="b", source_text="s", status="queued")
+    task_id = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T", description="d")
+    conn.execute(
+        "UPDATE tasks SET status='awaiting_input', blocked_question='q?', tmux_target='sess:task.0', assigned_agent='codex' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    keys = [
+        tui.curses.KEY_DOWN,
+        ord("b"),  # cancel batch modal
+        ord("b"),  # batch failure
+        ord("v"),
+        ord("y"),  # reply cancelled
+        ord("y"),  # reply send failure
+        ord("q"),
+    ]
+    _patch_curses(monkeypatch, keys, size=(34, 150), has_colors=False)
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+    ctr = {"v": 0.0}
+    monkeypatch.setattr(tui.time, "monotonic", lambda: ctr.__setitem__("v", ctr["v"] + 1.0) or ctr["v"])
+
+    calls = {"n": 0}
+
+    def fake_batch_modal(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return ("B", "codex", "tasks")
+
+    monkeypatch.setattr(tui, "_prompt_batch_modal", fake_batch_modal)
+    monkeypatch.setattr(
+        tui,
+        "create_batch_from_task_list",
+        lambda **_k: (_ for _ in ()).throw(RuntimeError("bad batch")),
+    )
+
+    reply_calls = {"n": 0}
+
+    def fake_reply_modal(*_a, **_k):
+        reply_calls["n"] += 1
+        if reply_calls["n"] == 1:
+            return None
+        return "answer"
+
+    monkeypatch.setattr(tui, "_prompt_task_reply_modal", fake_reply_modal)
+
+    class _Sched:
+        def __init__(self, **_k):
+            return
+
+        def tick(self):
+            class _Stats:
+                dispatched = completed = awaiting_input = reassigned = failed = 0
+
+            return _Stats()
+
+        def reply_to_task(self, *_a, **_k):
+            raise RuntimeError("send fail")
+
+    monkeypatch.setattr(tui, "GlobalScheduler", _Sched)
+    tui.run_tui(db_path=db_path, refresh_seconds=0.01)
+
+
+def test_prompt_batch_modal_empty_name_and_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    palette = {"border": 0, "info": 0, "muted": 0, "failed": 0, "selected": 0, "warn": 0}
+    monkeypatch.setattr(tui.curses, "curs_set", lambda *_a, **_k: None)
+    keys = [
+        21,   # clear name
+        10,   # error: empty name
+        ord("n"),
+        9,    # agent field
+        21,   # clear agent
+        10,   # error: empty agent
+        27,
+    ]
+    assert tui._prompt_batch_modal(FakeWindow(30, 140, keys), palette, "p") is None
+
+
+def test_run_tui_tasks_view_no_tasks_and_reply_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    conn = db.connect(db_path)
+    pid = db.create_project(conn, "p1", "/tmp/p1", "g")
+    # Ensure there is at least one awaiting task for reply success path.
+    batch_id = db.create_task_batch(conn, project_id=pid, name="b", source_text="s", status="queued")
+    task_id = db.create_task(conn, batch_id=batch_id, project_id=pid, title="T", description="d")
+    conn.execute(
+        "UPDATE tasks SET status='awaiting_input', blocked_question='q?', tmux_target='sess:task.0', assigned_agent='codex' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    # First run: tasks footer + reply success.
+    keys1 = [tui.curses.KEY_DOWN, ord("v"), ord("y"), ord("q")]
+    _patch_curses(monkeypatch, keys1, size=(34, 150), has_colors=False)
+    monkeypatch.setattr(tui.time, "sleep", lambda *_a, **_k: None)
+    ctr = {"v": 0.0}
+    monkeypatch.setattr(tui.time, "monotonic", lambda: ctr.__setitem__("v", ctr["v"] + 1.0) or ctr["v"])
+    monkeypatch.setattr(tui, "_prompt_task_reply_modal", lambda *_a, **_k: "ok")
+
+    class _SchedOk:
+        def __init__(self, **_k):
+            return
+
+        def tick(self):
+            class _Stats:
+                dispatched = completed = awaiting_input = reassigned = failed = 0
+
+            return _Stats()
+
+        def reply_to_task(self, *_a, **_k):
+            return None
+
+    monkeypatch.setattr(tui, "GlobalScheduler", _SchedOk)
+    tui.run_tui(db_path=db_path, refresh_seconds=0.01)
+
+    # Second run: no tasks in tasks view branch.
+    conn.execute("DELETE FROM tasks")
+    conn.commit()
+    keys2 = [tui.curses.KEY_DOWN, ord("v"), ord("q")]
+    _patch_curses(monkeypatch, keys2, size=(34, 150), has_colors=False)
+    ctr2 = {"v": 0.0}
+    monkeypatch.setattr(tui.time, "monotonic", lambda: ctr2.__setitem__("v", ctr2["v"] + 1.0) or ctr2["v"])
     tui.run_tui(db_path=db_path, refresh_seconds=0.01)

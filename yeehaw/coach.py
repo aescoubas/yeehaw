@@ -8,7 +8,11 @@ from pathlib import Path
 from . import db
 from .agents import resolve_command
 from .git_repo import GitRepoInfo
-from .tmux import attach_session, ensure_session, ensure_window, list_windows, send_text
+from .tmux import attach_session, capture_pane, ensure_session, ensure_window, list_windows, send_keys, send_text
+
+
+CODEX_TRUST_PROMPT_RE = re.compile(r"Do you trust the contents of this directory\?", re.IGNORECASE)
+CODEX_PRESS_ENTER_RE = re.compile(r"Press enter to continue", re.IGNORECASE)
 
 
 def _safe_session_name(prefix: str, stem: str) -> str:
@@ -25,6 +29,21 @@ def _ensure_window_alive(session_name: str, window_name: str, agent: str) -> Non
         f"Agent '{agent}' exited before initialization in session '{session_name}'. "
         "Check agent CLI installation/auth configuration."
     )
+
+
+def _handle_codex_trust_gate(target: str, agent: str, max_attempts: int = 4) -> None:
+    if agent.strip().lower() != "codex":
+        return
+    for _ in range(max_attempts):
+        pane = capture_pane(target, lines=1200)
+        tail = "\n".join(pane.splitlines()[-60:])
+        if not CODEX_TRUST_PROMPT_RE.search(tail):
+            return
+        if CODEX_PRESS_ENTER_RE.search(tail):
+            send_keys(target, "Enter")
+        else:
+            send_text(target, "1", press_enter=True)
+        time.sleep(0.35)
 
 
 def _roadmap_coach_prompt(project_name: str, project_root: str, output_path: str, guidelines: str) -> str:
@@ -112,6 +131,8 @@ def start_project_coach(
 
     time.sleep(warmup_seconds)
     _ensure_window_alive(session_name, "project-coach", agent)
+    _handle_codex_trust_gate(target=target, agent=agent)
+    _ensure_window_alive(session_name, "project-coach", agent)
 
     out_path = Path(guidelines_output)
     if not out_path.is_absolute():
@@ -156,6 +177,8 @@ def start_roadmap_coach(
     target = f"{session_name}:coach.0"
 
     time.sleep(warmup_seconds)
+    _ensure_window_alive(session_name, "coach", agent)
+    _handle_codex_trust_gate(target=target, agent=agent)
     _ensure_window_alive(session_name, "coach", agent)
 
     out_path = Path(output_path)

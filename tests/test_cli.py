@@ -240,6 +240,137 @@ def test_cmd_tui(monkeypatch: pytest.MonkeyPatch) -> None:
     assert called == [("x", 0.5)]
 
 
+def test_cmd_batch_and_task_and_scheduler(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    monkeypatch.setattr(cli, "create_batch_from_task_list", lambda **_k: 77)
+    tasks_file = tmp_path / "tasks.txt"
+    tasks_file.write_text("- a\n- b\n", encoding="utf-8")
+    rc = cli.cmd_batch_create(
+        _args(
+            project="p",
+            name="b",
+            tasks=None,
+            tasks_file=str(tasks_file),
+            planner_agent="codex",
+            db=None,
+            timeout_minutes=1,
+        )
+    )
+    assert rc == 0
+    assert "id=77" in capsys.readouterr().out
+
+    rc2 = cli.cmd_batch_create(
+        _args(
+            project="p",
+            name="b",
+            tasks="",
+            tasks_file=None,
+            planner_agent="codex",
+            db=None,
+            timeout_minutes=1,
+        )
+    )
+    assert rc2 == 2
+
+    called_replan: list[tuple] = []
+    monkeypatch.setattr(
+        cli,
+        "replan_batch_from_roadmap",
+        lambda **k: called_replan.append((k["batch_id"], k["roadmap_path"])),
+    )
+    rc3 = cli.cmd_batch_replan(_args(batch_id=3, roadmap="r.md", db=None))
+    assert rc3 == 0
+    assert called_replan == [(3, "r.md")]
+
+    class _Conn2:
+        pass
+
+    monkeypatch.setattr(cli.db, "connect", lambda *_a, **_k: _Conn2())
+    monkeypatch.setattr(cli.db, "get_project", lambda *_a, **_k: {"id": 1} if _a[1] == "p" else None)
+    monkeypatch.setattr(
+        cli.db,
+        "list_tasks",
+        lambda *_a, **_k: [
+            {
+                "id": 1,
+                "status": "awaiting_input",
+                "project_name": "p",
+                "priority": "high",
+                "assigned_agent": "codex",
+                "preferred_agent": None,
+                "title": "T1",
+                "blocked_question": "q?",
+            }
+        ],
+    )
+    assert cli.cmd_task_list(_args(db=None, status=None, project="p", limit=10)) == 0
+    assert "question: q?" in capsys.readouterr().out
+
+    monkeypatch.setattr(cli.db, "get_project", lambda *_a, **_k: None)
+    assert cli.cmd_task_list(_args(db=None, status=None, project="missing", limit=10)) == 2
+
+    monkeypatch.setattr(cli.db, "get_project", lambda *_a, **_k: {"id": 1})
+    monkeypatch.setattr(cli.db, "list_tasks", lambda *_a, **_k: [])
+    assert cli.cmd_task_list(_args(db=None, status="queued", project="p", limit=10)) == 0
+
+    class _Sched:
+        def __init__(self, **_k):
+            self.calls: list[tuple] = []
+
+        def reply_to_task(self, task_id: int, answer: str) -> None:
+            self.calls.append(("reply", task_id, answer))
+
+        def pause_task(self, task_id: int) -> None:
+            self.calls.append(("pause", task_id))
+
+        def tick(self):
+            class _Stats:
+                dispatched = 1
+                completed = 2
+                awaiting_input = 3
+                reassigned = 4
+                failed = 5
+
+            return _Stats()
+
+        def run_forever(self) -> None:
+            return None
+
+    sched = _Sched()
+    monkeypatch.setattr(cli, "GlobalScheduler", lambda **_k: sched)
+    assert cli.cmd_task_reply(_args(db=None, task_id=1, answer="a")) == 0
+    assert cli.cmd_task_pause(_args(db=None, task_id=1)) == 0
+    assert cli.cmd_scheduler_tick(_args(db=None, poll_seconds=0.1, max_attempts=3)) == 0
+    assert "dispatched=1" in capsys.readouterr().out
+    assert cli.cmd_scheduler_start(_args(db=None, poll_seconds=0.1, max_attempts=3)) == 0
+
+    monkeypatch.setattr(cli.db, "connect", lambda *_a, **_k: _Conn())
+    monkeypatch.setattr(
+        cli.db,
+        "scheduler_config",
+        lambda *_a, **_k: {
+            "max_global_sessions": 20,
+            "max_project_sessions": 10,
+            "default_stuck_minutes": 12,
+            "auto_reassign": 1,
+            "preemption_enabled": 1,
+        },
+    )
+    update_calls: list[dict] = []
+    monkeypatch.setattr(cli.db, "update_scheduler_config", lambda *_a, **k: update_calls.append(k))
+    assert cli.cmd_scheduler_config(
+        _args(
+            db=None,
+            set=True,
+            max_global=25,
+            max_project=9,
+            stuck_minutes=8,
+            auto_reassign=False,
+            preemption_enabled=True,
+        )
+    ) == 0
+    assert update_calls
+
+
 def test_build_parser_and_main(monkeypatch: pytest.MonkeyPatch) -> None:
     parser = cli.build_parser()
     parsed = parser.parse_args(["init-db"])

@@ -32,6 +32,40 @@ def test_ensure_window_alive(monkeypatch: pytest.MonkeyPatch) -> None:
         coach._ensure_window_alive("s", "coach", "codex")
 
 
+def test_handle_codex_trust_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    sends: list[str] = []
+    keys: list[str] = []
+    panes = iter(
+        [
+            "Do you trust the contents of this directory?\nPress enter to continue",
+            "ready prompt",
+        ]
+    )
+    monkeypatch.setattr(coach, "capture_pane", lambda *_a, **_k: next(panes))
+    monkeypatch.setattr(coach, "send_text", lambda _t, text, press_enter=True: sends.append(text))
+    monkeypatch.setattr(coach, "send_keys", lambda _t, key: keys.append(key))
+    monkeypatch.setattr(coach.time, "sleep", lambda *_a, **_k: None)
+
+    coach._handle_codex_trust_gate("s:coach.0", "codex")
+    assert keys == ["Enter"]
+    assert sends == []
+
+    # Alternative trust screen wording branch should pick explicit option 1.
+    panes2 = iter(
+        [
+            "Do you trust the contents of this directory?\n1. Yes, continue\n2. No, quit",
+            "ready prompt",
+        ]
+    )
+    monkeypatch.setattr(coach, "capture_pane", lambda *_a, **_k: next(panes2))
+    coach._handle_codex_trust_gate("s:coach.0", "codex")
+    assert sends == ["1"]
+
+    # Non-codex agents should skip trust handling.
+    coach._handle_codex_trust_gate("s:coach.0", "claude")
+    assert keys == ["Enter"]
+
+
 def test_start_project_coach(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -42,6 +76,7 @@ def test_start_project_coach(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr(coach, "ensure_session", lambda *a, **k: None)
     monkeypatch.setattr(coach, "ensure_window", lambda *a, **k: None)
     monkeypatch.setattr(coach, "list_windows", lambda *_a, **_k: ["project-coach"])
+    monkeypatch.setattr(coach, "_handle_codex_trust_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(coach, "attach_session", lambda *_a, **_k: sent.setdefault("attached", "1"))
     monkeypatch.setattr(coach, "send_text", lambda _t, text, press_enter=True: sent.setdefault("prompt", text))
     monkeypatch.setattr(coach.time, "sleep", lambda *_a, **_k: None)
@@ -76,6 +111,7 @@ def test_start_roadmap_coach(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr(coach, "ensure_session", lambda *a, **k: None)
     monkeypatch.setattr(coach, "ensure_window", lambda *a, **k: None)
     monkeypatch.setattr(coach, "list_windows", lambda *_a, **_k: ["coach"])
+    monkeypatch.setattr(coach, "_handle_codex_trust_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(coach, "send_text", lambda _t, text, press_enter=True: sent.setdefault("prompt", text))
     monkeypatch.setattr(coach, "attach_session", lambda *_a, **_k: sent.setdefault("attached", "1"))
     monkeypatch.setattr(coach.time, "sleep", lambda *_a, **_k: None)
@@ -95,6 +131,7 @@ def test_start_coach_fails_if_window_exits(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setattr(coach, "resolve_command", lambda *_a, **_k: ("cmd", 0.0))
     monkeypatch.setattr(coach, "ensure_session", lambda *a, **k: None)
     monkeypatch.setattr(coach, "ensure_window", lambda *a, **k: None)
+    monkeypatch.setattr(coach, "_handle_codex_trust_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(coach, "list_windows", lambda *_a, **_k: ["control"])
     monkeypatch.setattr(coach.time, "sleep", lambda *_a, **_k: None)
 
@@ -128,6 +165,7 @@ def test_start_roadmap_coach_fails_if_window_exits_after_prompt(
     monkeypatch.setattr(coach, "resolve_command", lambda *_a, **_k: ("cmd", 0.0))
     monkeypatch.setattr(coach, "ensure_session", lambda *a, **k: None)
     monkeypatch.setattr(coach, "ensure_window", lambda *a, **k: None)
+    monkeypatch.setattr(coach, "_handle_codex_trust_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(coach, "send_text", lambda *_a, **_k: None)
     monkeypatch.setattr(coach.time, "sleep", lambda *_a, **_k: None)
 

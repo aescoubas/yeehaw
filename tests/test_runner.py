@@ -40,6 +40,10 @@ def test_helpers() -> None:
     q2 = runner._extract_question("[[YEEHAW_NEEDS_INPUT x]]\nno question", "[[YEEHAW_NEEDS_INPUT x]]")
     assert "requested input" in q2
     assert runner._extract_question("none", "x") == ""
+    assert runner._marker_followed_by("[[M]]\nSummary:\n- ok", "[[M]]", "Summary:") is True
+    assert runner._marker_followed_by("[[M]]\nThen print\nSummary:", "[[M]]", "Summary:") is False
+    assert runner._marker_followed_by("none", "[[M]]", "Summary:") is False
+    assert runner._marker_followed_by("[[M]]", "[[M]]", "Summary:") is False
 
 
 def test_run_roadmap_project_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -124,12 +128,14 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, mode: str, include_repo_meta:
 
     def fake_capture(_target: str) -> str:
         state["captures"] += 1
-        if state["captures"] == 1:
+        if state["captures"] == 1 and mode != "done_in_baseline":
             return "boot"
         done = state["markers"]["done"]
         need = state["markers"]["input"]
         if mode == "done":
             return f"x\n{done}\nSummary:\n- ok\nArtifacts:\n- a.txt\n"
+        if mode == "done_in_baseline":
+            return f"{done}\nSummary:\n- fast\nArtifacts:\n- fast.txt\n"
         if mode == "await":
             return f"x\n{need}\nQuestion: please decide\n"
         return "still running"
@@ -140,6 +146,16 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, mode: str, include_repo_meta:
 
 def test_run_roadmap_done(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state = _patch_common(monkeypatch, mode="done", include_repo_meta=True)
+    run_id = runner.run_roadmap("proj", tmp_path / "r.md", poll_seconds=0.01)
+    assert run_id == 22
+    assert ("completed", True) in state["run_status"]
+    assert state["stage_completed"]
+
+
+def test_run_roadmap_done_when_marker_already_in_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = _patch_common(monkeypatch, mode="done_in_baseline", include_repo_meta=True)
     run_id = runner.run_roadmap("proj", tmp_path / "r.md", poll_seconds=0.01)
     assert run_id == 22
     assert ("completed", True) in state["run_status"]

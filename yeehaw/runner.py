@@ -88,6 +88,19 @@ def _extract_question(pane_text: str, input_marker: str) -> str:
     return "Agent requested input (no structured question found)."
 
 
+def _marker_followed_by(pane_text: str, marker: str, expected_prefix: str) -> bool:
+    marker_pos = pane_text.rfind(marker)
+    if marker_pos == -1:
+        return False
+    tail = pane_text[marker_pos + len(marker) :]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        return stripped.lower().startswith(expected_prefix.lower())
+    return False
+
+
 def _state_terminal(mode: str) -> bool:
     return mode in {"completed", "awaiting_input", "failed"}
 
@@ -234,7 +247,10 @@ def run_roadmap(
                 if runtime.mode == "waiting":
                     active_count += 1
                     pane = capture_pane(runtime.target)
-                    if pane.count(runtime.input_marker) > runtime.baseline_input_count:
+                    if (
+                        pane.count(runtime.input_marker) > runtime.baseline_input_count
+                        or _marker_followed_by(pane, runtime.input_marker, "Question:")
+                    ):
                         question = _extract_question(pane, runtime.input_marker)
                         runtime.mode = "awaiting_input"
 
@@ -258,7 +274,10 @@ def run_roadmap(
                         )
                         continue
 
-                    if pane.count(runtime.done_marker) > runtime.baseline_done_count:
+                    if (
+                        pane.count(runtime.done_marker) > runtime.baseline_done_count
+                        or _marker_followed_by(pane, runtime.done_marker, "Summary:")
+                    ):
                         summary, artifacts = _parse_summary_and_artifacts(pane, runtime.done_marker)
                         if runtime.stage_run_id is not None:
                             db.complete_stage_run(
