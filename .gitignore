@@ -1,7 +1,24 @@
+# Go
+/yeehaw
+/cmd/yeehaw/yeehaw
+*.exe
+*.test
+*.out
+coverage.out
+
+# Python (legacy)
 __pycache__/
 *.pyc
 *.egg-info/
 .venv/
-.yeehaw/
 .coverage
 .pytest_cache/
+
+# Yeehaw runtime
+.yeehaw/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
