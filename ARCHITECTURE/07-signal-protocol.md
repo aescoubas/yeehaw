@@ -1,34 +1,89 @@
-# 07 - Sentinel File Protocol
+# 07 — Sentinel File Protocol
 
-Agents signal completion by writing a JSON file. This replaces fragile pane-scanning.
+## Purpose
 
-## Signal File
+Workers signal task completion by writing a JSON file to a known directory.
+This decouples workers from the database — they never need DB access.
 
-Path: `{signal_dir}/signal.json`
+## Signal Directory
+
+```
+.yeehaw/signals/task-{id}/signal.json
+```
+
+Created by the orchestrator before launching the agent. Agent receives the
+full path in its task prompt.
+
+## Signal File Format
 
 ```json
 {
   "task_id": 42,
   "status": "done",
-  "summary": "Implemented user authentication with JWT",
-  "artifacts": ["internal/auth/auth.go", "internal/auth/auth_test.go"],
-  "timestamp": "2024-01-15T14:30:00Z"
+  "summary": "Implemented user model with migrations",
+  "artifacts": ["src/models/user.py", "migrations/001_create_users.sql"],
+  "timestamp": "2024-01-15T10:30:00Z"
 }
 ```
 
-## Status Values
+### Status Values
 
-- `done` - task completed successfully
-- `failed` - task could not be completed
-- `blocked` - task blocked by external dependency
+| Status | Meaning | Orchestrator Action |
+|--------|---------|-------------------|
+| `"done"` | Completed successfully | Run verification → mark done |
+| `"failed"` | Agent could not complete | Log failure, re-queue if attempts < max |
+| `"blocked"` | External dependency needed | Mark blocked, create alert |
 
-## Detection
+## Detection: watchdog
 
-- `fsnotify` watches the signal directory for file creation/write events
-- 500ms debounce after event detection (agent may still be writing)
-- 3 parse retries at 200ms intervals (handle partial writes)
-- Fallback: periodic polling every 30s as safety net
+```python
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-## Signal Directory
+class SignalHandler(FileSystemEventHandler):
+    def __init__(self, callback):
+        self.callback = callback
+        self._debounce = {}
 
-Located at `.yeehaw/signals/task-{id}/` in the repo root. Created by the harness before agent launch.
+    def on_created(self, event):
+        if event.src_path.endswith("signal.json"):
+            self._schedule(event.src_path)
+
+    def on_modified(self, event):
+        if event.src_path.endswith("signal.json"):
+            self._schedule(event.src_path)
+
+    def _schedule(self, path):
+        self._debounce[path] = time.monotonic()  # 500ms debounce
+```
+
+## Fallback: Polling
+
+30-second polling interval as fallback for edge cases where watchdog events
+are missed.
+
+## Parse Retries
+
+```python
+def read_signal(signal_path: Path, retries: int = 3) -> dict | None:
+    for attempt in range(retries):
+        try:
+            data = json.loads(signal_path.read_text())
+            if "task_id" in data and "status" in data:
+                return data
+        except (json.JSONDecodeError, KeyError):
+            pass
+        if attempt < retries - 1:
+            time.sleep(0.2)
+    return None
+```
+
+## Lifecycle
+
+1. Orchestrator creates `.yeehaw/signals/task-{id}/`
+2. Agent receives signal directory path in prompt
+3. Agent writes `signal.json` when finished
+4. watchdog detects creation/modification
+5. 500ms debounce → orchestrator reads signal
+6. Orchestrator processes result
+7. Signal directory preserved for debugging

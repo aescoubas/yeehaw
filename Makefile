@@ -1,23 +1,21 @@
-BINARY  := yeehaw
-GOFLAGS := GOTOOLCHAIN=local
+.PHONY: all install test lint check clean
 
-.PHONY: all build test vet check clean install
+all: check
 
-all: check build
-
-build:
-	$(GOFLAGS) go build -o $(BINARY) ./cmd/yeehaw
+install:
+	uv sync
 
 test:
-	$(GOFLAGS) go test ./...
+	uv run pytest
 
-vet:
-	$(GOFLAGS) go vet ./...
+test-cov:
+	uv run pytest --cov=yeehaw --cov-report=term-missing
 
-check: vet test
+lint:
+	uv run python -m py_compile src/yeehaw/cli/main.py
+
+check: test
 
 clean:
-	rm -f $(BINARY)
-
-install: build
-	install -m 755 $(BINARY) /usr/local/bin/
+	rm -rf dist/ build/ *.egg-info/ .pytest_cache/ htmlcov/ .coverage
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

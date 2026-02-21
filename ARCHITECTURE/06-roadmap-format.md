@@ -1,39 +1,90 @@
-# 06 - Roadmap Format
+# 06 — Roadmap Format
 
-Roadmaps are structured markdown documents produced by the master agent.
+## Structure
 
-## Format
+Roadmaps are structured Markdown documents with a strict hierarchy:
 
 ```markdown
 # Roadmap: project-name
 
-## Phase 1: Phase Title
-**Verification:** `go test ./...`
+## Phase 1: Foundation
 
-### Task 1.1: Task Title
-Task description paragraph(s).
+**Verify:** `make test`
 
-### Task 1.2: Another Task
-More description.
+### Task 1.1: Set up database schema
 
-## Phase 2: Next Phase
-**Verification:** `npm test`
+Detailed description of what needs to be done.
+Multiple paragraphs are fine.
 
-### Task 2.1: Something
-Description.
+### Task 1.2: Create API endpoints
+
+Another task description.
+
+## Phase 2: Features
+
+**Verify:** `pytest tests/integration/`
+
+### Task 2.1: User authentication
+
+Description here.
 ```
 
-## Parsing Rules
+## Rules
 
-1. H1 (`# Roadmap: ...`) - project name confirmation
-2. H2 (`## Phase N: ...`) - phase boundary
-3. Bold verification line after H2 - phase verification command
-4. H3 (`### Task N.M: ...`) - task boundary
-5. Everything after H3 until next heading - task description
+1. **H1** (`#`) — Exactly one, format: `# Roadmap: {project-name}`
+2. **H2** (`##`) — Phases, format: `## Phase {N}: {title}`
+3. **Bold verify** — Optional line after H2: `**Verify:** \`{command}\``
+4. **H3** (`###`) — Tasks, format: `### Task {N.M}: {title}`
+5. **Body** — Everything after H3 until next heading is the task description
+6. Phase numbers sequential starting from 1
+7. Task numbers match their phase: Phase 2 tasks are 2.1, 2.2, etc.
+8. At least one phase required, each phase needs at least one task
+
+## Parser Output
+
+```python
+@dataclass
+class Task:
+    number: str         # "1.1", "2.3"
+    title: str
+    description: str
+
+@dataclass
+class Phase:
+    number: int
+    title: str
+    verify_cmd: str | None
+    tasks: list[Task]
+
+@dataclass
+class Roadmap:
+    project_name: str
+    phases: list[Phase]
+```
 
 ## Validation
 
-- At least one phase required
-- Each phase must have at least one task
-- Task numbers must be sequential within phases
-- Phase numbers must be sequential
+```python
+def validate_roadmap(roadmap: Roadmap) -> list[str]:
+    """Returns list of validation error messages. Empty = valid."""
+    errors = []
+    if not roadmap.phases:
+        errors.append("Roadmap must have at least one phase")
+    for i, phase in enumerate(roadmap.phases):
+        if phase.number != i + 1:
+            errors.append(f"Phase {phase.number} out of sequence (expected {i+1})")
+        if not phase.tasks:
+            errors.append(f"Phase {phase.number} has no tasks")
+        for j, task in enumerate(phase.tasks):
+            expected = f"{phase.number}.{j+1}"
+            if task.number != expected:
+                errors.append(f"Task {task.number} out of sequence (expected {expected})")
+    return errors
+```
+
+## Parser
+
+Single-pass line-by-line state machine:
+```
+States: INIT → HEADER → PHASE → TASK_HEADER → TASK_BODY
+```

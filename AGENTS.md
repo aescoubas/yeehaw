@@ -30,9 +30,9 @@ When your task is complete (success or failure), create the file `signal.json` i
 ```
 
 Status values:
-- `"done"` - Task completed successfully
-- `"failed"` - Task could not be completed
-- `"blocked"` - Task is blocked by an external dependency
+- `"done"` — Task completed successfully
+- `"failed"` — Task could not be completed (include reason in summary)
+- `"blocked"` — Task is blocked by an external dependency
 
 **IMPORTANT:** The signal file is how the harness knows you are finished. Without it, your task will eventually time out.
 
@@ -52,10 +52,42 @@ Status values:
 
 ## Verification
 
-After completing your work, if a verification command was provided in the task prompt, run it and include the result in your signal summary.
+After completing your work, if a verification command was provided in the task prompt, run it and include the result in your signal summary. If verification fails, fix the issues before signaling `"done"`.
 
 ## Communication
 
 - Your only communication channel with the harness is the signal file.
 - Do NOT attempt to read or write to stdin/stdout for harness communication.
 - All task context is provided in your initial prompt.
+
+## Project Structure
+
+This project is a Python 3.12+ CLI tool built with:
+- `argparse` (stdlib) for CLI
+- `sqlite3` (stdlib) for persistence
+- `FastMCP` for MCP server
+- `watchdog` for filesystem monitoring
+- `uv` for package management
+
+Source layout:
+```
+src/yeehaw/          # Main package
+├── cli/             # argparse commands
+├── store/           # SQLite persistence
+├── mcp/             # FastMCP server for Planner agent
+├── orchestrator/    # Dispatch/monitor engine
+├── agent/           # Agent profiles (claude, gemini, codex)
+├── git/             # Worktree management
+├── tmux/            # Session management
+├── signal/          # Sentinel file protocol
+├── roadmap/         # Markdown parser
+└── planner/         # AI planning session
+tests/               # pytest test suite
+```
+
+When writing code, follow these conventions:
+- Type hints on all function signatures
+- Dataclasses for structured data
+- `pathlib.Path` instead of string paths
+- `subprocess.run()` with `capture_output=True` for shell commands
+- No global mutable state; pass dependencies explicitly
