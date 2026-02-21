@@ -48,6 +48,16 @@ func CapturePane(name string) (string, error) {
 	return string(out), nil
 }
 
+// CapturePaneFull captures the entire scrollback of a tmux pane.
+func CapturePaneFull(name string) (string, error) {
+	cmd := exec.Command("tmux", "capture-pane", "-t", name, "-p", "-S", "-")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("capture-pane %q: %s (%w)", name, strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
 // KillSession terminates a tmux session.
 func KillSession(name string) error {
 	cmd := exec.Command("tmux", "kill-session", "-t", name)

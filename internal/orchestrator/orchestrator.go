@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aescoubas/yeehaw/internal/agent"
@@ -193,12 +195,13 @@ func (o *Orchestrator) dispatchTask(task store.Task) error {
 		return fmt.Errorf("prepare worktree: %w", err)
 	}
 
-	// Create signal directory
+	// Create signal directory (remove stale signal from previous attempt)
 	sigDir, err := signal.EnsureSignalDir(o.Project.RootPath, task.ID)
 	if err != nil {
 		gitpkg.CleanupWorktree(o.Project.RootPath, worktreePath)
 		return fmt.Errorf("create signal dir: %w", err)
 	}
+	os.Remove(signal.SignalFile(o.Project.RootPath, task.ID)) // clear stale signal
 
 	// Record worktree in DB
 	if _, err := o.DB.InsertWorktree(task.ID, worktreePath, branch, baseSHA); err != nil {
@@ -215,16 +218,24 @@ func (o *Orchestrator) dispatchTask(task store.Task) error {
 		o.Logger.Printf("warning: could not watch signal dir: %v", err)
 	}
 
-	// Build prompt
+	// Write prompt file and launcher script
 	prompt := agent.BuildTaskPrompt(task.Number, task.Title, task.Description, sigDir, "", "")
+	promptFile := filepath.Join(sigDir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte(prompt), 0o644); err != nil {
+		return fmt.Errorf("write prompt file: %w", err)
+	}
+
+	launcherPath := filepath.Join(sigDir, "launch.sh")
+	cmd, err := agent.WriteLauncher(profile, promptFile, launcherPath)
+	if err != nil {
+		return fmt.Errorf("write launcher: %w", err)
+	}
 
 	// Create tmux session and launch agent
 	sessName := tmux.SessionName(task.ID)
 	if err := tmux.EnsureSession(sessName, worktreePath); err != nil {
 		return fmt.Errorf("create tmux session: %w", err)
 	}
-
-	cmd := agent.ResolveCommand(profile, prompt)
 	if err := tmux.SendText(sessName, cmd); err != nil {
 		return fmt.Errorf("send command to tmux: %w", err)
 	}
@@ -260,6 +271,7 @@ func (o *Orchestrator) handleSignalEvent(evt signal.WatchEvent) {
 
 func (o *Orchestrator) handleCompletion(task store.Task, sig *signal.Signal) {
 	sessName := tmux.SessionName(task.ID)
+	o.savePaneLog(task, sessName)
 	tmux.KillSession(sessName)
 	o.Watcher.Unwatch(task.SignalDir)
 
@@ -287,6 +299,7 @@ func (o *Orchestrator) handleFailure(task store.Task, reason string) {
 	o.Logger.Printf("task %d failed: %s (attempt %d/%d)", task.ID, reason, task.AttemptCount, task.MaxAttempts)
 
 	sessName := tmux.SessionName(task.ID)
+	o.savePaneLog(task, sessName)
 	tmux.KillSession(sessName)
 	o.Watcher.Unwatch(task.SignalDir)
 
@@ -297,6 +310,20 @@ func (o *Orchestrator) handleFailure(task store.Task, reason string) {
 	} else {
 		o.DB.UpdateTaskStatus(task.ID, "failed")
 		o.DB.InsertEvent(&o.Project.ID, &task.ID, "failed", fmt.Sprintf("max attempts reached: %s", reason))
+	}
+}
+
+func (o *Orchestrator) savePaneLog(task store.Task, sessName string) {
+	if task.SignalDir == "" {
+		return
+	}
+	output, err := tmux.CapturePaneFull(sessName)
+	if err != nil {
+		return // session may already be dead, that's fine
+	}
+	logFile := filepath.Join(task.SignalDir, "output.log")
+	if err := os.WriteFile(logFile, []byte(output), 0o644); err != nil {
+		o.Logger.Printf("task %d: failed to write log: %v", task.ID, err)
 	}
 }
 

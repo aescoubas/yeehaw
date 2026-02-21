@@ -39,6 +39,9 @@ func DetectRepo(path string) (*RepoInfo, error) {
 // PrepareWorktree creates a git worktree for a task. The worktree is placed
 // under .yeehaw/worktrees/<branch> in the repo root. Returns the absolute
 // worktree path and the base SHA it branched from.
+//
+// On retry, if the branch or worktree already exists, it cleans up the stale
+// state before creating fresh ones.
 func PrepareWorktree(repoRoot, branch string) (worktreePath, baseSHA string, err error) {
 	worktreeDir := filepath.Join(repoRoot, ".yeehaw", "worktrees")
 	if err := os.MkdirAll(worktreeDir, 0o755); err != nil {
@@ -52,6 +55,15 @@ func PrepareWorktree(repoRoot, branch string) (worktreePath, baseSHA string, err
 		return "", "", fmt.Errorf("get base sha: %w", err)
 	}
 	baseSHA = strings.TrimSpace(sha)
+
+	// Clean up stale worktree/branch from a previous attempt
+	if _, statErr := os.Stat(worktreePath); statErr == nil {
+		_, _ = runGit(repoRoot, "worktree", "remove", "--force", worktreePath)
+		_, _ = runGit(repoRoot, "worktree", "prune")
+	}
+	if _, verifyErr := runGit(repoRoot, "rev-parse", "--verify", branch); verifyErr == nil {
+		_, _ = runGit(repoRoot, "branch", "-D", branch)
+	}
 
 	_, err = runGit(repoRoot, "worktree", "add", "-b", branch, worktreePath, "HEAD")
 	if err != nil {

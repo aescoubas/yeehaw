@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -82,7 +83,17 @@ When the roadmap is complete, save it to: %s/.yeehaw/roadmap-draft.md
 			return err
 		}
 
-		agentCmd := agent.ResolveCommand(profile, prompt)
+		// Write prompt and launcher script
+		promptFile := filepath.Join(project.RootPath, ".yeehaw", "master-prompt.md")
+		if err := os.WriteFile(promptFile, []byte(prompt), 0o644); err != nil {
+			return fmt.Errorf("write prompt file: %w", err)
+		}
+
+		launcherPath := filepath.Join(project.RootPath, ".yeehaw", "master-launch.sh")
+		agentCmd, err := agent.WriteLauncher(profile, promptFile, launcherPath)
+		if err != nil {
+			return err
+		}
 		if err := tmux.SendText(sessName, agentCmd); err != nil {
 			return err
 		}

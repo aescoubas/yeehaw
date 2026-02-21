@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,22 +24,39 @@ func TestResolve(t *testing.T) {
 	}
 }
 
-func TestResolveCommand(t *testing.T) {
+func TestWriteLauncher(t *testing.T) {
 	p, _ := Resolve("claude")
-	cmd := ResolveCommand(p, "do the thing")
-	if !strings.Contains(cmd, "claude") {
-		t.Errorf("command missing 'claude': %s", cmd)
-	}
-	if !strings.Contains(cmd, "do the thing") {
-		t.Errorf("command missing prompt: %s", cmd)
-	}
-}
+	dir := t.TempDir()
 
-func TestResolveCommandEscaping(t *testing.T) {
-	p, _ := Resolve("claude")
-	cmd := ResolveCommand(p, "it's a test")
-	if strings.Contains(cmd, "it's") {
-		t.Errorf("single quote not escaped: %s", cmd)
+	promptFile := filepath.Join(dir, "prompt.md")
+	os.WriteFile(promptFile, []byte("test prompt"), 0o644)
+
+	launcherPath := filepath.Join(dir, "launch.sh")
+	cmd, err := WriteLauncher(p, promptFile, launcherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(cmd, "bash") {
+		t.Errorf("command should use bash: %s", cmd)
+	}
+	if !strings.Contains(cmd, launcherPath) {
+		t.Errorf("command should reference launcher: %s", cmd)
+	}
+
+	data, err := os.ReadFile(launcherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	if !strings.Contains(script, "claude") {
+		t.Errorf("script missing agent command: %s", script)
+	}
+	if !strings.Contains(script, promptFile) {
+		t.Errorf("script missing prompt file path: %s", script)
+	}
+	if !strings.Contains(script, "exec") {
+		t.Errorf("script should exec the agent: %s", script)
 	}
 }
 

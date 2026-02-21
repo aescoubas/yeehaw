@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -52,12 +53,17 @@ func Resolve(name string) (Profile, error) {
 	return p, nil
 }
 
-// ResolveCommand builds the full CLI command string to launch an agent with
-// the given prompt. Returns the command to be sent to a tmux session.
-func ResolveCommand(profile Profile, prompt string) string {
-	// Escape single quotes in the prompt for shell safety
-	escaped := strings.ReplaceAll(prompt, "'", "'\\''")
-	return fmt.Sprintf("%s %s '%s'", profile.Command, profile.PromptFlag, escaped)
+// WriteLauncher writes a shell script that displays the prompt (visible in tmux
+// scrollback) then exec's the agent reading from the prompt file. Returns the
+// short command to send to tmux. This avoids all shell escaping issues since
+// the prompt never passes through tmux send-keys.
+func WriteLauncher(profile Profile, promptFile, launcherPath string) (string, error) {
+	script := fmt.Sprintf("#!/bin/bash\ncat '%s'\necho\nexec %s %s \"$(cat '%s')\"\n",
+		promptFile, profile.Command, profile.PromptFlag, promptFile)
+	if err := os.WriteFile(launcherPath, []byte(script), 0o755); err != nil {
+		return "", fmt.Errorf("write launcher: %w", err)
+	}
+	return fmt.Sprintf("bash '%s'", launcherPath), nil
 }
 
 // Timeout returns the agent's timeout as a time.Duration.

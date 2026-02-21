@@ -2,11 +2,18 @@ package tui
 
 import (
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/aescoubas/yeehaw/internal/orchestrator"
 	"github.com/aescoubas/yeehaw/internal/store"
 )
 
@@ -35,6 +42,11 @@ type Model struct {
 	eventScroll   int
 
 	err error
+
+	statusMsg   string
+	statusIsErr bool
+
+	orch *orchestrator.Orchestrator
 }
 
 // New creates the TUI model.
@@ -77,23 +89,85 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		return m, tea.Batch(loadProjects(m.db), loadEvents(m.db))
+		cmds := []tea.Cmd{loadProjects(m.db), loadEvents(m.db)}
+		if len(m.projects) > 0 {
+			cmds = append(cmds, loadTasksForProject(m.db, m.projects[m.projectCursor].ID))
+		}
+		if m.orch != nil {
+			cmds = append(cmds, tickEvery(3*time.Second))
+		}
+		return m, tea.Batch(cmds...)
 
 	case errMsg:
 		m.err = msg.err
 		return m, nil
+
+	case editorFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Editor error: %v", msg.err)
+			m.statusIsErr = true
+			return m, nil
+		}
+		m.statusMsg = "Importing roadmap..."
+		m.statusIsErr = false
+		return m, importRoadmap(m.db, msg.project, msg.filePath)
+
+	case roadmapApprovedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Approve failed: %v", msg.err)
+			m.statusIsErr = true
+			return m, nil
+		}
+		m.statusMsg = "Roadmap approved — press 'r' to run"
+		return m, nil
+
+	case roadmapImportedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Import failed: %v", msg.err)
+			m.statusIsErr = true
+			return m, nil
+		}
+		m.statusMsg = msg.summary
+		m.statusIsErr = false
+		return m, tea.Batch(
+			loadProjects(m.db),
+			loadTasksForProject(m.db, msg.projectID),
+			loadEvents(m.db),
+		)
 	}
 
 	return m, nil
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Clear status on any keypress
+	m.statusMsg = ""
+
 	switch msg.String() {
 	case "q", "ctrl+c":
+		if m.orch != nil {
+			m.orch.Stop()
+		}
 		return m, tea.Quit
 
 	case "tab":
 		m.focus = (m.focus + 1) % 3
+		return m, nil
+
+	case "shift+tab":
+		m.focus = (m.focus + 2) % 3
+		return m, nil
+
+	case "l":
+		if m.focus == PanelProjects {
+			m.focus = PanelTasks
+		}
+		return m, nil
+
+	case "h":
+		if m.focus == PanelTasks {
+			m.focus = PanelProjects
+		}
 		return m, nil
 
 	case "j", "down":
@@ -147,6 +221,123 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case "e":
+		// Open roadmap in neovim for the selected project
+		if len(m.projects) == 0 {
+			m.statusMsg = "No projects available"
+			m.statusIsErr = true
+			return m, nil
+		}
+		project := m.projects[m.projectCursor]
+		filePath := filepath.Join(project.RootPath, ".yeehaw", "roadmap-draft.md")
+
+		// Ensure .yeehaw directory exists
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+			m.statusMsg = fmt.Sprintf("Cannot create dir: %v", err)
+			m.statusIsErr = true
+			return m, nil
+		}
+
+		// If file doesn't exist, seed it from DB or template
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			var content string
+			rm, dbErr := m.db.GetLatestRoadmap(project.ID)
+			if dbErr == nil && rm != nil {
+				content = rm.RawText
+			} else {
+				content = roadmapTemplate(project.Name)
+			}
+			if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+				m.statusMsg = fmt.Sprintf("Write failed: %v", err)
+				m.statusIsErr = true
+				return m, nil
+			}
+		}
+
+		cmd := exec.Command("nvim", filePath)
+		return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+			return editorFinishedMsg{err: err, project: project, filePath: filePath}
+		})
+
+	case "p":
+		// View task log (prompt + output) for the selected task
+		if m.taskCursor < len(m.tasks) {
+			task := m.tasks[m.taskCursor]
+			if task.SignalDir == "" {
+				m.statusMsg = "No log available (task not yet dispatched)"
+				m.statusIsErr = true
+				return m, nil
+			}
+			promptFile := filepath.Join(task.SignalDir, "prompt.md")
+			outputFile := filepath.Join(task.SignalDir, "output.log")
+			var files []string
+			if _, err := os.Stat(promptFile); err == nil {
+				files = append(files, promptFile)
+			}
+			if _, err := os.Stat(outputFile); err == nil {
+				files = append(files, outputFile)
+			}
+			if len(files) == 0 {
+				m.statusMsg = "No log files found"
+				m.statusIsErr = true
+				return m, nil
+			}
+			cmd := exec.Command("less", files...)
+			return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+				return tickMsg{}
+			})
+		}
+		return m, nil
+
+	case "a":
+		// Approve draft roadmap for the selected project
+		if len(m.projects) == 0 {
+			m.statusMsg = "No projects available"
+			m.statusIsErr = true
+			return m, nil
+		}
+		project := m.projects[m.projectCursor]
+		return m, approveRoadmap(m.db, project.ID)
+
+	case "r":
+		// Start orchestrator for the selected project
+		if m.orch != nil {
+			m.statusMsg = "Orchestrator already running"
+			m.statusIsErr = true
+			return m, nil
+		}
+		if len(m.projects) == 0 {
+			m.statusMsg = "No projects available"
+			m.statusIsErr = true
+			return m, nil
+		}
+		project := m.projects[m.projectCursor]
+		rm, err := m.db.GetLatestRoadmap(project.ID)
+		if err != nil || rm == nil {
+			m.statusMsg = "No roadmap found"
+			m.statusIsErr = true
+			return m, nil
+		}
+		if rm.Status != "approved" && rm.Status != "executing" {
+			m.statusMsg = fmt.Sprintf("Roadmap is %q (approve first with 'a')", rm.Status)
+			m.statusIsErr = true
+			return m, nil
+		}
+		if rm.Status == "approved" {
+			m.db.UpdateRoadmapStatus(rm.ID, "executing")
+		}
+		logger := log.New(io.Discard, "", 0)
+		orch, err := orchestrator.New(m.db, &project, rm, logger)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Start failed: %v", err)
+			m.statusIsErr = true
+			return m, nil
+		}
+		m.orch = orch
+		go orch.RunForever()
+		m.statusMsg = fmt.Sprintf("Orchestrator started for %s", project.Name)
+		return m, tickEvery(3 * time.Second)
 	}
 
 	return m, nil
@@ -210,11 +401,19 @@ func (m Model) View() string {
 
 	// Help bar
 	help := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
-		" [Tab] focus  [w] attach  [s] refresh  [j/k] navigate  [q] quit",
+		" [h/l] focus  [j/k] scroll  [e] edit  [a] approve  [r] run  [w] attach  [p] log  [s] refresh  [q] quit",
 	)
 
 	// Compose
 	top := lipgloss.JoinHorizontal(lipgloss.Top, projectsPanel, tasksPanel)
+	if m.statusMsg != "" {
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+		if m.statusIsErr {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+		}
+		statusLine := " " + style.Render(m.statusMsg)
+		return lipgloss.JoinVertical(lipgloss.Left, title, top, eventsPanel, statusLine, help)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, top, eventsPanel, help)
 }
 
