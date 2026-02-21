@@ -1,0 +1,33 @@
+"""Orchestrator run command."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from yeehaw.orchestrator.engine import Orchestrator
+from yeehaw.store.store import Store
+
+
+def handle_run(args: Any, db_path: Path) -> None:
+    """Launch orchestrator loop."""
+    store = Store(db_path)
+    repo_root = db_path.parent.parent
+
+    project_id = None
+    if args.project:
+        project = store.get_project(args.project)
+        if not project:
+            print(f"Error: Project '{args.project}' not found.")
+            store.close()
+            return
+        project_id = project["id"]
+
+    print("Starting orchestrator... (Ctrl+C to stop)")
+    orchestrator = Orchestrator(store, repo_root)
+    try:
+        orchestrator.run(project_id=project_id)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        store.close()
