@@ -246,12 +246,12 @@ uv run yeehaw scheduler show
 - Update scheduler config:
 
 ```bash
-uv run yeehaw scheduler config --max-global 5 --max-project 3 --tick 5 --timeout 60
+uv run yeehaw scheduler config --max-global 5 --max-project 5 --tick 5 --timeout 60
 ```
 
 Defaults:
 - `max_global_tasks=5`
-- `max_per_project=3`
+- `max_per_project=5`
 - `tick_interval_sec=5`
 - `task_timeout_min=60`
 
@@ -321,7 +321,7 @@ Phase flow:
 - If no next phase, roadmap becomes `completed`.
 
 Failure/retry behavior:
-- Crash, timeout, dirty `done` signal, merge failure, or worker `failed` signal marks task failed.
+- Crash, timeout, dirty `done` signal, rebase/merge failure, or worker `failed` signal marks task failed.
 - Task is re-queued until `max_attempts` is exhausted (default `4`).
 - Exhaustion emits an alert.
 
@@ -333,7 +333,7 @@ Per-task branch name:
 Per-roadmap integration branch:
 - `yeehaw/roadmap-<roadmap_id>` (created on first dispatch for that roadmap)
 - Task worktrees are based on this branch.
-- On `done`, Yeehaw auto-merges task branch into this integration branch.
+- On `done`, Yeehaw first rebases the task branch onto this integration branch, then merges (fast-forward preferred).
 
 Worktree location:
 - `~/.yeehaw/worktrees/<repo-key>/...`

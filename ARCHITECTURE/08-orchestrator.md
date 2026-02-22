@@ -50,9 +50,10 @@ For each launch:
 ## Completion Sequence (`status="done"`)
 
 1. ensure worktree has no uncommitted changes
-2. merge task branch into integration branch via temporary merge worktree
-3. mark task done if merge succeeds
-4. on merge failure, mark failed and retry later from updated base
+2. rebase task branch onto integration branch (temporary rebase worktree)
+3. merge task branch into integration branch (fast-forward preferred) via temporary merge worktree
+4. mark task done if rebase/merge succeeds
+5. on rebase/merge failure, mark failed and retry later from updated base
 
 Task worktree is cleaned after processing.
 

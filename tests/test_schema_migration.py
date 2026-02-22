@@ -319,3 +319,62 @@ def test_existing_modern_db_migrates_tasks_to_support_paused(tmp_path: Path) -> 
     assert "'paused'" in str(row[0] or "")
     assert "integration_branch" in roadmap_cols
     assert task_dependencies is not None
+
+
+def test_scheduler_default_per_project_is_bumped_from_3_to_5(tmp_path: Path) -> None:
+    db_path = tmp_path / ".yeehaw" / "yeehaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE scheduler_config (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            max_global_tasks    INTEGER NOT NULL DEFAULT 5,
+            max_per_project     INTEGER NOT NULL DEFAULT 3,
+            tick_interval_sec   INTEGER NOT NULL DEFAULT 5,
+            task_timeout_min    INTEGER NOT NULL DEFAULT 60
+        );
+        INSERT INTO scheduler_config (
+            id, max_global_tasks, max_per_project, tick_interval_sec, task_timeout_min
+        ) VALUES (1, 5, 3, 5, 60);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db_path)
+    try:
+        config = store.get_scheduler_config()
+        assert config["max_per_project"] == 5
+    finally:
+        store.close()
+
+
+def test_scheduler_custom_per_project_value_is_preserved(tmp_path: Path) -> None:
+    db_path = tmp_path / ".yeehaw" / "yeehaw.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE scheduler_config (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            max_global_tasks    INTEGER NOT NULL DEFAULT 5,
+            max_per_project     INTEGER NOT NULL DEFAULT 3,
+            tick_interval_sec   INTEGER NOT NULL DEFAULT 5,
+            task_timeout_min    INTEGER NOT NULL DEFAULT 60
+        );
+        INSERT INTO scheduler_config (
+            id, max_global_tasks, max_per_project, tick_interval_sec, task_timeout_min
+        ) VALUES (1, 7, 3, 5, 60);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db_path)
+    try:
+        config = store.get_scheduler_config()
+        assert config["max_global_tasks"] == 7
+        assert config["max_per_project"] == 3
+    finally:
+        store.close()

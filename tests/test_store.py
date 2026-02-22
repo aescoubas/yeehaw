@@ -156,6 +156,10 @@ def test_events_alerts_and_scheduler_config(store: Store) -> None:
 
     config = store.get_scheduler_config()
     assert config["id"] == 1
+    assert config["max_global_tasks"] == 5
+    assert config["max_per_project"] == 5
+    assert config["tick_interval_sec"] == 5
+    assert config["task_timeout_min"] == 60
 
     store.update_scheduler_config(max_global_tasks=7, tick_interval_sec=10)
     updated = store.get_scheduler_config()

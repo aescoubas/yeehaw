@@ -874,3 +874,156 @@ def test_handle_timeout_records_log_hints(
     assert "Task timed out" in (updated["last_failure"] or "")
     assert "Check log:" in (updated["last_failure"] or "")
     assert "Pane snapshot:" in (updated["last_failure"] or "")
+
+
+def test_merge_done_task_branch_rebases_then_merges(orchestrator_store: tuple[Store, Path]) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    source_branch = "yeehaw/task-1.1-task-1"
+    target_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", target_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    store.set_roadmap_integration_branch(roadmap_id, target_branch)
+    store._conn.execute("UPDATE tasks SET branch_name = ? WHERE id = ?", (source_branch, task_id))
+    store._conn.commit()
+
+    subprocess.run(
+        ["git", "checkout", "-b", source_branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "task.txt").write_text("task branch change\n")
+    subprocess.run(["git", "add", "task.txt"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "task change"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", target_branch], cwd=repo_root, check=True, capture_output=True)
+    (repo_root / "integration.txt").write_text("integration branch change\n")
+    subprocess.run(
+        ["git", "add", "integration.txt"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "integration change"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", "--detach"], cwd=repo_root, check=True, capture_output=True)
+
+    orchestrator = Orchestrator(store, repo_root)
+    task = store.get_task(task_id)
+    assert task is not None
+    error = orchestrator._merge_done_task_branch(task)
+    assert error is None
+
+    source_in_target = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            f"refs/heads/{source_branch}",
+            f"refs/heads/{target_branch}",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+    )
+    target_in_source = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            f"refs/heads/{target_branch}",
+            f"refs/heads/{source_branch}",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+    )
+    assert source_in_target.returncode == 0
+    assert target_in_source.returncode == 0
+
+    events = store.list_events(limit=20)
+    kinds = [event["kind"] for event in events]
+    assert "task_rebased" in kinds
+    assert "task_merged" in kinds
+
+
+def test_merge_done_task_branch_reports_rebase_conflict(orchestrator_store: tuple[Store, Path]) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    source_branch = "yeehaw/task-1.1-task-1"
+    target_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", target_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    store.set_roadmap_integration_branch(roadmap_id, target_branch)
+    store._conn.execute("UPDATE tasks SET branch_name = ? WHERE id = ?", (source_branch, task_id))
+    store._conn.commit()
+
+    subprocess.run(
+        ["git", "checkout", target_branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "conflict.txt").write_text("integration value\n")
+    subprocess.run(["git", "add", "conflict.txt"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "integration conflict change"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(
+        ["git", "checkout", "-b", source_branch, f"refs/heads/{target_branch}~1"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "conflict.txt").write_text("task value\n")
+    subprocess.run(["git", "add", "conflict.txt"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "task conflict change"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", "--detach"], cwd=repo_root, check=True, capture_output=True)
+
+    orchestrator = Orchestrator(store, repo_root)
+    task = store.get_task(task_id)
+    assert task is not None
+    error = orchestrator._merge_done_task_branch(task)
+    assert error is not None
+    assert "Failed to rebase" in error
+    assert "content_conflict" in error
+    assert "conflict.txt" in error

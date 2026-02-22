@@ -51,6 +51,18 @@ Handling:
 2. mark failed with merge details
 3. retry policy applies (worker will relaunch from refreshed base)
 
+## Rebase Failure on Completion
+
+Condition:
+
+- task branch cannot be rebased onto roadmap integration branch
+
+Handling:
+
+1. classify conflict type from git output (for example `content_conflict`)
+2. include conflicted file names in failure details when available
+3. mark failed and retry from latest integration branch base
+
 ## Missing Integration Branch
 
 Condition:

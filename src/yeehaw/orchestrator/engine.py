@@ -28,6 +28,7 @@ from yeehaw.tmux.session import (
 MAIN_BRANCH = "main"
 INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
 MERGE_WORKTREE_DIR = "merge-worktrees"
+REBASE_WORKTREE_DIR = "rebase-worktrees"
 
 
 class Orchestrator:
@@ -444,6 +445,15 @@ class Orchestrator:
             )
             return None
 
+        rebase_error = self._rebase_branch_onto_target(
+            repo_root=repo_root,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            task_id=int(task["id"]),
+        )
+        if rebase_error:
+            return rebase_error
+
         merge_root = self.runtime_root / MERGE_WORKTREE_DIR
         merge_root.mkdir(parents=True, exist_ok=True)
         merge_worktree = merge_root / f"task-{task['id']}"
@@ -476,22 +486,33 @@ class Orchestrator:
             merge_env.setdefault("GIT_COMMITTER_EMAIL", "yeehaw@local")
 
             merge_result = subprocess.run(
-                ["git", "merge", "--no-edit", f"refs/heads/{source_branch}"],
+                ["git", "merge", "--ff-only", f"refs/heads/{source_branch}"],
                 cwd=merge_worktree,
                 capture_output=True,
                 text=True,
                 env=merge_env,
             )
             if merge_result.returncode != 0:
+                merge_result = subprocess.run(
+                    ["git", "merge", "--no-edit", f"refs/heads/{source_branch}"],
+                    cwd=merge_worktree,
+                    capture_output=True,
+                    text=True,
+                    env=merge_env,
+                )
+            if merge_result.returncode != 0:
+                conflict_detail = self._format_conflict_detail(
+                    worktree_path=merge_worktree,
+                    detail=self._git_command_error(merge_result, fallback="unknown merge error"),
+                )
                 subprocess.run(
                     ["git", "merge", "--abort"],
                     cwd=merge_worktree,
                     capture_output=True,
                     text=True,
                 )
-                detail = merge_result.stderr.strip() or merge_result.stdout.strip() or "unknown merge error"
                 return (
-                    f"Failed to merge {source_branch} into {target_branch}: {detail}. "
+                    f"Failed to merge {source_branch} into {target_branch}: {conflict_detail}. "
                     "Task will be retried against latest integration branch."
                 )
 
@@ -538,6 +559,152 @@ class Orchestrator:
                 capture_output=True,
                 text=True,
             )
+
+    def _rebase_branch_onto_target(
+        self,
+        *,
+        repo_root: Path,
+        source_branch: str,
+        target_branch: str,
+        task_id: int,
+    ) -> str | None:
+        """Rebase source branch onto target branch before merge."""
+        source_before = self._git_ref(repo_root, source_branch)
+        if source_before is None:
+            return f"Task branch '{source_branch}' is missing"
+
+        rebase_root = self.runtime_root / REBASE_WORKTREE_DIR
+        rebase_root.mkdir(parents=True, exist_ok=True)
+        rebase_worktree = rebase_root / f"task-{task_id}"
+        if rebase_worktree.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(rebase_worktree)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+
+        add_result = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(rebase_worktree), f"refs/heads/{source_branch}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if add_result.returncode != 0:
+            detail = self._git_command_error(add_result, fallback="unknown git error")
+            return f"Failed to prepare rebase worktree: {detail}"
+
+        try:
+            rebase_result = subprocess.run(
+                ["git", "rebase", f"refs/heads/{target_branch}"],
+                cwd=rebase_worktree,
+                capture_output=True,
+                text=True,
+            )
+            if rebase_result.returncode != 0:
+                conflict_detail = self._format_conflict_detail(
+                    worktree_path=rebase_worktree,
+                    detail=self._git_command_error(rebase_result, fallback="unknown rebase error"),
+                )
+                subprocess.run(
+                    ["git", "rebase", "--abort"],
+                    cwd=rebase_worktree,
+                    capture_output=True,
+                    text=True,
+                )
+                return (
+                    f"Failed to rebase {source_branch} onto {target_branch}: {conflict_detail}. "
+                    "Task will be retried against latest integration branch."
+                )
+
+            rebased_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=rebase_worktree,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+            update = subprocess.run(
+                ["git", "update-ref", f"refs/heads/{source_branch}", rebased_head, source_before],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            if update.returncode != 0:
+                detail = self._git_command_error(update, fallback="unknown update-ref error")
+                return f"Failed to update rebased task branch '{source_branch}': {detail}"
+
+            self.store.log_event(
+                "task_rebased",
+                f"Rebased {source_branch} onto {target_branch}",
+                task_id=task_id,
+            )
+            return None
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(rebase_worktree)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+
+    @staticmethod
+    def _git_command_error(result: subprocess.CompletedProcess[str], fallback: str) -> str:
+        """Return best-effort human-readable error text from a git subprocess result."""
+        detail = result.stderr.strip() or result.stdout.strip()
+        return detail or fallback
+
+    @staticmethod
+    def _git_conflicted_files(worktree_path: Path) -> list[str]:
+        """Return list of currently conflicted files in a worktree."""
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        files: list[str] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped:
+                files.append(stripped)
+        return files
+
+    @staticmethod
+    def _classify_conflict(detail: str) -> str:
+        """Classify common git conflict categories from command output."""
+        lowered = detail.lower()
+        if "add/add" in lowered or "both added" in lowered:
+            return "add_add_conflict"
+        if "modify/delete" in lowered or "deleted by" in lowered:
+            return "modify_delete_conflict"
+        if "rename/rename" in lowered or "rename/delete" in lowered:
+            return "rename_conflict"
+        if "binary" in lowered and "conflict" in lowered:
+            return "binary_conflict"
+        if "conflict" in lowered:
+            return "content_conflict"
+        return "unknown_conflict"
+
+    def _format_conflict_detail(self, worktree_path: Path, detail: str) -> str:
+        """Format conflict classification and file list for retry guidance."""
+        conflict_type = self._classify_conflict(detail)
+        files = self._git_conflicted_files(worktree_path)
+        if not files:
+            return f"{conflict_type}; {detail}"
+        preview = ", ".join(files[:5])
+        if len(files) > 5:
+            preview += ", ..."
+        return f"{conflict_type}; files: {preview}; {detail}"
 
     @staticmethod
     def _git_branch_exists(repo_root: Path, branch: str) -> bool:

@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE TABLE IF NOT EXISTS scheduler_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     max_global_tasks    INTEGER NOT NULL DEFAULT 5,
-    max_per_project     INTEGER NOT NULL DEFAULT 3,
+    max_per_project     INTEGER NOT NULL DEFAULT 5,
     tick_interval_sec   INTEGER NOT NULL DEFAULT 5,
     task_timeout_min    INTEGER NOT NULL DEFAULT 60
 );
@@ -231,6 +231,35 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
         conn.commit()
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_scheduler_default_max_per_project(conn: sqlite3.Connection) -> None:
+    """Bump untouched legacy scheduler default from 3 to 5 per-project tasks."""
+    if not _table_exists(conn, "scheduler_config"):
+        return
+    row = conn.execute(
+        "SELECT max_global_tasks, max_per_project, tick_interval_sec, task_timeout_min "
+        "FROM scheduler_config WHERE id = 1",
+    ).fetchone()
+    if row is None:
+        return
+
+    max_global, max_per_project, tick_interval_sec, task_timeout_min = (
+        int(row[0]),
+        int(row[1]),
+        int(row[2]),
+        int(row[3]),
+    )
+    if (
+        max_global == 5
+        and max_per_project == 3
+        and tick_interval_sec == 5
+        and task_timeout_min == 60
+    ):
+        conn.execute(
+            "UPDATE scheduler_config SET max_per_project = 5 WHERE id = 1",
+        )
+        conn.commit()
 
 
 def _is_legacy_schema(conn: sqlite3.Connection) -> bool:
@@ -430,4 +459,5 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA_DDL)
     _migrate_roadmaps_add_integration_branch(conn)
     _migrate_tasks_add_paused_status(conn)
+    _migrate_scheduler_default_max_per_project(conn)
     return conn
