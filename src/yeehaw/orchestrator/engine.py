@@ -112,7 +112,11 @@ class Orchestrator:
         session = f"yeehaw-task-{task['id']}"
 
         if data["status"] == "done":
-            if self._run_verification(task):
+            cleanliness_error = self._validate_done_signal_worktree(task)
+            if cleanliness_error:
+                self.store.fail_task(task["id"], cleanliness_error)
+                self._maybe_retry(task)
+            elif self._run_verification(task):
                 self.store.complete_task(task["id"], "done")
                 self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
             else:
@@ -162,6 +166,8 @@ class Orchestrator:
 
             signal_dir = self.repo_root / ".yeehaw" / "signals" / f"task-{task['id']}"
             signal_dir.mkdir(parents=True, exist_ok=True)
+            # Prevent stale completion signals from previous attempts being reprocessed.
+            (signal_dir / "signal.json").unlink(missing_ok=True)
             log_path = self._task_log_path(task["id"], attempt_num, profile.name)
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -228,11 +234,11 @@ class Orchestrator:
         phase = self.store.get_phase(task["phase_id"])
         if not phase or not phase.get("verify_cmd"):
             return True
-        task_repo_root = self._task_repo_root(task)
+        verify_root = self._task_verification_root(task)
         result = subprocess.run(
             phase["verify_cmd"],
             shell=True,
-            cwd=task_repo_root,
+            cwd=verify_root,
             capture_output=True,
             text=True,
             timeout=120,
@@ -376,6 +382,41 @@ class Orchestrator:
         if first is None:
             return self.repo_root
         return self._task_repo_root(first)
+
+    def _task_verification_root(self, task: dict[str, Any]) -> Path:
+        """Resolve verification cwd, preferring the task worktree when available."""
+        worktree_path = task.get("worktree_path")
+        if isinstance(worktree_path, str) and worktree_path:
+            candidate = Path(worktree_path)
+            if candidate.exists():
+                return candidate
+        return self._task_repo_root(task)
+
+    def _validate_done_signal_worktree(self, task: dict[str, Any]) -> str | None:
+        """Ensure done signals only pass when task worktree has no pending changes."""
+        worktree_path = task.get("worktree_path")
+        if not isinstance(worktree_path, str) or not worktree_path:
+            return None
+
+        candidate = Path(worktree_path)
+        if not candidate.exists():
+            return "Task reported done but worktree path is missing"
+
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--", ".", ":(exclude).yeehaw"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown git error"
+            return f"Task reported done but worktree validation failed: {detail}"
+
+        if result.stdout.strip():
+            return "Task reported done with uncommitted changes in worktree"
+
+        return None
 
     def _write_pid_file(self) -> None:
         """Ensure only one orchestrator process owns this repo."""

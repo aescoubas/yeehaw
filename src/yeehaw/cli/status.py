@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json as json_module
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from yeehaw.store.store import Store
 
 TITLE_WIDTH = 35
+BRANCH_WIDTH = 8
+BRANCH_NA = "n/a"
+BRANCH_OPEN = "open"
+BRANCH_MERGED = "merged"
 
 
 def _truncate_for_column(value: str, width: int) -> str:
@@ -20,6 +25,67 @@ def _truncate_for_column(value: str, width: int) -> str:
     if width <= 3:
         return "." * width
     return f"{value[: width - 3]}..."
+
+
+def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
+    """Resolve git repo root for a task."""
+    candidate = task.get("project_repo_root")
+    if isinstance(candidate, str) and candidate:
+        return Path(candidate)
+    return db_path.parent.parent
+
+
+def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
+    """Resolve branch state from git refs for one task."""
+    try:
+        rev_parse = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return BRANCH_NA
+
+    if rev_parse.returncode != 0:
+        return BRANCH_NA
+
+    commit_sha = rev_parse.stdout.strip()
+    if not commit_sha:
+        return BRANCH_NA
+
+    contains = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "--contains", commit_sha, "refs/heads"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if contains.returncode != 0:
+        return BRANCH_OPEN
+
+    containing_branches = [
+        line.strip()
+        for line in contains.stdout.splitlines()
+        if line.strip()
+    ]
+    if any(ref != branch_name for ref in containing_branches):
+        return BRANCH_MERGED
+    return BRANCH_OPEN
+
+
+def _annotate_branch_states(tasks: list[dict[str, Any]], db_path: Path) -> None:
+    """Attach branch_state to each task for status rendering."""
+    cache: dict[tuple[str, str], str] = {}
+    for task in tasks:
+        branch_name = task.get("branch_name")
+        if not isinstance(branch_name, str) or not branch_name:
+            task["branch_state"] = BRANCH_NA
+            continue
+        repo_root = _task_repo_root(task, db_path)
+        key = (str(repo_root), branch_name)
+        if key not in cache:
+            cache[key] = _resolve_branch_state(repo_root, branch_name)
+        task["branch_state"] = cache[key]
 
 
 def handle_status(args: Any, db_path: Path) -> None:
@@ -38,6 +104,7 @@ def handle_status(args: Any, db_path: Path) -> None:
             store.list_tasks(project_id=project_id),
             key=lambda task: int(task["id"]),
         )
+        _annotate_branch_states(tasks, db_path)
 
         if args.as_json:
             print(json_module.dumps(tasks, indent=2, default=str))
@@ -47,14 +114,19 @@ def handle_status(args: Any, db_path: Path) -> None:
             print("No tasks.")
             return
 
-        print(f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} {'Status':<14} {'Agent':<10}")
-        print("-" * 80)
+        header = (
+            f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} "
+            f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}}"
+        )
+        print(header)
+        print("-" * len(header))
         for task in tasks:
             agent = task.get("assigned_agent") or ""
             title = _truncate_for_column(task["title"], TITLE_WIDTH)
+            branch_state = task.get("branch_state") or BRANCH_NA
             print(
                 f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
-                f"{task['status']:<14} {agent:<10}"
+                f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}}"
             )
 
         by_status: dict[str, int] = {}

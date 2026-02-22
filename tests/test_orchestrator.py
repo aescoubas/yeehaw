@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,28 @@ def test_dispatch_queued_uses_default_agent_override(
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert task["assigned_agent"] == "codex"
+
+
+def test_dispatch_queued_clears_stale_signal_file(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    stale_signal = signal_dir / "signal.json"
+    stale_signal.write_text(json.dumps({"task_id": ids["task_id"], "status": "done"}))
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    assert stale_signal.exists() is False
 
 
 def test_dispatch_queued_applies_worker_runtime_config(
@@ -255,6 +278,7 @@ def test_process_signal_done_completes_task(
     monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
     monkeypatch.setattr(orchestrator, "_run_verification", lambda _task: True)
     orchestrator._process_signal_file(signal_file)
 
@@ -269,6 +293,57 @@ def test_process_signal_done_completes_task(
     events = store.list_events(limit=10)
     kinds = [event["kind"] for event in events]
     assert "task_done" in kinds
+
+
+def test_process_signal_done_with_dirty_worktree_queues_retry(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(
+        json.dumps({"task_id": ids["task_id"], "status": "done", "summary": "ok"}),
+    )
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
+
+    verify_called = {"called": False}
+
+    def fake_verify(_task: dict[str, Any]) -> bool:
+        verify_called["called"] = True
+        return True
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_validate_done_signal_worktree",
+        lambda _task: "Task reported done with uncommitted changes in worktree",
+    )
+    monkeypatch.setattr(orchestrator, "_run_verification", fake_verify)
+
+    orchestrator._process_signal_file(signal_file)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "queued"
+    assert task["last_failure"] == "Task reported done with uncommitted changes in worktree"
+    assert verify_called["called"] is False
 
 
 def test_process_signal_failed_queues_retry(
@@ -396,6 +471,47 @@ def test_check_phase_completion_queues_next_phase(
     assert phase_1_row["status"] == "completed"
     assert phase_2_row["status"] == "executing"
     assert next_task["status"] == "queued"
+
+
+def test_run_verification_prefers_worktree_path(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+    store._conn.execute(
+        "UPDATE roadmap_phases SET verify_cmd = ? WHERE id = ?",
+        ("bash -n run_diagnostics.sh scripts/*.sh", ids["phase_id"]),
+    )
+    store._conn.commit()
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+
+    run_calls: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        run_calls["cwd"] = kwargs["cwd"]
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+
+    orchestrator = Orchestrator(store, repo_root)
+    assert orchestrator._run_verification(task) is True
+    assert run_calls["cwd"] == worktree
 
 
 def test_is_timed_out_true_for_old_started_at(orchestrator_store: tuple[Store, Path]) -> None:

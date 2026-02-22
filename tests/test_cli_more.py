@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from pathlib import Path
+import subprocess
 from typing import Any
 
 import pytest
@@ -413,6 +414,8 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     cli_status.handle_status(args, db_path)
     out = capsys.readouterr().out
     assert "ID" in out
+    assert "Branch" in out
+    assert "n/a" in out
     assert "Total:" in out
 
     cli_status.handle_alerts(Namespace(ack=None), db_path)
@@ -476,6 +479,66 @@ def test_handle_status_truncates_long_title(db_path: Path, capsys: pytest.Captur
 
     row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
     assert row[54:60] == "queued"
+
+
+def test_handle_status_branch_states_open_and_merged(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    open_branch = "yeehaw/task-1.1-open"
+    merged_branch = "yeehaw/task-1.2-merged"
+
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_open = store.create_task(roadmap_id, phase_id, "1.1", "Open branch", "desc")
+        task_merged = store.create_task(roadmap_id, phase_id, "1.2", "Merged branch", "desc")
+        store.assign_task(task_open, "codex", open_branch, "/tmp/w1", "/tmp/s1")
+        store.assign_task(task_merged, "codex", merged_branch, "/tmp/w2", "/tmp/s2")
+    finally:
+        store.close()
+
+    def fake_git_run(
+        cmd: list[str],
+        cwd: Path | None = None,
+        capture_output: bool = False,
+        text: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        assert cmd and cmd[0] == "git"
+        if cmd[1] == "rev-parse":
+            branch_ref = cmd[4]
+            if branch_ref == f"refs/heads/{open_branch}":
+                return subprocess.CompletedProcess(cmd, 0, "open-sha\n", "")
+            if branch_ref == f"refs/heads/{merged_branch}":
+                return subprocess.CompletedProcess(cmd, 0, "merged-sha\n", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        if cmd[1] == "for-each-ref":
+            commit_sha = cmd[4]
+            if commit_sha == "open-sha":
+                return subprocess.CompletedProcess(cmd, 0, f"{open_branch}\n", "")
+            if commit_sha == "merged-sha":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    f"{merged_branch}\nmain\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        raise AssertionError(f"Unexpected git command: {cmd}")
+
+    monkeypatch.setattr(cli_status.subprocess, "run", fake_git_run)
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+    assert "Branch" in out
+
+    open_row = next(line for line in out.splitlines() if line.startswith(f"{task_open:<6}"))
+    merged_row = next(line for line in out.splitlines() if line.startswith(f"{task_merged:<6}"))
+    assert open_row.rstrip().endswith("open")
+    assert merged_row.rstrip().endswith("merged")
 
 
 def test_handle_scheduler_show_config_and_no_changes(
