@@ -318,14 +318,21 @@ def test_process_signal_done_completes_task(
     monkeypatch.setattr(engine, "kill_session", lambda _session: None)
     monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
 
+    verify_called = {"called": False}
+
+    def fake_verify(_task: dict[str, Any]) -> bool:
+        verify_called["called"] = True
+        return True
+
     orchestrator = Orchestrator(store, repo_root)
     monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
-    monkeypatch.setattr(orchestrator, "_run_verification", lambda _task: True)
+    monkeypatch.setattr(orchestrator, "_run_verification", fake_verify)
     orchestrator._process_signal_file(signal_file)
 
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert task["status"] == "done"
+    assert verify_called["called"] is False
 
     roadmap = store.get_roadmap(ids["roadmap_id"])
     assert roadmap is not None

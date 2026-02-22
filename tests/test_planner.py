@@ -51,6 +51,8 @@ def test_start_planner_session_claude_uses_mcp_config(
     assert "## Initial Briefing" in prompt
     assert "Ship API v1" in prompt
     assert "Target project: 'demo'." in prompt
+    assert "Updated colorized roadmap preview" in prompt
+    assert "never replace it with a summarized outline" in prompt
 
     config = captured["config"]
     assert isinstance(config, dict)
@@ -90,6 +92,7 @@ def test_start_planner_session_codex(tmp_path: Path, monkeypatch: pytest.MonkeyP
     prompt = cmd[-1]
     assert isinstance(prompt, str)
     assert "create_roadmap(project_name='demo'" in prompt
+    assert "show the full returned preview verbatim" in prompt
 
 
 def test_start_planner_session_gemini(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -116,12 +116,11 @@ class Orchestrator:
             if cleanliness_error:
                 self.store.fail_task(task["id"], cleanliness_error)
                 self._maybe_retry(task)
-            elif self._run_verification(task):
+            else:
+                # Phase verify commands are phase-level gates and should run only
+                # once all tasks in the phase report done.
                 self.store.complete_task(task["id"], "done")
                 self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
-            else:
-                self.store.fail_task(task["id"], "Verification command failed")
-                self._maybe_retry(task)
 
         elif data["status"] == "failed":
             self.store.fail_task(task["id"], data.get("summary", "Unknown failure"))
