@@ -257,6 +257,32 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     assert "No alerts" in out
 
 
+def test_handle_status_sorts_tasks_by_id(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_1 = store.create_roadmap(project_id, "# Roadmap 1")
+        phase_1 = store.create_phase(roadmap_1, 1, "P1", None)
+        task_1 = store.create_task(roadmap_1, phase_1, "1.1", "First", "desc")
+
+        roadmap_2 = store.create_roadmap(project_id, "# Roadmap 2")
+        phase_2 = store.create_phase(roadmap_2, 2, "P2", None)
+        task_2 = store.create_task(roadmap_2, phase_2, "2.1", "Second", "desc")
+
+        assert task_1 < task_2
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+
+    first_idx = out.find(f"{task_1:<6}")
+    second_idx = out.find(f"{task_2:<6}")
+    assert first_idx != -1
+    assert second_idx != -1
+    assert first_idx < second_idx
+
+
 def test_handle_scheduler_show_config_and_no_changes(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],

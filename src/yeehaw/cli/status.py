@@ -21,7 +21,10 @@ def handle_status(args: Any, db_path: Path) -> None:
                 return
             project_id = project["id"]
 
-        tasks = store.list_tasks(project_id=project_id)
+        tasks = sorted(
+            store.list_tasks(project_id=project_id),
+            key=lambda task: int(task["id"]),
+        )
 
         if args.as_json:
             print(json_module.dumps(tasks, indent=2, default=str))
