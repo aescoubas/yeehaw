@@ -175,6 +175,49 @@ Initial setup
     assert "Cannot modify task 1.1" in result["error"]
 
 
+def test_mcp_pause_and_resume_task(
+    mcp_store_extra: Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_server.create_project("proj-a", "/tmp/repo-a")
+    md = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+Initial setup
+""".strip()
+    mcp_server.create_roadmap("proj-a", md)
+    mcp_server.approve_roadmap("proj-a")
+
+    task = mcp_server.list_tasks(project_name="proj-a")[0]
+    task_id = int(task["id"])
+
+    paused = mcp_server.pause_task(task_id)
+    assert paused["paused"] is True
+    assert paused["previous_status"] == "queued"
+    assert paused["had_session"] is False
+    assert mcp_store_extra.get_task(task_id)["status"] == "paused"
+
+    resumed = mcp_server.resume_task(task_id)
+    assert resumed == {"task_id": task_id, "resumed": True, "status": "queued"}
+    assert mcp_store_extra.get_task(task_id)["status"] == "queued"
+
+    mcp_store_extra.assign_task(task_id, "codex", "branch", "/tmp/wt", "/tmp/sig")
+    killed: dict[str, str] = {}
+    monkeypatch.setattr(mcp_server, "has_session", lambda session: session == f"yeehaw-task-{task_id}")
+    monkeypatch.setattr(mcp_server, "kill_session", lambda session: killed.setdefault("session", session))
+
+    paused_active = mcp_server.pause_task(task_id)
+    assert paused_active["paused"] is True
+    assert paused_active["previous_status"] == "in-progress"
+    assert paused_active["had_session"] is True
+    assert killed["session"] == f"yeehaw-task-{task_id}"
+    assert mcp_store_extra.get_task(task_id)["status"] == "paused"
+
+    not_paused = mcp_server.resume_task(9999)
+    assert not_paused["error"] == "Task 9999 not found"
+
+
 def test_mcp_approve_and_update_task_branches(mcp_store_extra: Store) -> None:
     assert mcp_server.approve_roadmap("missing")["error"] == "Project 'missing' not found"
 

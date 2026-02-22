@@ -89,6 +89,7 @@ def _show_roadmap(store: Store, args: Any) -> None:
             icon = {
                 "pending": " ",
                 "queued": "~",
+                "paused": "=",
                 "in-progress": ">",
                 "done": "+",
                 "failed": "!",

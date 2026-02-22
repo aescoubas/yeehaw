@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 
 from yeehaw.roadmap.parser import Roadmap, parse_roadmap, validate_roadmap
 from yeehaw.store.store import Store
+from yeehaw.tmux.session import has_session, kill_session
 
 _store: Store | None = None
 
@@ -273,6 +274,7 @@ def get_project_status(project_name: str) -> dict[str, Any]:
                 "tasks_in_progress": sum(
                     1 for task in tasks if task["status"] == "in-progress"
                 ),
+                "tasks_paused": sum(1 for task in tasks if task["status"] == "paused"),
                 "tasks_failed": sum(1 for task in tasks if task["status"] == "failed"),
             }
         )
@@ -314,6 +316,63 @@ def approve_roadmap(project_name: str) -> dict[str, Any]:
     store.update_roadmap_status(roadmap["id"], "executing")
 
     return {"approved": True, "queued_tasks": queued}
+
+
+@mcp.tool()
+def pause_task(task_id: int) -> dict[str, Any]:
+    """Pause a task so it is not dispatched/monitored until resumed."""
+    store = _get_store()
+    task = store.get_task(task_id)
+    if not task:
+        return {"error": f"Task {task_id} not found"}
+
+    previous_status = str(task["status"])
+    if previous_status not in {"pending", "queued", "in-progress"}:
+        return {"error": f"Task {task_id} is '{previous_status}' and cannot be paused"}
+
+    session = f"yeehaw-task-{task_id}"
+    had_session = False
+    if previous_status == "in-progress":
+        try:
+            had_session = has_session(session)
+        except OSError:
+            had_session = False
+        if had_session:
+            try:
+                kill_session(session)
+            except OSError:
+                pass
+
+    if not store.pause_task(task_id):
+        return {"error": f"Task {task_id} could not be paused"}
+
+    store.log_event("task_paused", f"Task {task_id} paused", task_id=task_id)
+    return {
+        "task_id": task_id,
+        "paused": True,
+        "previous_status": previous_status,
+        "had_session": had_session,
+    }
+
+
+@mcp.tool()
+def resume_task(task_id: int) -> dict[str, Any]:
+    """Resume a paused task by re-queuing it for dispatch."""
+    store = _get_store()
+    task = store.get_task(task_id)
+    if not task:
+        return {"error": f"Task {task_id} not found"}
+    if task["status"] != "paused":
+        return {"error": f"Task {task_id} is '{task['status']}', not 'paused'"}
+
+    if not store.resume_task(task_id):
+        return {"error": f"Task {task_id} could not be resumed"}
+    store.log_event("task_resumed", f"Task {task_id} resumed", task_id=task_id)
+    return {
+        "task_id": task_id,
+        "resumed": True,
+        "status": "queued",
+    }
 
 
 @mcp.tool()

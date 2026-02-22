@@ -131,6 +131,47 @@ def test_dispatch_queued_clears_stale_signal_file(
     assert stale_signal.exists() is False
 
 
+def test_dispatch_queued_reuses_existing_worktree_path(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    existing_worktree = repo_root / "existing-worktree"
+    existing_worktree.mkdir(parents=True, exist_ok=True)
+    store._conn.execute(
+        "UPDATE tasks SET branch_name = ?, worktree_path = ?, attempts = 1 WHERE id = ?",
+        ("yeehaw/task-1.1-task-1", str(existing_worktree), ids["task_id"]),
+    )
+    store._conn.commit()
+
+    prepare_calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        engine,
+        "prepare_worktree",
+        lambda repo_root_arg, branch_arg: prepare_calls.append((repo_root_arg, branch_arg)) or repo_root,
+    )
+
+    launched: dict[str, str] = {}
+    monkeypatch.setattr(
+        engine,
+        "launch_agent",
+        lambda _session, working_dir, _command: launched.setdefault("working_dir", working_dir),
+    )
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "in-progress"
+    assert task["attempts"] == 2
+    assert prepare_calls == []
+    assert launched["working_dir"] == str(existing_worktree)
+
+
 def test_dispatch_queued_applies_worker_runtime_config(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,

@@ -40,7 +40,7 @@ def _build_planner_prompt(project_name: str | None, briefing_file: Path | None) 
         "",
         "Available MCP tools include: create_project, get_roadmap, create_roadmap,",
         "edit_roadmap, preview_roadmap, list_projects, list_tasks, get_project_status,",
-        "approve_roadmap, update_task.",
+        "approve_roadmap, pause_task, resume_task, update_task.",
         "",
         "Your objective:",
         "1) Ask clarifying questions until requirements are concrete.",

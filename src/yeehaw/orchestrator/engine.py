@@ -160,8 +160,17 @@ class Orchestrator:
             task_repo_root = self._task_repo_root(task)
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
             worker_cfg = resolve_worker_launch_config(self.repo_root, profile.name)
-            branch = branch_name(task["task_number"], task["title"])
-            worktree_path = prepare_worktree(task_repo_root, branch)
+            branch = str(task.get("branch_name") or branch_name(task["task_number"], task["title"]))
+            existing_worktree = task.get("worktree_path")
+            worktree_path: Path
+            if isinstance(existing_worktree, str) and existing_worktree:
+                candidate = Path(existing_worktree)
+                if candidate.exists():
+                    worktree_path = candidate
+                else:
+                    worktree_path = prepare_worktree(task_repo_root, branch)
+            else:
+                worktree_path = prepare_worktree(task_repo_root, branch)
             attempt_num = int(task.get("attempts") or 0) + 1
 
             signal_dir = self.repo_root / ".yeehaw" / "signals" / f"task-{task['id']}"

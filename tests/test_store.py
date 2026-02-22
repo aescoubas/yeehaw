@@ -90,6 +90,33 @@ def test_failed_task_and_list_filters(store: Store) -> None:
     assert [task["task_number"] for task in queued] == ["1.2"]
 
 
+def test_pause_and_resume_task(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    store.queue_task(task_id)
+    assert store.pause_task(task_id) is True
+    paused = store.get_task(task_id)
+    assert paused is not None
+    assert paused["status"] == "paused"
+
+    assert store.pause_task(task_id) is False
+    assert store.resume_task(task_id) is True
+    resumed = store.get_task(task_id)
+    assert resumed is not None
+    assert resumed["status"] == "queued"
+    assert resumed["completed_at"] is None
+    assert store.resume_task(task_id) is False
+
+    store.assign_task(task_id, "codex", "branch-a", "/tmp/wt", "/tmp/signal")
+    assert store.pause_task(task_id) is True
+    paused_again = store.get_task(task_id)
+    assert paused_again is not None
+    assert paused_again["status"] == "paused"
+
+
 def test_create_roadmap_supersedes_previous_for_same_project(store: Store) -> None:
     project_id = store.create_project("proj-a", "/tmp/repo-a")
     roadmap_1 = store.create_roadmap(project_id, "# Roadmap 1")

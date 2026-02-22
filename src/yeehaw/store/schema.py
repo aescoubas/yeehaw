@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title           TEXT    NOT NULL,
     description     TEXT    NOT NULL DEFAULT '',
     status          TEXT    NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','queued','in-progress','done','failed','blocked')),
+                    CHECK (status IN ('pending','queued','paused','in-progress','done','failed','blocked')),
     assigned_agent  TEXT,
     branch_name     TEXT,
     worktree_path   TEXT,
@@ -123,6 +123,89 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {str(row[1]) for row in rows}
+
+
+def _tasks_support_paused_status(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+    ).fetchone()
+    if row is None:
+        return True
+    sql = str(row[0] or "")
+    return "'paused'" in sql
+
+
+def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
+    """Rebuild tasks table to include paused status in CHECK constraint."""
+    if not _table_exists(conn, "tasks"):
+        return
+    if _tasks_support_paused_status(conn):
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("ALTER TABLE tasks RENAME TO tasks__prepaused")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                roadmap_id      INTEGER NOT NULL REFERENCES roadmaps(id),
+                phase_id        INTEGER NOT NULL REFERENCES roadmap_phases(id),
+                task_number     TEXT    NOT NULL,
+                title           TEXT    NOT NULL,
+                description     TEXT    NOT NULL DEFAULT '',
+                status          TEXT    NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending','queued','paused','in-progress','done','failed','blocked')),
+                assigned_agent  TEXT,
+                branch_name     TEXT,
+                worktree_path   TEXT,
+                signal_dir      TEXT,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                max_attempts    INTEGER NOT NULL DEFAULT 4,
+                last_failure    TEXT,
+                started_at      TEXT,
+                completed_at    TEXT,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, roadmap_id, phase_id, task_number, title, description, status,
+                assigned_agent, branch_name, worktree_path, signal_dir,
+                attempts, max_attempts, last_failure, started_at, completed_at, created_at, updated_at
+            )
+            SELECT id,
+                   roadmap_id,
+                   phase_id,
+                   task_number,
+                   title,
+                   description,
+                   CASE
+                     WHEN status IN ('pending','queued','paused','in-progress','done','failed','blocked')
+                     THEN status
+                     ELSE 'pending'
+                   END,
+                   assigned_agent,
+                   branch_name,
+                   worktree_path,
+                   signal_dir,
+                   attempts,
+                   max_attempts,
+                   last_failure,
+                   started_at,
+                   completed_at,
+                   created_at,
+                   updated_at
+            FROM tasks__prepaused
+            """
+        )
+        conn.execute("DROP TABLE tasks__prepaused")
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _is_legacy_schema(conn: sqlite3.Connection) -> bool:
@@ -317,4 +400,5 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     if _is_legacy_schema(conn):
         _migrate_legacy_schema(conn, db_path)
     conn.executescript(SCHEMA_DDL)
+    _migrate_tasks_add_paused_status(conn)
     return conn

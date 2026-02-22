@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from yeehaw.roadmap.parser import Roadmap, Task
 
 _EDITABLE_TASK_STATUSES = {"pending", "queued"}
-_LOCKED_TASK_STATUSES = {"in-progress", "done", "failed", "blocked"}
+_LOCKED_TASK_STATUSES = {"paused", "in-progress", "done", "failed", "blocked"}
 _RE_TASK_COMPONENTS = re.compile(r"^(\d+)\.(\d+)$")
 
 
@@ -399,6 +399,34 @@ class Store:
             (self._now(), task_id),
         )
         self._conn.commit()
+
+    def pause_task(self, task_id: int) -> bool:
+        """Pause a task that is pending, queued, or in-progress."""
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        if task["status"] not in {"pending", "queued", "in-progress"}:
+            return False
+        self._conn.execute(
+            "UPDATE tasks SET status = 'paused', updated_at = ? WHERE id = ?",
+            (self._now(), task_id),
+        )
+        self._conn.commit()
+        return True
+
+    def resume_task(self, task_id: int) -> bool:
+        """Resume a paused task by queuing it for dispatch."""
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        if task["status"] != "paused":
+            return False
+        self._conn.execute(
+            "UPDATE tasks SET status = 'queued', completed_at = NULL, updated_at = ? WHERE id = ?",
+            (self._now(), task_id),
+        )
+        self._conn.commit()
+        return True
 
     def count_active_tasks(self, project_id: int | None = None) -> int:
         """Count in-progress tasks, optionally for a project."""

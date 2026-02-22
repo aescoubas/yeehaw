@@ -148,6 +148,84 @@ def _create_legacy_db(db_path: Path) -> None:
     conn.close()
 
 
+def _create_prepaused_db(db_path: Path) -> None:
+    """Create a modern-like DB whose tasks CHECK does not yet include paused."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT    NOT NULL UNIQUE,
+            repo_root   TEXT    NOT NULL,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE roadmaps (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id),
+            raw_md      TEXT    NOT NULL,
+            status      TEXT    NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft','approved','executing','completed','invalid')),
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE roadmap_phases (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            roadmap_id    INTEGER NOT NULL REFERENCES roadmaps(id),
+            phase_number  INTEGER NOT NULL,
+            title         TEXT    NOT NULL,
+            verify_cmd    TEXT,
+            status        TEXT    NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','executing','completed','failed')),
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE tasks (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            roadmap_id      INTEGER NOT NULL REFERENCES roadmaps(id),
+            phase_id        INTEGER NOT NULL REFERENCES roadmap_phases(id),
+            task_number     TEXT    NOT NULL,
+            title           TEXT    NOT NULL,
+            description     TEXT    NOT NULL DEFAULT '',
+            status          TEXT    NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending','queued','in-progress','done','failed','blocked')),
+            assigned_agent  TEXT,
+            branch_name     TEXT,
+            worktree_path   TEXT,
+            signal_dir      TEXT,
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            max_attempts    INTEGER NOT NULL DEFAULT 4,
+            last_failure    TEXT,
+            started_at      TEXT,
+            completed_at    TEXT,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO projects (id, name, repo_root) VALUES (1, 'proj-a', '/tmp/repo-a')"
+    )
+    conn.execute(
+        "INSERT INTO roadmaps (id, project_id, raw_md, status) VALUES (1, 1, '# Roadmap: proj-a', 'executing')"
+    )
+    conn.execute(
+        "INSERT INTO roadmap_phases (id, roadmap_id, phase_number, title, status) VALUES (1, 1, 1, 'Phase 1', 'executing')"
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (
+            id, roadmap_id, phase_id, task_number, title, description, status
+        ) VALUES (1, 1, 1, '1.1', 'Task 1', 'desc', 'queued')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_legacy_schema_migrates_in_place(tmp_path: Path) -> None:
     db_path = tmp_path / ".yeehaw" / "yeehaw.db"
     _create_legacy_db(db_path)
@@ -210,3 +288,25 @@ def test_fresh_db_does_not_create_legacy_backup(tmp_path: Path) -> None:
 
     backups = list(db_path.parent.glob("yeehaw.legacy-backup-*.db"))
     assert backups == []
+
+
+def test_existing_modern_db_migrates_tasks_to_support_paused(tmp_path: Path) -> None:
+    db_path = tmp_path / ".yeehaw" / "yeehaw.db"
+    _create_prepaused_db(db_path)
+
+    store = Store(db_path)
+    try:
+        assert store.pause_task(1) is True
+        task = store.get_task(1)
+        assert task is not None
+        assert task["status"] == "paused"
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert "'paused'" in str(row[0] or "")
