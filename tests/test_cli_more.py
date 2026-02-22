@@ -92,6 +92,9 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["init"])
     cli_main.main(["roadmap", "show", "--project", "p"])  # routing only
     cli_main.main(["roadmap", "clear", "--project", "p"])  # routing only
+    cli_main.main(
+        ["roadmap", "generate", "--project", "p", "--prompt", "build the project roadmap"]
+    )
     cli_main.main(["plan"])
     cli_main.main(["run", "--agent", "codex"])
     cli_main.main(["attach", "1"])
@@ -103,6 +106,7 @@ def test_cli_main_dispatches_remaining_commands(
     names = [name for name, _ in calls]
     assert names == [
         "init",
+        "roadmap",
         "roadmap",
         "roadmap",
         "plan",
@@ -273,6 +277,113 @@ def test_handle_roadmap_clear(db_path: Path, capsys: pytest.CaptureFixture[str])
         assert store.list_tasks(project_id=project["id"]) == []
     finally:
         store.close()
+
+
+def test_handle_roadmap_generate_paths(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = Namespace(
+        roadmap_command="generate",
+        project="missing",
+        prompt="Build API v1",
+        file=None,
+        agent="codex",
+        approve=False,
+    )
+    cli_roadmap.handle_roadmap(args, db_path)
+    assert "Project 'missing' not found" in capsys.readouterr().out
+
+    store = Store(db_path)
+    store.create_project("proj-a", "/tmp/repo-a")
+    store.close()
+
+    called: list[tuple[Path, str, str, str]] = []
+
+    class FakeResult:
+        def __init__(self, success: bool, stderr: str = "") -> None:
+            self.success = success
+            self.message = "ok" if success else "boom"
+            self.roadmap_id = 12 if success else None
+            self.phases = 2 if success else 0
+            self.tasks = 3 if success else 0
+            self.stdout = ""
+            self.stderr = stderr
+
+    def fake_generate(
+        db_path_arg: Path,
+        project_name: str,
+        prompt_text: str,
+        agent: str,
+    ) -> FakeResult:
+        called.append((db_path_arg, project_name, prompt_text, agent))
+        return FakeResult(success=True)
+
+    monkeypatch.setattr(cli_roadmap, "generate_roadmap_from_prompt", fake_generate)
+
+    cli_roadmap.handle_roadmap(
+        Namespace(
+            roadmap_command="generate",
+            project="proj-a",
+            prompt="Build API v1",
+            file=None,
+            agent="codex",
+            approve=False,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Roadmap generated (id=12): 2 phases, 3 tasks (agent=codex)" in out
+    assert called == [(db_path, "proj-a", "Build API v1", "codex")]
+
+    briefing = db_path.parent / "briefing.txt"
+    briefing.write_text("Natural language roadmap request")
+
+    def fake_generate_failure(
+        db_path_arg: Path,
+        project_name: str,
+        prompt_text: str,
+        agent: str,
+    ) -> FakeResult:
+        called.append((db_path_arg, project_name, prompt_text, agent))
+        return FakeResult(success=False, stderr="trace line 1\ntrace line 2")
+
+    monkeypatch.setattr(
+        cli_roadmap,
+        "generate_roadmap_from_prompt",
+        fake_generate_failure,
+    )
+
+    cli_roadmap.handle_roadmap(
+        Namespace(
+            roadmap_command="generate",
+            project="proj-a",
+            prompt=None,
+            file=str(briefing),
+            agent="gemini",
+            approve=False,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Roadmap generation failed: boom" in out
+    assert "Agent stderr (tail):" in out
+    assert "trace line 2" in out
+
+    cli_roadmap.handle_roadmap(
+        Namespace(
+            roadmap_command="generate",
+            project="proj-a",
+            prompt=None,
+            file="missing.txt",
+            agent="claude",
+            approve=False,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "File 'missing.txt' not found" in out
 
 
 def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

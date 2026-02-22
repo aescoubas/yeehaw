@@ -56,6 +56,32 @@ def main(argv: list[str] | None = None) -> None:
     clear_roadmap = roadmap_sub.add_parser("clear", help="Clear active roadmap")
     clear_roadmap.add_argument("--project", required=True, help="Project name")
 
+    generate_roadmap = roadmap_sub.add_parser(
+        "generate",
+        help="Generate roadmap from natural-language text",
+    )
+    generate_roadmap.add_argument("--project", required=True, help="Project name")
+    source_group = generate_roadmap.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--prompt",
+        help="Natural-language prompt describing project goals and constraints",
+    )
+    source_group.add_argument(
+        "--file",
+        help="Path to text/markdown briefing file",
+    )
+    generate_roadmap.add_argument(
+        "--agent",
+        default="codex",
+        choices=["claude", "gemini", "codex"],
+        help="Planner agent for roadmap generation (default: codex)",
+    )
+    generate_roadmap.add_argument(
+        "--approve",
+        action="store_true",
+        help="Approve generated roadmap immediately",
+    )
+
     plan_parser = subparsers.add_parser("plan", help="Start AI planning session")
     plan_parser.add_argument("briefing", nargs="?", help="Briefing file (optional)")
     plan_parser.add_argument(

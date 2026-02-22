@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from yeehaw.planner.generate import generate_roadmap_from_prompt
 from yeehaw.roadmap.parser import parse_roadmap, validate_roadmap
 from yeehaw.store.store import Store
 
@@ -21,6 +22,8 @@ def handle_roadmap(args: Any, db_path: Path) -> None:
             _approve_roadmap(store, args)
         elif args.roadmap_command == "clear":
             _clear_roadmap(store, args)
+        elif args.roadmap_command == "generate":
+            _generate_roadmap(store, args, db_path)
     finally:
         store.close()
 
@@ -162,3 +165,40 @@ def _clear_roadmap(store: Store, args: Any) -> None:
         f"Cleared {removed_roadmaps} roadmap(s) for project '{args.project}' "
         f"(latest #{last_cleared_id}, {phases_total} phases, {tasks_total} tasks removed)."
     )
+
+
+def _generate_roadmap(store: Store, args: Any, db_path: Path) -> None:
+    project = store.get_project(args.project)
+    if not project:
+        print(f"Error: Project '{args.project}' not found.")
+        return
+
+    prompt_text = args.prompt
+    if args.file:
+        prompt_file = Path(args.file)
+        if not prompt_file.exists():
+            print(f"Error: File '{args.file}' not found.")
+            return
+        prompt_text = prompt_file.read_text()
+
+    assert prompt_text is not None
+    result = generate_roadmap_from_prompt(db_path, args.project, prompt_text, args.agent)
+
+    if not result.success:
+        print(f"Roadmap generation failed: {result.message}")
+        if result.stderr:
+            tail = result.stderr.strip().splitlines()[-10:]
+            if tail:
+                print("Agent stderr (tail):")
+                for line in tail:
+                    print(f"  {line}")
+        return
+
+    assert result.roadmap_id is not None
+    print(
+        f"Roadmap generated (id={result.roadmap_id}): "
+        f"{result.phases} phases, {result.tasks} tasks (agent={args.agent})"
+    )
+
+    if args.approve:
+        _approve_roadmap(store, args)
