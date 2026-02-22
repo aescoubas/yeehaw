@@ -23,8 +23,14 @@ def handle_run(args: Any, db_path: Path) -> None:
             return
         project_id = project["id"]
 
+    default_agent = getattr(args, "agent", None)
     print("Starting orchestrator... (Ctrl+C to stop)")
-    orchestrator = Orchestrator(store, repo_root)
+    try:
+        orchestrator = Orchestrator(store, repo_root, default_agent=default_agent)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        store.close()
+        return
     try:
         orchestrator.run(project_id=project_id)
     except KeyboardInterrupt:

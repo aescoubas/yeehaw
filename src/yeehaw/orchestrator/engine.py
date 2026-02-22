@@ -15,17 +15,29 @@ from yeehaw.agent.profiles import resolve_profile
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
-from yeehaw.tmux.session import capture_pane, has_session, kill_session, launch_agent
+from yeehaw.tmux.session import (
+    capture_pane,
+    has_session,
+    kill_session,
+    launch_agent,
+    pipe_output,
+)
 
 
 class Orchestrator:
     """Coordinates task dispatch, monitoring, and completion processing."""
 
-    def __init__(self, store: Store, repo_root: Path) -> None:
+    def __init__(
+        self,
+        store: Store,
+        repo_root: Path,
+        default_agent: str | None = None,
+    ) -> None:
         self.store = store
         self.repo_root = repo_root
         self.config = store.get_scheduler_config()
         self.signal_watcher = SignalWatcher(repo_root / ".yeehaw" / "signals")
+        self.default_agent = resolve_profile(default_agent).name if default_agent else None
         self.running = False
         self._poll_counter = 0
 
@@ -133,12 +145,15 @@ class Orchestrator:
 
     def _launch_task(self, task: dict[str, Any]) -> None:
         try:
-            profile = resolve_profile(task.get("assigned_agent"))
+            profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
             branch = branch_name(task["task_number"], task["title"])
             worktree_path = prepare_worktree(self.repo_root, branch)
+            attempt_num = int(task.get("attempts") or 0) + 1
 
             signal_dir = self.repo_root / ".yeehaw" / "signals" / f"task-{task['id']}"
             signal_dir.mkdir(parents=True, exist_ok=True)
+            log_path = self._task_log_path(task["id"], attempt_num, profile.name)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
 
             prompt = build_task_prompt(task, str(signal_dir), task.get("last_failure"))
 
@@ -154,8 +169,21 @@ class Orchestrator:
             launcher_path = signal_dir / "launch.sh"
             write_launcher(launcher_path, profile, prompt)
             launch_agent(session, str(worktree_path), str(launcher_path))
+            try:
+                pipe_output(session, str(log_path))
+            except (subprocess.CalledProcessError, OSError) as exc:
+                self.store.log_event("task_log_pipe_failed", str(exc), task_id=task["id"])
+                self.store.create_alert(
+                    "warn",
+                    f"Task {task['id']} launched but log pipe failed: {exc}",
+                    task_id=task["id"],
+                )
 
-            self.store.log_event("task_launched", f"Agent: {profile.name}", task_id=task["id"])
+            self.store.log_event(
+                "task_launched",
+                f"Agent: {profile.name}, log: {log_path}",
+                task_id=task["id"],
+            )
 
         except (subprocess.CalledProcessError, OSError) as exc:
             self.store.fail_task(task["id"], str(exc))
@@ -189,16 +217,32 @@ class Orchestrator:
         return elapsed > self.config["task_timeout_min"] * 60
 
     def _handle_timeout(self, task: dict[str, Any], session: str) -> None:
+        pane_text = ""
+        try:
+            pane_text = capture_pane(session)
+        except OSError:
+            pane_text = ""
         kill_session(session)
-        self.store.fail_task(task["id"], "Task timed out")
-        self.store.log_event("task_timeout", "", task_id=task["id"])
+        failure_msg = "Task timed out"
+        latest_log = self._latest_task_log_path(task["id"])
+        if latest_log is not None:
+            failure_msg = f"{failure_msg}. Check log: {latest_log}"
+        if pane_text.strip():
+            snapshot_path = self._write_pane_snapshot(task["id"], pane_text, "timeout")
+            failure_msg = f"{failure_msg}. Pane snapshot: {snapshot_path}"
+        self.store.fail_task(task["id"], failure_msg)
+        self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
             cleanup_worktree(self.repo_root, Path(task["worktree_path"]))
 
     def _handle_crash(self, task: dict[str, Any]) -> None:
-        self.store.fail_task(task["id"], "Tmux session lost")
-        self.store.log_event("session_lost", "", task_id=task["id"])
+        failure_msg = "Tmux session lost"
+        latest_log = self._latest_task_log_path(task["id"])
+        if latest_log is not None:
+            failure_msg = f"{failure_msg}. Check log: {latest_log}"
+        self.store.fail_task(task["id"], failure_msg)
+        self.store.log_event("session_lost", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
             cleanup_worktree(self.repo_root, Path(task["worktree_path"]))
@@ -262,6 +306,27 @@ class Orchestrator:
                 "roadmap_completed",
                 f"Roadmap {phase['roadmap_id']} finished",
             )
+
+    def _task_log_path(self, task_id: int, attempt: int, agent: str) -> Path:
+        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        return logs_root / f"attempt-{attempt:02d}-{agent}.log"
+
+    def _latest_task_log_path(self, task_id: int) -> Path | None:
+        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        if not logs_root.exists():
+            return None
+        candidates = sorted(logs_root.glob("attempt-*.log"))
+        if not candidates:
+            return None
+        return candidates[-1]
+
+    def _write_pane_snapshot(self, task_id: int, pane_text: str, kind: str) -> Path:
+        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        logs_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        snapshot_path = logs_root / f"{kind}-pane-{timestamp}.txt"
+        snapshot_path.write_text(pane_text)
+        return snapshot_path
 
     def _write_pid_file(self) -> None:
         """Ensure only one orchestrator process owns this repo."""

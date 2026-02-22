@@ -24,12 +24,14 @@ def test_tmux_commands_invoke_subprocess(monkeypatch: pytest.MonkeyPatch) -> Non
     assert tmux.has_session("s1") is True
     assert tmux.capture_pane("s1") == "pane output"
     tmux.kill_session("s1")
+    tmux.pipe_output("s1", "/tmp/agent.log")
 
     assert calls[0][0][:2] == ["tmux", "new-session"]
     assert calls[1][0][:2] == ["tmux", "send-keys"]
     assert calls[2][0][:2] == ["tmux", "has-session"]
     assert calls[3][0][:2] == ["tmux", "capture-pane"]
     assert calls[4][0][:2] == ["tmux", "kill-session"]
+    assert calls[5][0][:2] == ["tmux", "pipe-pane"]
 
 
 def test_has_session_false(monkeypatch: pytest.MonkeyPatch) -> None:

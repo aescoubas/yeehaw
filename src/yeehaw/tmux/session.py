@@ -60,3 +60,12 @@ def launch_agent(session_name: str, working_dir: str, command: str) -> None:
     """Create session and dispatch command."""
     ensure_session(session_name, working_dir)
     send_text(session_name, command)
+
+
+def pipe_output(session_name: str, log_path: str) -> None:
+    """Pipe tmux pane output to a log file."""
+    subprocess.run(
+        ["tmux", "pipe-pane", "-o", "-t", session_name, f"cat >> {log_path}"],
+        check=True,
+        capture_output=True,
+    )

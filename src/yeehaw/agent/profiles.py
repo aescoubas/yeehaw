@@ -28,8 +28,8 @@ AGENT_REGISTRY: dict[str, AgentProfile] = {
     ),
     "codex": AgentProfile(
         name="codex",
-        command="codex",
-        prompt_flag="--prompt",
+        command="codex exec --dangerously-bypass-approvals-and-sandbox",
+        prompt_flag="",
     ),
 }
 

@@ -10,6 +10,7 @@ import pytest
 
 import yeehaw.cli.main as cli_main
 import yeehaw.cli.attach as cli_attach
+import yeehaw.cli.logs as cli_logs
 import yeehaw.cli.plan as cli_plan
 import yeehaw.cli.roadmap as cli_roadmap
 import yeehaw.cli.run as cli_run
@@ -84,20 +85,32 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.run.handle_run", _capture("run"))
     monkeypatch.setattr("yeehaw.cli.attach.handle_attach", _capture("attach"))
     monkeypatch.setattr("yeehaw.cli.stop.handle_stop", _capture("stop"))
+    monkeypatch.setattr("yeehaw.cli.logs.handle_logs", _capture("logs"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
 
     cli_main.main(["init"])
     cli_main.main(["roadmap", "show", "--project", "p"])  # routing only
     cli_main.main(["plan"])
-    cli_main.main(["run"])
+    cli_main.main(["run", "--agent", "codex"])
     cli_main.main(["attach", "1"])
     cli_main.main(["stop", "1"])
+    cli_main.main(["logs", "1"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["alerts"])
 
     names = [name for name, _ in calls]
-    assert names == ["init", "roadmap", "plan", "run", "attach", "stop", "scheduler", "alerts"]
+    assert names == [
+        "init",
+        "roadmap",
+        "plan",
+        "run",
+        "attach",
+        "stop",
+        "logs",
+        "scheduler",
+        "alerts",
+    ]
     assert all(db == tmp_path / ".yeehaw" / "yeehaw.db" for _, db in calls)
 
 
@@ -333,9 +346,15 @@ def test_handle_run_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeOrchestrator:
-        def __init__(self, store: Store, repo_root: Path) -> None:
+        def __init__(
+            self,
+            store: Store,
+            repo_root: Path,
+            default_agent: str | None = None,
+        ) -> None:
             self.store = store
             self.repo_root = repo_root
+            self.default_agent = default_agent
             self.called_with: list[int | None] = []
 
         def run(self, project_id: int | None = None) -> None:
@@ -343,11 +362,11 @@ def test_handle_run_paths(
 
     monkeypatch.setattr(cli_run, "Orchestrator", FakeOrchestrator)
 
-    cli_run.handle_run(Namespace(project="missing"), db_path)
+    cli_run.handle_run(Namespace(project="missing", agent=None), db_path)
     assert "Project 'missing' not found" in capsys.readouterr().out
 
     ids = _seed_project_with_task(db_path)
-    cli_run.handle_run(Namespace(project="proj-a"), db_path)
+    cli_run.handle_run(Namespace(project="proj-a", agent="codex"), db_path)
     out = capsys.readouterr().out
     assert "Starting orchestrator" in out
 
@@ -356,9 +375,29 @@ def test_handle_run_paths(
             raise KeyboardInterrupt
 
     monkeypatch.setattr(cli_run, "Orchestrator", InterruptingOrchestrator)
-    cli_run.handle_run(Namespace(project=None), db_path)
+    cli_run.handle_run(Namespace(project=None, agent=None), db_path)
     out = capsys.readouterr().out
     assert "Stopping" in out
+
+
+def test_handle_logs_paths(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cli_logs.handle_logs(Namespace(task_id=999, attempt=None, tail=10), db_path)
+    assert "Task 999 not found" in capsys.readouterr().out
+
+    ids = _seed_project_with_task(db_path)
+    cli_logs.handle_logs(Namespace(task_id=ids["task_id"], attempt=None, tail=10), db_path)
+    assert "No logs found for task" in capsys.readouterr().out
+
+    logs_dir = db_path.parent.parent / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "attempt-01-claude.log"
+    log_path.write_text("line1\\nline2\\nline3\\n")
+
+    cli_logs.handle_logs(Namespace(task_id=ids["task_id"], attempt=None, tail=2), db_path)
+    out = capsys.readouterr().out
+    assert f"Log file: {log_path}" in out
+    assert "line2" in out
+    assert "line3" in out
 
 
 def test_handle_stop_paths(

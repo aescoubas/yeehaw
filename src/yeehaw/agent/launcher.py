@@ -60,14 +60,19 @@ def build_task_prompt(
 
 def build_launch_command(profile: AgentProfile, prompt: str) -> str:
     """Build shell-safe agent launch command."""
-    return f"{profile.command} {profile.prompt_flag} {shlex.quote(prompt)}"
+    parts = [profile.command]
+    if profile.prompt_flag:
+        parts.append(profile.prompt_flag)
+    parts.append(shlex.quote(prompt))
+    return " ".join(parts)
 
 
 def write_launcher(script_path: Path, profile: AgentProfile, prompt: str) -> None:
     """Write a launcher script that feeds long prompts via heredoc."""
+    prompt_flag = f"{profile.prompt_flag} " if profile.prompt_flag else ""
     script_path.write_text(
         "#!/bin/bash\n"
-        f"exec {profile.command} {profile.prompt_flag} "
+        f"exec {profile.command} {prompt_flag}"
         f"\"$(cat <<'YEEHAW_PROMPT_EOF'\n{prompt}\nYEEHAW_PROMPT_EOF\n)\"\n",
     )
     script_path.chmod(0o755)

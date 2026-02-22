@@ -59,9 +59,14 @@ def test_dispatch_queued_launches_task(
         launched["session"] = session
         launched["working_dir"] = working_dir
         launched["command"] = command
+    piped: dict[str, str] = {}
+    def fake_pipe_output(session: str, log_path: str) -> None:
+        piped["session"] = session
+        piped["log_path"] = log_path
 
     monkeypatch.setattr(engine, "prepare_worktree", fake_prepare_worktree)
     monkeypatch.setattr(engine, "launch_agent", fake_launch_agent)
+    monkeypatch.setattr(engine, "pipe_output", fake_pipe_output)
 
     orchestrator = Orchestrator(store, repo_root)
     orchestrator._dispatch_queued(project_id=None)
@@ -72,9 +77,31 @@ def test_dispatch_queued_launches_task(
     assert task["attempts"] == 1
     assert task["assigned_agent"] == "claude"
     assert launched["session"] == f"yeehaw-task-{ids['task_id']}"
+    assert piped["session"] == f"yeehaw-task-{ids['task_id']}"
+    assert f".yeehaw/logs/task-{ids['task_id']}/attempt-01-claude.log" in piped["log_path"]
 
     events = store.list_events()
     assert events[0]["kind"] == "task_launched"
+    assert "log:" in events[0]["message"]
+
+
+def test_dispatch_queued_uses_default_agent_override(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root, default_agent="codex")
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["assigned_agent"] == "codex"
 
 
 def test_process_signal_done_completes_task(
@@ -277,3 +304,44 @@ def test_is_timed_out_true_for_old_started_at(orchestrator_store: tuple[Store, P
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert orchestrator._is_timed_out(task) is True
+
+
+def test_handle_timeout_records_log_hints(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="claude",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+
+    log_dir = repo_root / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "attempt-01-claude.log").write_text("agent output")
+
+    monkeypatch.setattr(engine, "capture_pane", lambda _session: "pane output")
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._handle_timeout(task, "yeehaw-task-1")
+
+    updated = store.get_task(ids["task_id"])
+    assert updated is not None
+    assert updated["status"] == "queued"
+    assert "Task timed out" in (updated["last_failure"] or "")
+    assert "Check log:" in (updated["last_failure"] or "")
+    assert "Pane snapshot:" in (updated["last_failure"] or "")

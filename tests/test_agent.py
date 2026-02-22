@@ -19,7 +19,8 @@ def test_resolve_profile_default_and_named() -> None:
     codex_profile = resolve_profile("codex")
 
     assert default_profile.name == "claude"
-    assert codex_profile.command == "codex"
+    assert codex_profile.command.startswith("codex exec")
+    assert codex_profile.prompt_flag == ""
 
 
 def test_resolve_profile_unknown() -> None:
@@ -51,7 +52,8 @@ def test_build_launch_command_quotes_prompt() -> None:
     profile = resolve_profile("codex")
     command = build_launch_command(profile, "line one\nline two with 'quotes'")
 
-    assert command.startswith("codex --prompt ")
+    assert command.startswith("codex exec ")
+    assert "--prompt" not in command
     assert "line two" in command
 
 

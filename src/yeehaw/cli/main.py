@@ -64,6 +64,11 @@ def main(argv: list[str] | None = None) -> None:
 
     run_parser = subparsers.add_parser("run", help="Start the orchestrator")
     run_parser.add_argument("--project", help="Limit to a specific project")
+    run_parser.add_argument(
+        "--agent",
+        choices=["claude", "gemini", "codex"],
+        help="Default worker agent for unassigned tasks",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show task status")
     status_parser.add_argument("--project", help="Filter by project")
@@ -83,6 +88,20 @@ def main(argv: list[str] | None = None) -> None:
     stop_parser = subparsers.add_parser("stop", help="Stop a running task")
     stop_parser.add_argument("task_id", nargs="?", type=int, help="Task ID")
     stop_parser.add_argument("--all", action="store_true", help="Stop all tasks")
+
+    logs_parser = subparsers.add_parser("logs", help="Show task execution logs")
+    logs_parser.add_argument("task_id", type=int, help="Task ID")
+    logs_parser.add_argument(
+        "--attempt",
+        type=int,
+        help="Specific attempt number (default: latest)",
+    )
+    logs_parser.add_argument(
+        "--tail",
+        type=int,
+        default=200,
+        help="Number of trailing log lines to show (default: 200)",
+    )
 
     scheduler_parser = subparsers.add_parser("scheduler", help="Manage scheduler config")
     scheduler_sub = scheduler_parser.add_subparsers(
@@ -150,6 +169,11 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.stop import handle_stop
 
         handle_stop(args, _get_db_path())
+
+    elif args.command == "logs":
+        from yeehaw.cli.logs import handle_logs
+
+        handle_logs(args, _get_db_path())
 
     elif args.command == "scheduler":
         from yeehaw.cli.scheduler import handle_scheduler
