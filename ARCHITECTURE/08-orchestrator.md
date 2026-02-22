@@ -1,90 +1,73 @@
 # 08 — Orchestrator Engine
 
-## Design
+## Core Loop
 
-Single-threaded tick-based loop. Each tick (default 5 seconds):
+The orchestrator is a single-threaded tick loop:
 
-1. **Monitor active tasks** — check signals, tmux liveness, timeouts
-2. **Dispatch queued tasks** — respect concurrency limits, launch workers
+1. monitor active tasks
+2. dispatch queued tasks
 
-## Tick Loop
+Tick interval is `scheduler_config.tick_interval_sec` (default 5s).
 
-```python
-class Orchestrator:
-    def __init__(self, store: Store, repo_root: Path, config: dict):
-        self.store = store
-        self.repo_root = repo_root
-        self.config = config
-        self.signal_watcher = SignalWatcher(repo_root / ".yeehaw" / "signals")
-        self.running = False
+## Startup and Shutdown
 
-    def run(self, project_id: int | None = None) -> None:
-        self.running = True
-        self.signal_watcher.start()
-        try:
-            while self.running:
-                self._tick(project_id)
-                time.sleep(self.config["tick_interval_sec"])
-        finally:
-            self.signal_watcher.stop()
-
-    def _tick(self, project_id: int | None) -> None:
-        self._monitor_active(project_id)
-        self._dispatch_queued(project_id)
-
-    def stop(self) -> None:
-        self.running = False
-```
+- writes `<runtime_root>/orchestrator.pid` and refuses second active instance
+- installs `SIGINT`/`SIGTERM` handlers that call `stop()`
+- uses a stop event so `Ctrl+C` exits promptly without waiting a full tick
+- always stops watcher and removes PID file on exit
 
 ## Monitor Active Tasks
 
-For each task with `status = "in-progress"`:
+For each in-progress task:
 
-1. Check for signal file → process signal
-2. Check tmux session alive → handle crash if dead
-3. Check timeout → handle timeout if exceeded
+1. process ready or polled signal files
+2. detect missing tmux session (`session_lost`)
+3. enforce timeout (`task_timeout_min`)
 
-## Handle Signal
-
-- `"done"` → run verification command → mark done or fail
-- `"failed"` → log failure → retry if attempts < max
-- `"blocked"` → mark blocked → create alert
-
-Always: kill tmux session, cleanup worktree.
+Timeout/crash handling marks task failed and may requeue if attempts remain.
 
 ## Dispatch Queued Tasks
 
-1. Check global concurrency limit
-2. For each queued task: check per-project limit
-3. Select agent (explicit > project default > global default)
-4. Create worktree + signal directory
-5. Build prompt (include failure context on retries)
-6. Update DB with assignment
-7. Launch tmux session with agent command
+Dispatch happens only when:
 
-## Phase Advancement
+- global active tasks < `max_global_tasks`
+- project active tasks < `max_per_project`
+- dependencies satisfied (`task_dependencies` blockers all `done`)
 
-After all tasks in a phase complete:
-1. Run phase verification command (if set)
-2. Mark phase completed or failed
-3. If completed, queue next phase's tasks
-4. If all phases done, mark roadmap completed
+## Launch Sequence
 
-## Concurrency Defaults
+For each launch:
 
-| Setting | Default |
-|---------|---------|
-| `max_global_tasks` | 5 |
-| `max_per_project` | 3 |
-| `tick_interval_sec` | 5 |
-| `task_timeout_min` | 60 |
+1. resolve task repo root from project metadata
+2. resolve agent profile + worker runtime config (`workers.json`)
+3. ensure roadmap integration branch exists (`yeehaw/roadmap-<roadmap_id>`)
+4. prepare/reset task branch + worktree from integration branch
+5. create signal directory and clear stale `signal.json`
+6. write prompt file and launcher script
+7. mark task `in-progress` (`attempts += 1`)
+8. launch tmux session and pipe output to attempt log
 
-## PID File
+## Completion Sequence (`status="done"`)
 
-Only one orchestrator per project. Uses `.yeehaw/orchestrator.pid`.
-Checks on startup, verifies process alive, overwrites stale PIDs.
+1. ensure worktree has no uncommitted changes
+2. merge task branch into integration branch via temporary merge worktree
+3. mark task done if merge succeeds
+4. on merge failure, mark failed and retry later from updated base
 
-## Graceful Shutdown
+Task worktree is cleaned after processing.
 
-`SIGINT`/`SIGTERM` → set `running = False` → current tick completes →
-active tmux sessions continue → PID file cleaned up.
+## Retry Policy
+
+On failure:
+
+- if `attempts < max_attempts`: task is requeued
+- else: emit error alert for exhausted retries
+
+## Phase and Roadmap Progression
+
+When all tasks in a phase are `done`:
+
+1. run phase `verify_cmd` in repo root (or no-op if absent)
+2. set phase status `completed` or `failed`
+3. if completed, queue next phase tasks and mark next phase `executing`
+4. if no next phase, mark roadmap `completed`

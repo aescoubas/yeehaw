@@ -2,93 +2,70 @@
 
 ## Purpose
 
-Each worker agent runs in an **isolated git worktree** branched from the
-project's HEAD. This prevents agents from stepping on each other's files
-and provides clean branch-per-task isolation.
+Each task runs on its own git branch + worktree so workers do not overwrite one
+another and each task has isolated commit history.
 
-## Directory Layout
+## Branching Model
 
-```
-repo-root/
-├── .yeehaw/
-│   ├── yeehaw.db
-│   ├── worktrees/
-│   │   ├── yeehaw-task-1-add-user-model/
-│   │   ├── yeehaw-task-2-api-endpoints/
-│   │   └── ...
-│   └── signals/
-│       ├── task-1/signal.json
-│       └── task-2/signal.json
-```
+Task branch name:
 
-## Branch Naming
+`yeehaw/task-<task_number>-<sanitized-title>`
 
-```
-yeehaw/task-{number}-{sanitized-title}
-```
+Sanitization rules:
 
-- Title is lowercased, non-alphanumeric chars replaced with `-`
-- Consecutive dashes collapsed, leading/trailing dashes stripped
-- Truncated to 50 chars max
+- lowercase title
+- replace non `[a-z0-9]` with `-`
+- trim edge `-`
+- truncate slug to 50 chars
 
-```python
-import re
+Roadmap integration branch:
 
-def branch_name(task_number: str, title: str) -> str:
-    slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
-    slug = slug[:50]
-    return f"yeehaw/task-{task_number}-{slug}"
-```
+`yeehaw/roadmap-<roadmap_id>`
 
-## Lifecycle
+This branch is created on first dispatch for a roadmap and used as the base for all
+task worktrees in that roadmap execution.
 
-### 1. Prepare Worktree
+## Worktree Location
 
-```python
-import subprocess
-from pathlib import Path
+Worktrees live under runtime root, not inside project repo:
 
-def prepare_worktree(repo_root: Path, branch: str) -> Path:
-    worktree_path = repo_root / ".yeehaw" / "worktrees" / branch.split("/")[-1]
+`<runtime_root>/worktrees/<repo-name>-<repo-hash>/<task-branch-tail>`
 
-    if worktree_path.exists():
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(worktree_path)],
-            cwd=repo_root, capture_output=True,
-        )
+`repo-hash` is a short SHA1 of resolved repo path to avoid collisions.
 
-    subprocess.run(
-        ["git", "branch", "-f", branch, "HEAD"],
-        cwd=repo_root, check=True, capture_output=True,
-    )
+## Prepare / Cleanup APIs
 
-    subprocess.run(
-        ["git", "worktree", "add", str(worktree_path), branch],
-        cwd=repo_root, check=True, capture_output=True,
-    )
+`prepare_worktree(repo_root, runtime_root, branch, base_ref="HEAD")`:
 
-    return worktree_path
-```
+1. Computes worktree path under runtime root.
+2. Removes stale worktree path if present.
+3. Force-updates task branch to `base_ref`.
+4. Adds git worktree for task branch.
 
-### 2. Agent Works in Worktree
+`cleanup_worktree(repo_root, worktree_path)`:
 
-Agent makes commits to its branch. Each commit prefixed with task number:
-`[task-1.1] Add user model`.
+1. Force removes worktree.
+2. Runs `git worktree prune`.
 
-### 3. Cleanup Worktree
+## Orchestrator Usage
 
-```python
-def cleanup_worktree(repo_root: Path, worktree_path: Path) -> None:
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(worktree_path)],
-        cwd=repo_root, capture_output=True,
-    )
-    subprocess.run(["git", "worktree", "prune"], cwd=repo_root, capture_output=True)
-```
+During task launch:
 
-## Error Handling
+- base ref is roadmap integration branch (if present/created)
+- branch/worktree path are stored on task row
+- retries may reuse existing task branch name while resetting branch tip to base ref
 
-- If branch exists from a retry, force-update it to HEAD
-- If worktree path is stale, force-remove before creating
-- All git commands use `capture_output=True` to avoid polluting terminal
-- On retry, append `-attempt-{n}` to branch name if conflicts persist
+During task completion:
+
+- worktree is removed after signal handling
+- task branch is merged into integration branch on successful `done`
+
+## Branch Status in `yeehaw status`
+
+Branch state is computed by ancestry between task branch and target base branch
+(roadmap integration branch when set, otherwise `main`):
+
+- `n/a`
+- `ahead`
+- `diverged`
+- `merged`

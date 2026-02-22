@@ -1,101 +1,75 @@
 # 01 — Architecture Overview
 
-## System Identity
+## System Purpose
 
-Yeehaw is a **Planner-Worker multi-agent swarm** for software development. It
-decomposes high-level instructions into structured roadmaps and dispatches tasks
-to coding agents (Claude Code, Gemini CLI, Codex) running in isolated git
-worktrees, coordinated via tmux sessions and a file-based signal protocol.
+Yeehaw is a roadmap-driven multi-agent orchestrator. It lets a planner/supervisor
+agent create and refine a roadmap, then runs worker agents task-by-task in isolated
+git worktrees.
 
-## Language & Runtime
+## Runtime Model
 
-- **Python 3.12+** — stdlib-first approach, minimal external dependencies
-- **SQLite** via `sqlite3` (stdlib) — single-file persistence, zero-config
-- **FastMCP** — MCP server exposing task CRUD for the Planner agent
-- **argparse** (stdlib) — CLI framework
-- **watchdog** — filesystem event monitoring for signal protocol
-- **uv** — package management and virtual environments
+- Language/runtime: Python 3.12+
+- Persistence: SQLite (`sqlite3`)
+- CLI: `argparse`
+- Planner bridge: FastMCP server over stdio
+- Worker execution: tmux sessions + filesystem signal protocol
+- File watching: `watchdog` with polling fallback
 
-## Core Architecture Pattern
+Runtime state is shared under one runtime root:
 
-```
-                    ┌─────────────────────┐
-                    │   Human Operator     │
-                    │  (morning briefing)  │
-                    └─────────┬───────────┘
-                              │ brain dump
-                              ▼
-                    ┌─────────────────────┐
-                    │   Planner Agent      │
-                    │  (Claude/Gemini)     │
-                    │  connected via MCP   │
-                    └─────────┬───────────┘
-                              │ create_task(), update_roadmap()
-                              ▼
-                    ┌─────────────────────┐
-                    │   SQLite Database    │
-                    │   (.yeehaw/yeehaw.db)│
-                    │   ─── The Brain ─── │
-                    └─────────┬───────────┘
-                              │ query pending tasks
-                              ▼
-                    ┌─────────────────────┐
-                    │   Orchestrator       │
-                    │   (tick loop, 5s)    │
-                    └───┬─────────────┬───┘
-                        │             │
-              dispatch  │             │  monitor
-                        ▼             ▼
-               ┌──────────────┐ ┌──────────────┐
-               │ Worker Agent │ │ Worker Agent │  ... N workers
-               │ (tmux + git  │ │ (tmux + git  │
-               │  worktree)   │ │  worktree)   │
-               └──────┬───────┘ └──────┬───────┘
-                      │                │
-                      ▼                ▼
-               signal.json       signal.json
-               (file-based)      (file-based)
-```
+- Default: `~/.yeehaw`
+- Override: `YEEHAW_HOME`
 
-## Three-Layer Design
+Key paths under runtime root:
 
-### Layer 1: The Brain (SQLite + MCP Server)
-SQLite stores all state: projects, roadmaps, phases, tasks, events, alerts,
-scheduler config. The FastMCP server exposes this as tools that the Planner
-agent can call. The CLI also queries the DB directly for status commands.
+- `yeehaw.db`
+- `signals/task-<id>/signal.json`
+- `logs/task-<id>/attempt-XX-<agent>.log`
+- `worktrees/<repo-key>/...`
+- `orchestrator.pid`
+- `workers.json`
 
-### Layer 2: The Planner (AI Agent via MCP)
-A single AI agent instance (Claude Code or Gemini CLI) connects to the MCP
-server. The human pastes a brain dump, and the Planner translates it into
-structured rows: projects, roadmaps with phases, and individual tasks.
+## Major Components
 
-### Layer 3: The Workers (tmux + git worktrees + file signals)
-The orchestrator reads pending tasks from the DB, creates isolated git
-worktrees, launches worker agents in tmux sessions, and monitors for
-completion via the sentinel file protocol. Workers never touch the DB.
+| Component | Responsibility |
+|---|---|
+| `cli/` | User-facing commands (`init`, `project`, `roadmap`, `plan`, `run`, `status`, `logs`, etc.) |
+| `store/` | Schema + transactional state updates |
+| `roadmap/` | Markdown parser/validator + dependency extraction |
+| `mcp/` | Planner/supervisor tools (roadmap preview/edit, pause/resume, status views) |
+| `planner/` | Interactive planning session + single-shot roadmap generation |
+| `orchestrator/` | Dispatch/monitor loop, retries, phase progression, branch merges |
+| `agent/` | Agent profiles, launchers, worker runtime config |
+| `git/` | Branch/worktree creation and cleanup |
+| `tmux/` | Session lifecycle + log piping |
+| `signal/` | `signal.json` watcher and parser |
 
-## Component Map
+## End-to-End Flow
 
-| Package | Responsibility |
-|---------|---------------|
-| `cli/` | argparse command tree, user-facing interface |
-| `store/` | SQLite schema + CRUD operations |
-| `mcp/` | FastMCP server exposing task tools for Planner |
-| `planner/` | Planner session lifecycle, MCP server spawn |
-| `orchestrator/` | Core dispatch/monitor tick loop |
-| `agent/` | Agent profiles (Claude, Gemini, Codex) |
-| `git/` | Worktree create/cleanup |
-| `tmux/` | Session create/attach/kill |
-| `signal/` | Sentinel file protocol + watchdog |
-| `roadmap/` | Markdown parser + validator |
+1. `yeehaw init` initializes runtime DB.
+2. `yeehaw project add` registers a repo root for a project.
+3. Planner flow:
+   - `yeehaw plan ...` for interactive conversation over MCP, or
+   - `yeehaw roadmap generate ...` for one-shot generation.
+4. `yeehaw roadmap approve` queues first-phase tasks and sets roadmap executing.
+5. `yeehaw run` starts orchestrator tick loop.
+6. Orchestrator dispatches queued tasks when:
+   - global/per-project slots are available, and
+   - all task dependencies are `done`.
+7. Worker writes `signal.json` (`done`/`failed`/`blocked`).
+8. On `done`, orchestrator validates clean worktree, merges task branch into roadmap
+   integration branch, and completes task.
+9. When a phase is fully `done`, phase verify command runs; success queues next phase.
+10. `status`, `logs`, and `alerts` provide live operational visibility.
 
-## Data Flow
+## Task Lifecycle
 
-1. `yeehaw plan briefing.md` → spawns MCP server + Planner agent
-2. Planner calls `create_project()`, `create_roadmap()`, `create_task()` via MCP
-3. `yeehaw roadmap show` → human reviews structured output
-4. `yeehaw roadmap approve --project foo` → marks roadmap as approved
-5. `yeehaw run --project foo` → orchestrator starts tick loop
-6. Each tick: monitor active tasks for signals, dispatch pending tasks
-7. `yeehaw status` → query DB, print table
-8. `yeehaw attach task-3` → drop into tmux session of worker agent
+`pending -> queued -> in-progress -> done`
+
+Other paths:
+
+- `queued|in-progress -> paused -> queued` (via pause/resume)
+- `in-progress -> failed` (worker failure/crash/timeout/merge/validation failure)
+- `in-progress -> blocked` (worker reports external blocker)
+
+Retries: failed tasks are re-queued until `max_attempts` is exhausted.

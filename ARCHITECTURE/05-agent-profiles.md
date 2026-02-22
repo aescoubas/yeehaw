@@ -1,80 +1,72 @@
-# 05 — Agent Profiles
+# 05 — Agent Profiles and Worker Runtime Config
 
-## Supported Agents
+## Supported Worker Agents
 
-| Agent | Command | Prompt Flag | Default Timeout |
-|-------|---------|-------------|-----------------|
-| Claude Code | `claude` | `--dangerously-skip-permissions -p` | 60 min |
-| Gemini CLI | `gemini` | `-p` | 60 min |
-| Codex | `codex` | `--prompt` | 60 min |
+| Agent | Command Template |
+|---|---|
+| `claude` | `claude --dangerously-skip-permissions -p "<prompt>"` |
+| `gemini` | `gemini -p "<prompt>"` |
+| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox "<prompt>"` |
 
-## Profile Definition
+Registry is defined in `src/yeehaw/agent/profiles.py`.
 
-```python
-from dataclasses import dataclass
+- default worker agent: `claude`
+- unknown agent names raise `ValueError`
 
-@dataclass(frozen=True)
-class AgentProfile:
-    name: str
-    command: str
-    prompt_flag: str
-    timeout_minutes: int = 60
+## Prompt Construction
 
-AGENT_REGISTRY: dict[str, AgentProfile] = {
-    "claude": AgentProfile(name="claude", command="claude",
-                           prompt_flag="--dangerously-skip-permissions -p"),
-    "gemini": AgentProfile(name="gemini", command="gemini", prompt_flag="-p"),
-    "codex":  AgentProfile(name="codex", command="codex", prompt_flag="--prompt"),
-}
-```
+`build_task_prompt(...)` includes:
 
-## Agent Selection
+- task header + task description
+- completion requirements:
+  - commit changes
+  - `git status --porcelain` must be clean before signaling `done`
+- required signal file format and statuses
+- previous failure context on retries
 
-1. **Explicit assignment** — `assigned_agent` set by Planner or user
-2. **Project default** — configurable per-project default
-3. **Global default** — falls back to `"claude"`
+To preserve instructions when context grows, orchestrator writes the prompt to:
 
-## Task Prompt Construction
+`<runtime_root>/signals/task-<id>/task-<id>-prompt.md`
 
-```python
-def build_task_prompt(task: dict, signal_dir: str, previous_failure: str | None = None) -> str:
-    parts = [
-        f"# Task {task['task_number']}: {task['title']}",
-        "", task["description"], "",
-        "## Signal Protocol",
-        f"When finished, write `{signal_dir}/signal.json`:",
-        '```json', '{',
-        f'  "task_id": {task["id"]},',
-        '  "status": "done",',
-        '  "summary": "what you did",',
-        '  "artifacts": ["files", "changed"],',
-        '  "timestamp": "ISO-8601"',
-        '}', '```', "",
-        'Status must be "done", "failed", or "blocked".',
-    ]
-    if previous_failure:
-        parts.extend(["", "## Previous Attempt Failed",
-                       f"Failure reason: {previous_failure}",
-                       "Fix the issues and try again."])
-    return "\n".join(parts)
-```
+and injects `YEEHAW_TASK_PROMPT_FILE` for workers.
 
-## Shell Command Construction
+## Launcher Script
 
-```python
-import shlex
+`write_launcher(...)` writes a per-attempt script:
 
-def build_launch_command(profile: AgentProfile, prompt: str) -> str:
-    return f"{profile.command} {profile.prompt_flag} {shlex.quote(prompt)}"
-```
+- exports configured env vars
+- embeds prompt with heredoc
+- executes profile command + args
 
-## Launcher Script (for long prompts)
+The script is run inside task worktree via tmux.
 
-```python
-def write_launcher(script_path: Path, profile: AgentProfile, prompt: str) -> None:
-    script_path.write_text(
-        f"#!/bin/bash\nexec {profile.command} {profile.prompt_flag} "
-        f"\"$(cat <<'YEEHAW_PROMPT_EOF'\n{prompt}\nYEEHAW_PROMPT_EOF\n)\"\n"
-    )
-    script_path.chmod(0o755)
-```
+## Worker Runtime Configuration (`workers.json`)
+
+Resolved from:
+
+`<runtime_root>/workers.json`
+
+Schema:
+
+- `disable_default_mcp: bool` (default `true`)
+- `extra_args: string[]`
+- `env: {string: string}`
+- `agents.<name>.{disable_default_mcp, extra_args, env}` overrides
+
+Resolution:
+
+1. start from global config
+2. apply per-agent override
+3. concatenate args: global first, then per-agent
+4. merge env map: per-agent keys win
+
+## Default MCP Hardening for Workers
+
+When `disable_default_mcp=true`, Yeehaw injects agent-specific args to disable any
+preconfigured MCP servers by default:
+
+- Claude: strict empty MCP config
+- Gemini: sentinel allow-list server name
+- Codex: disables each discovered configured MCP server via `-c` overrides
+
+This keeps worker execution isolated unless explicitly opted in by runtime config.

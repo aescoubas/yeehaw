@@ -1,139 +1,84 @@
-# 09 — MCP Server (The Brain Interface)
+# 09 — MCP Server
 
 ## Purpose
 
-The FastMCP server exposes the SQLite store as **MCP tools** that the Planner
-agent can call. This is the bridge between the AI Planner and the database.
+`src/yeehaw/mcp/server.py` exposes planning/supervision tools over FastMCP so
+Claude/Codex/Gemini can manage Yeehaw state during roadmap discussions.
 
-The MCP server is a **separate process** started by `yeehaw plan`. It runs
-alongside a Planner agent session (Claude or Gemini) that connects to it.
+Transport: stdio (`mcp.run(transport="stdio")`).
 
-## Implementation
+## Tool Surface
 
-```python
-from fastmcp import FastMCP
+Project tools:
 
-mcp = FastMCP("yeehaw")
+- `create_project(name, repo_root)`
+- `list_projects()`
 
-@mcp.tool()
-def create_project(name: str, repo_root: str) -> dict:
-    """Create a new project for task tracking."""
-    project_id = store.create_project(name, repo_root)
-    return {"id": project_id, "name": name}
+Roadmap tools:
 
-@mcp.tool()
-def list_projects() -> list[dict]:
-    """List all registered projects."""
-    return store.list_projects()
+- `get_roadmap(project_name, color=True)`
+- `preview_roadmap(markdown, color=True)`
+- `create_roadmap(project_name, markdown)`
+- `edit_roadmap(project_name, markdown)` (true in-place edit)
+- `approve_roadmap(project_name)`
 
-@mcp.tool()
-def create_roadmap(project_name: str, markdown: str) -> dict:
-    """Create a roadmap from structured markdown. Returns roadmap ID and parsed phases/tasks."""
-    project = store.get_project(project_name)
-    roadmap = parser.parse_roadmap(markdown)
-    errors = parser.validate_roadmap(roadmap)
-    if errors:
-        return {"error": "Validation failed", "details": errors}
+Task/status tools:
 
-    roadmap_id = store.create_roadmap(project["id"], markdown)
-    for phase in roadmap.phases:
-        phase_id = store.create_phase(roadmap_id, phase.number, phase.title, phase.verify_cmd)
-        for task in phase.tasks:
-            store.create_task(roadmap_id, phase_id, task.number, task.title, task.description)
+- `list_tasks(project_name=None, status=None)`
+- `get_project_status(project_name)`
+- `pause_task(task_id)`
+- `resume_task(task_id)`
+- `update_task(task_id, status=None, assigned_agent=None, reset_attempts=False)`
 
-    return {"roadmap_id": roadmap_id, "phases": len(roadmap.phases),
-            "tasks": sum(len(p.tasks) for p in roadmap.phases)}
+## Colorized Verbose Roadmap Preview
 
-@mcp.tool()
-def create_task(project_name: str, phase_number: int, title: str, description: str) -> dict:
-    """Create a single task in an existing roadmap phase."""
-    # ... resolve project → active roadmap → phase → create task
-    return {"task_id": task_id}
+`preview_roadmap` and `get_roadmap` return a `preview` field rendered with ANSI
+styles when `color=True`.
 
-@mcp.tool()
-def update_task_status(task_id: int, status: str) -> dict:
-    """Update a task's status (pending, queued, done, failed, blocked)."""
-    store.complete_task(task_id, status)
-    return {"task_id": task_id, "status": status}
+The formatter preserves verbose task body lines, including:
 
-@mcp.tool()
-def list_tasks(project_name: str | None = None, status: str | None = None) -> list[dict]:
-    """List tasks, optionally filtered by project and/or status."""
-    project_id = store.get_project(project_name)["id"] if project_name else None
-    return store.list_tasks(project_id=project_id, status=status)
+- metadata lines (`**Depends on:**`, etc.)
+- checklist items (`- [ ] ...`, `- [x] ...`)
 
-@mcp.tool()
-def get_project_status(project_name: str) -> dict:
-    """Get comprehensive project status including phase progress and task counts."""
-    # ... aggregate status across phases and tasks
-    return status_dict
+## Roadmap Persistence Behavior
 
-@mcp.tool()
-def approve_roadmap(project_name: str) -> dict:
-    """Approve the active roadmap and queue Phase 1 tasks for execution."""
-    # ... approve roadmap, queue phase 1 tasks
-    return {"approved": True, "queued_tasks": count}
-```
+`create_roadmap`:
 
-## MCP Server Lifecycle
+1. parse + validate markdown
+2. create roadmap/phases/tasks rows
+3. apply dependency edges from task metadata
+4. return structured counts + preview
 
-### Start (during `yeehaw plan`)
+`edit_roadmap`:
 
-```python
-import subprocess
-import sys
+1. targets active roadmap for project
+2. parse + validate new markdown
+3. applies in-place sync with history safety checks
+4. updates dependency edges
+5. returns edit stats + preview
 
-def start_mcp_server(db_path: Path, port: int = 0) -> subprocess.Popen:
-    """Start the MCP server as a subprocess."""
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "yeehaw.mcp.server", "--db", str(db_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return proc
-```
+## Pause/Resume Semantics
 
-### Connection Mode: stdio
+- `pause_task` allowed from `pending`, `queued`, `in-progress`
+- if in-progress and tmux exists, session is killed before status change
+- paused tasks are not dispatched
+- `resume_task` transitions `paused -> queued`
 
-The MCP server runs in **stdio mode** by default, which is what Claude Code
-and Gemini CLI expect when configured as an MCP server:
+## `update_task` Limitations (Current Behavior)
 
-```python
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-```
+`update_task` supports:
 
-### Configuration for Planner Agent
+- status updates only for `done`, `blocked`, `failed`, `queued`
+- optional `reset_attempts`
+- `assigned_agent` update only when current task status is `pending`
 
-The CLI generates a temporary MCP config that points the Planner agent to the
-yeehaw MCP server:
+It does not currently provide a direct `in-progress` transition.
 
-```json
-{
-  "mcpServers": {
-    "yeehaw": {
-      "command": "python",
-      "args": ["-m", "yeehaw.mcp.server", "--db", "/path/to/.yeehaw/yeehaw.db"]
-    }
-  }
-}
-```
+## Planner Integration
 
-## Planner Session Flow
+`yeehaw plan` configures selected planner agent with this MCP server and provides a
+prompt that encourages:
 
-1. `yeehaw plan briefing.md` starts:
-   - Reads the briefing file
-   - Writes MCP config to temp file
-   - Launches Planner agent (e.g., Claude Code) with MCP config
-   - Agent connects to yeehaw MCP server automatically
-2. User interacts with Planner agent naturally
-3. Planner calls `create_project()`, `create_roadmap()`, etc. via MCP
-4. Session ends when user exits the Planner agent
-5. `yeehaw roadmap show` to review what the Planner created
-
-## Security
-
-- MCP server runs locally, no network exposure
-- stdio transport means no open ports
-- DB path is explicit, no default access to system files
-- Tools are scoped to yeehaw operations only
+- interactive requirement clarification
+- repeated preview during discussion
+- final persistence via `create_roadmap` or `edit_roadmap`

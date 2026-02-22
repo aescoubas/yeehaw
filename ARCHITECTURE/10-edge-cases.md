@@ -1,76 +1,89 @@
-# 10 — Edge Cases & Error Handling
+# 10 — Edge Cases and Failure Handling
 
-## Agent Timeout
+## Worker Crash (`session_lost`)
 
-1. Task exceeded `task_timeout_min`
-2. Kill tmux session
-3. Check for late signal (agent may have finished before timeout)
-4. Signal found → process normally
-5. No signal → mark failed, log `"timeout"`, retry up to `max_attempts`
+Condition:
 
-## Tmux Crash
+- task is `in-progress` but tmux session no longer exists
 
-1. `has_session()` returns False for active task
-2. Check for signal file
-3. Signal found → process normally
-4. No signal → mark failed, log `"session_lost"`, retry
+Handling:
 
-## Verification Failure
+1. if `signal.json` exists, process signal normally
+2. else mark task failed (`Tmux session lost`)
+3. retry if attempts remain
+4. cleanup worktree
 
-1. Signal says `"done"` but verification command fails
-2. Capture pane output for context
-3. Mark failed with verification output as `last_failure`
-4. Re-queue with failure context in prompt
-5. After `max_attempts`, create error alert
+## Timeout
 
-## Invalid Roadmap
+Condition:
 
-1. Parser returns validation errors
-2. Store roadmap with status `"invalid"`
-3. Return errors to caller (MCP or CLI)
-4. Planner agent can see errors and fix
+- elapsed time since `started_at` exceeds `task_timeout_min`
 
-## Signal File Race Conditions
+Handling:
 
-1. Agent starts writing signal.json
-2. watchdog fires on CREATE
-3. Partial JSON → `json.JSONDecodeError`
-4. Retry 3x at 200ms intervals
-5. Still invalid → log warning, wait for next tick
+1. capture pane snapshot when possible
+2. kill session
+3. mark failed with log/snapshot hints
+4. retry if attempts remain
+5. cleanup worktree
 
-## Worktree Conflicts
+## `done` Signal with Dirty Worktree
 
-1. Branch exists from previous attempt
-2. Force-update: `git branch -f {branch} HEAD`
-3. Worktree path exists → `git worktree remove --force`
-4. Persistent conflict → append `-attempt-{n}`
+Condition:
 
-## SQLite Busy
+- worker reports `done` but `git status --porcelain` is non-empty
 
-1. WAL mode enables concurrent reads
-2. `busy_timeout=5000` handles brief contention
-3. Single-writer prevents deadlocks
-4. CLI status commands are read-only
+Handling:
 
-## Agent Spawn Failure
+1. reject completion
+2. mark task failed (`uncommitted changes`)
+3. retry policy applies
 
-1. `tmux new-session` fails
-2. Catch `subprocess.CalledProcessError`
-3. Mark task failed, create error alert
-4. Do NOT retry immediately (systemic issue)
+## Merge Failure on Completion
 
-## Concurrent Orchestrator Instances
+Condition:
 
-1. PID file at `.yeehaw/orchestrator.pid`
-2. Check on startup, verify process alive
-3. Stale PID → overwrite and proceed
-4. Active PID → abort with error
+- task branch cannot merge into roadmap integration branch
 
-## Graceful Shutdown
+Handling:
 
-1. `SIGINT`/`SIGTERM` caught
-2. `running = False`
-3. Current tick completes
-4. Active tmux sessions continue
-5. Next `yeehaw run` reconnects
-6. PID file cleaned up
+1. abort merge in temporary merge worktree
+2. mark failed with merge details
+3. retry policy applies (worker will relaunch from refreshed base)
+
+## Missing Integration Branch
+
+Condition:
+
+- roadmap has `integration_branch` value but branch does not exist
+
+Handling:
+
+- launch fails with explicit error and task is failed for retry/inspection
+
+## Invalid/Partial Signal JSON
+
+Handling:
+
+- parser retries 3 times (200ms backoff)
+- ignored until valid signal appears (watchdog + polling fallback)
+
+## Paused Tasks
+
+- paused tasks are never dispatched
+- if pause is requested while in-progress, tmux session is terminated first
+- resume requeues task
+
+## Concurrent Orchestrator Processes
+
+- startup checks `<runtime_root>/orchestrator.pid`
+- live PID -> startup aborts with clear error
+- stale PID -> replaced
+
+## Log Pipe Failure
+
+If `tmux pipe-pane` fails:
+
+- task continues running
+- warning event/alert is emitted
+- operator can still attach via tmux

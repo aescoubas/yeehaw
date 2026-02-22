@@ -1,90 +1,62 @@
-# 06 — Roadmap Format
+# 06 — Roadmap Markdown Format
 
-## Structure
+## Required Structure
 
-Roadmaps are structured Markdown documents with a strict hierarchy:
+```md
+# Roadmap: <project-name>
 
-```markdown
-# Roadmap: project-name
+## Phase <N>: <title>
+**Verify:** `<command>`            # optional, must appear before first task in phase
 
-## Phase 1: Foundation
-
-**Verify:** `make test`
-
-### Task 1.1: Set up database schema
-
-Detailed description of what needs to be done.
-Multiple paragraphs are fine.
-
-### Task 1.2: Create API endpoints
-
-Another task description.
-
-## Phase 2: Features
-
-**Verify:** `pytest tests/integration/`
-
-### Task 2.1: User authentication
-
-Description here.
+### Task <N.M>: <title>            # also accepts: ### P0.1: <title>
+<task description block>
 ```
 
-## Rules
+## Parsing Rules
 
-1. **H1** (`#`) — Exactly one, format: `# Roadmap: {project-name}`
-2. **H2** (`##`) — Phases, format: `## Phase {N}: {title}`
-3. **Bold verify** — Optional line after H2: `**Verify:** \`{command}\``
-4. **H3** (`###`) — Tasks, format: `### Task {N.M}: {title}`
-5. **Body** — Everything after H3 until next heading is the task description
-6. Phase numbers sequential starting from 1
-7. Task numbers match their phase: Phase 2 tasks are 2.1, 2.2, etc.
-8. At least one phase required, each phase needs at least one task
+- Header: exactly one `# Roadmap: ...`
+- Phase heading: `## Phase <int>: ...`
+- Task heading:
+  - `### Task N.M: ...`
+  - `### P0.1: ...` (normalized to `0.1` in storage)
+- Optional trailing checklist marker in task title (like `[x]`) is stripped
+- Task description is every line until next heading
 
-## Parser Output
+## Numbering Rules
 
-```python
-@dataclass
-class Task:
-    number: str         # "1.1", "2.3"
-    title: str
-    description: str
+- Phases can start at `0` or `1`, then must be sequential
+- Tasks must be sequential within phase (`N.1`, `N.2`, ...)
+- Task number must match phase number
 
-@dataclass
-class Phase:
-    number: int
-    title: str
-    verify_cmd: str | None
-    tasks: list[Task]
+## Dependency Metadata
 
-@dataclass
-class Roadmap:
-    project_name: str
-    phases: list[Phase]
-```
+Dependencies are extracted from task description lines:
+
+`**Depends on:** <refs>`
+
+Accepted refs:
+
+- `1.1`, `2.3`, `P0.1` (normalized)
+- comma/space mixed text is tolerated; task refs are regex-extracted
+- `none`, `n/a`, `-` treated as no dependencies
 
 ## Validation
 
-```python
-def validate_roadmap(roadmap: Roadmap) -> list[str]:
-    """Returns list of validation error messages. Empty = valid."""
-    errors = []
-    if not roadmap.phases:
-        errors.append("Roadmap must have at least one phase")
-    for i, phase in enumerate(roadmap.phases):
-        if phase.number != i + 1:
-            errors.append(f"Phase {phase.number} out of sequence (expected {i+1})")
-        if not phase.tasks:
-            errors.append(f"Phase {phase.number} has no tasks")
-        for j, task in enumerate(phase.tasks):
-            expected = f"{phase.number}.{j+1}"
-            if task.number != expected:
-                errors.append(f"Task {task.number} out of sequence (expected {expected})")
-    return errors
-```
+`validate_roadmap(...)` enforces:
 
-## Parser
+- at least one phase
+- sequential phase and task numbering
+- valid task-number format
+- dependency references must exist
+- no self-dependency
+- no dependency cycle
 
-Single-pass line-by-line state machine:
-```
-States: INIT → HEADER → PHASE → TASK_HEADER → TASK_BODY
-```
+Example cycle error:
+
+`Task dependency cycle detected: 1.1 -> 1.2 -> 1.1`
+
+## Execution Semantics
+
+- Dependency edges are persisted to `task_dependencies`
+- Orchestrator dispatches queued tasks only when all blockers are `done`
+- Phase verify command runs only after all phase tasks are `done`

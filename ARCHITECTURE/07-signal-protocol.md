@@ -1,89 +1,69 @@
-# 07 — Sentinel File Protocol
+# 07 — Signal Protocol
 
 ## Purpose
 
-Workers signal task completion by writing a JSON file to a known directory.
-This decouples workers from the database — they never need DB access.
+Workers notify completion by writing a JSON file. They do not write to the DB
+directly.
 
-## Signal Directory
+## Signal Path
 
-```
-.yeehaw/signals/task-{id}/signal.json
-```
+`<runtime_root>/signals/task-<task_id>/signal.json`
 
-Created by the orchestrator before launching the agent. Agent receives the
-full path in its task prompt.
+The directory is created by orchestrator before launch and passed in task prompt.
 
-## Signal File Format
+## Signal Format
 
 ```json
 {
   "task_id": 42,
   "status": "done",
-  "summary": "Implemented user model with migrations",
-  "artifacts": ["src/models/user.py", "migrations/001_create_users.sql"],
-  "timestamp": "2024-01-15T10:30:00Z"
+  "summary": "Brief description",
+  "artifacts": ["path1", "path2"],
+  "timestamp": "2026-02-22T12:00:00Z"
 }
 ```
 
-### Status Values
+Required fields for processing:
 
-| Status | Meaning | Orchestrator Action |
-|--------|---------|-------------------|
-| `"done"` | Completed successfully | Run verification → mark done |
-| `"failed"` | Agent could not complete | Log failure, re-queue if attempts < max |
-| `"blocked"` | External dependency needed | Mark blocked, create alert |
+- `task_id`
+- `status`
 
-## Detection: watchdog
+Supported statuses:
 
-```python
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+- `done`
+- `failed`
+- `blocked`
 
-class SignalHandler(FileSystemEventHandler):
-    def __init__(self, callback):
-        self.callback = callback
-        self._debounce = {}
+## Detection
 
-    def on_created(self, event):
-        if event.src_path.endswith("signal.json"):
-            self._schedule(event.src_path)
+`SignalWatcher` combines:
 
-    def on_modified(self, event):
-        if event.src_path.endswith("signal.json"):
-            self._schedule(event.src_path)
+- watchdog recursive observer with debounce (`0.5s`)
+- periodic filesystem polling fallback (`poll_signals()`)
 
-    def _schedule(self, path):
-        self._debounce[path] = time.monotonic()  # 500ms debounce
-```
+Signal parsing retries partial writes up to 3 times with 200ms delay.
 
-## Fallback: Polling
+## Orchestrator Actions
 
-30-second polling interval as fallback for edge cases where watchdog events
-are missed.
+On `done`:
 
-## Parse Retries
+1. Validate task worktree is clean (`git status --porcelain` must be empty).
+2. Merge task branch into roadmap integration branch.
+3. Mark task `done` on success.
+4. If validation/merge fails, mark `failed` and apply retry policy.
 
-```python
-def read_signal(signal_path: Path, retries: int = 3) -> dict | None:
-    for attempt in range(retries):
-        try:
-            data = json.loads(signal_path.read_text())
-            if "task_id" in data and "status" in data:
-                return data
-        except (json.JSONDecodeError, KeyError):
-            pass
-        if attempt < retries - 1:
-            time.sleep(0.2)
-    return None
-```
+On `failed`:
 
-## Lifecycle
+- mark task failed
+- queue retry if attempts remain
 
-1. Orchestrator creates `.yeehaw/signals/task-{id}/`
-2. Agent receives signal directory path in prompt
-3. Agent writes `signal.json` when finished
-4. watchdog detects creation/modification
-5. 500ms debounce → orchestrator reads signal
-6. Orchestrator processes result
-7. Signal directory preserved for debugging
+On `blocked`:
+
+- mark task blocked
+- create warning alert
+
+After any processed signal:
+
+- kill tmux session
+- remove task worktree
+- check phase completion/advancement

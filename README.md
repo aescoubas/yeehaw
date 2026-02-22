@@ -32,6 +32,13 @@ Run commands with:
 uv run yeehaw ...
 ```
 
+Or install the CLI entrypoint once and run `yeehaw` directly:
+
+```bash
+uv tool install -e .
+yeehaw --help
+```
+
 ## Important Path Behavior
 
 Yeehaw runtime state is **global by default**.
@@ -66,7 +73,7 @@ uv run yeehaw project add demo --repo /absolute/path/to/your/repo
 uv run yeehaw roadmap create demo-roadmap.md --project demo
 ```
 
-4. Approve roadmap (queues phase 1 tasks):
+4. Approve roadmap (queues first phase tasks):
 
 ```bash
 uv run yeehaw roadmap approve --project demo
@@ -183,6 +190,8 @@ uv run yeehaw status --project demo
 uv run yeehaw status --json
 ```
 
+Rows are sorted by DB task `ID` (ascending).
+
 Columns:
 - `ID`: DB task id.
 - `Task`: logical task number (`1.1`, `2.3`, ...).
@@ -194,6 +203,7 @@ Columns:
   - `ahead`: branch has commits not in target base branch
   - `diverged`: both branch and target base branch moved
   - `merged`: no branch-only commits remain
+- `Attempts`: attempt counter shown as `<attempts>/<max_attempts>`.
 - `Tokens`: parsed token usage from latest in-progress log (if detectable), else `n/a`.
 
 ### `attach`
@@ -296,7 +306,7 @@ Write the baseline contract shared by all scripts.
 
 Task statuses:
 - `pending`: task exists but not yet queued.
-- `queued`: eligible for dispatch.
+- `queued`: ready to dispatch, waiting for dependencies and/or available scheduler capacity.
 - `paused`: intentionally paused; not dispatched until resumed.
 - `in-progress`: worker currently running.
 - `done`: finished successfully.
@@ -311,7 +321,7 @@ Phase flow:
 - If no next phase, roadmap becomes `completed`.
 
 Failure/retry behavior:
-- Crash, timeout, verification failure, or worker `failed` signal marks task failed.
+- Crash, timeout, dirty `done` signal, merge failure, or worker `failed` signal marks task failed.
 - Task is re-queued until `max_attempts` is exhausted (default `4`).
 - Exhaustion emits an alert.
 
@@ -384,7 +394,7 @@ Exposed tools:
 - `approve_roadmap(project_name)`
 - `pause_task(task_id)`
 - `resume_task(task_id)`
-- `update_task(task_id, status=None, assigned_agent=None)`
+- `update_task(task_id, status=None, assigned_agent=None, reset_attempts=False)`
 
 Notes:
 - `pause_task` works for `pending`, `queued`, and `in-progress`.
@@ -403,7 +413,7 @@ High-level flow for a supervisor/controller agent:
 4. `edit_roadmap(project_name="demo", markdown=<updated>)`
 
 Safety rules enforced:
-- Non-editable task history (`in-progress`, `done`, `failed`, `blocked`) cannot be modified or removed.
+- Non-editable task history (`paused`, `in-progress`, `done`, `failed`, `blocked`) cannot be modified or removed.
 - For non-draft roadmaps, phase structure cannot be added/removed/reordered.
 
 ## Planner / Supervisor Usage

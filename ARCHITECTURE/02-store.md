@@ -1,199 +1,126 @@
 # 02 — SQLite Store
 
-## Design Principles
+## Design
 
-- **Single-file database** at `.yeehaw/yeehaw.db` (gitignored)
-- **stdlib `sqlite3`** — no external ORM, no driver dependency
-- **WAL mode** for concurrent reads from CLI while orchestrator writes
-- **Single-writer** via connection reuse within the orchestrator process
-- **ISO 8601 timestamps** stored as TEXT
-- **Schema versioning** via idempotent DDL (`CREATE TABLE IF NOT EXISTS`)
+- SQLite database at `<runtime_root>/yeehaw.db`
+- WAL mode + busy timeout for concurrent readers
+- Updates come from orchestrator, CLI commands, and MCP server tool calls
+- ISO timestamps stored as text
+- Idempotent schema initialization with targeted migrations
 
-## Schema
+## Core Tables
 
 ### `projects`
 
-```sql
-CREATE TABLE IF NOT EXISTS projects (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL UNIQUE,
-    repo_root   TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+Tracks registered repos.
+
+- `name` (unique)
+- `repo_root` (absolute path for task execution and verification)
 
 ### `roadmaps`
 
-```sql
-CREATE TABLE IF NOT EXISTS roadmaps (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id  INTEGER NOT NULL REFERENCES projects(id),
-    raw_md      TEXT    NOT NULL,
-    status      TEXT    NOT NULL DEFAULT 'draft'
-                CHECK (status IN ('draft','approved','executing','completed','invalid')),
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+Stores roadmap markdown and lifecycle state.
+
+- `raw_md`
+- `status`: `draft | approved | executing | completed | invalid`
+- `integration_branch`: roadmap-level branch where completed task branches are merged
 
 ### `roadmap_phases`
 
-```sql
-CREATE TABLE IF NOT EXISTS roadmap_phases (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    roadmap_id    INTEGER NOT NULL REFERENCES roadmaps(id),
-    phase_number  INTEGER NOT NULL,
-    title         TEXT    NOT NULL,
-    verify_cmd    TEXT,
-    status        TEXT    NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending','executing','completed','failed')),
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+- `phase_number`, `title`, optional `verify_cmd`
+- `status`: `pending | executing | completed | failed`
 
 ### `tasks`
 
-```sql
-CREATE TABLE IF NOT EXISTS tasks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    roadmap_id      INTEGER NOT NULL REFERENCES roadmaps(id),
-    phase_id        INTEGER NOT NULL REFERENCES roadmap_phases(id),
-    task_number     TEXT    NOT NULL,
-    title           TEXT    NOT NULL,
-    description     TEXT    NOT NULL DEFAULT '',
-    status          TEXT    NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','queued','in-progress','done','failed','blocked')),
-    assigned_agent  TEXT,
-    branch_name     TEXT,
-    worktree_path   TEXT,
-    signal_dir      TEXT,
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    max_attempts    INTEGER NOT NULL DEFAULT 4,
-    last_failure    TEXT,
-    started_at      TEXT,
-    completed_at    TEXT,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+- `task_number`, `title`, `description`
+- `status`: `pending | queued | paused | in-progress | done | failed | blocked`
+- assignment/runtime metadata: `assigned_agent`, `branch_name`, `worktree_path`, `signal_dir`
+- retry metadata: `attempts`, `max_attempts`, `last_failure`
 
-### `git_worktrees`
+### `task_dependencies`
 
-```sql
-CREATE TABLE IF NOT EXISTS git_worktrees (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     INTEGER NOT NULL REFERENCES tasks(id),
-    branch      TEXT    NOT NULL,
-    path        TEXT    NOT NULL,
-    status      TEXT    NOT NULL DEFAULT 'active'
-                CHECK (status IN ('active','merged','cleaned')),
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+Dependency edges between tasks:
 
-### `events`
+- `blocked_task_id`
+- `blocker_task_id`
+- uniqueness on edge pair
 
-```sql
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id  INTEGER REFERENCES projects(id),
-    task_id     INTEGER REFERENCES tasks(id),
-    kind        TEXT    NOT NULL,
-    message     TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+This powers dispatch gating (`queued` tasks launch only when blockers are `done`).
 
-### `alerts`
+### `git_worktrees`, `events`, `alerts`, `scheduler_config`
 
-```sql
-CREATE TABLE IF NOT EXISTS alerts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id  INTEGER REFERENCES projects(id),
-    task_id     INTEGER REFERENCES tasks(id),
-    severity    TEXT    NOT NULL CHECK (severity IN ('info','warn','error')),
-    message     TEXT    NOT NULL,
-    acked       INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+- `git_worktrees`: bookkeeping rows
+- `events`: operational audit trail
+- `alerts`: actionable warnings/errors with ack flag
+- `scheduler_config` singleton:
+  - `max_global_tasks`
+  - `max_per_project`
+  - `tick_interval_sec`
+  - `task_timeout_min`
 
-### `scheduler_config`
+## Store Operations (Key APIs)
 
-```sql
-CREATE TABLE IF NOT EXISTS scheduler_config (
-    id                  INTEGER PRIMARY KEY CHECK (id = 1),
-    max_global_tasks    INTEGER NOT NULL DEFAULT 5,
-    max_per_project     INTEGER NOT NULL DEFAULT 3,
-    tick_interval_sec   INTEGER NOT NULL DEFAULT 5,
-    task_timeout_min    INTEGER NOT NULL DEFAULT 60
-);
+Projects:
 
-INSERT OR IGNORE INTO scheduler_config (id) VALUES (1);
-```
+- `create_project(name, repo_root)`
+- `get_project(name)`
+- `list_projects()`
+- `delete_project(name)`
 
-## Store API
+Roadmaps:
 
-```python
-class Store:
-    def __init__(self, db_path: Path) -> None: ...
-    def close(self) -> None: ...
+- `create_roadmap(project_id, raw_md)` (invalidates prior active roadmaps for project)
+- `get_active_roadmap(project_id)`
+- `update_roadmap_status(roadmap_id, status)`
+- `set_roadmap_integration_branch(roadmap_id, branch_name)`
+- `edit_roadmap_in_place(...)` (structural/immutability checks + task sync)
+- `apply_roadmap_dependencies(roadmap_id, roadmap)`
 
-    # Projects
-    def create_project(self, name: str, repo_root: str) -> int: ...
-    def get_project(self, name: str) -> dict | None: ...
-    def list_projects(self) -> list[dict]: ...
-    def delete_project(self, name: str) -> bool: ...
+Tasks:
 
-    # Roadmaps
-    def create_roadmap(self, project_id: int, raw_md: str) -> int: ...
-    def get_roadmap(self, roadmap_id: int) -> dict | None: ...
-    def get_active_roadmap(self, project_id: int) -> dict | None: ...
-    def update_roadmap_status(self, roadmap_id: int, status: str) -> None: ...
+- `assign_task(...)` sets `in-progress`, increments attempts, stores branch/worktree/signal
+- `queue_task(task_id)`
+- `pause_task(task_id)` and `resume_task(task_id)`
+- `complete_task(task_id, status)` for terminal `done`/`blocked`
+- `fail_task(task_id, failure_msg)`
+- `reset_task_attempts(task_id)`
+- `are_task_dependencies_satisfied(task_id)`
 
-    # Phases
-    def create_phase(self, roadmap_id: int, number: int, title: str, verify_cmd: str | None) -> int: ...
-    def get_phase(self, phase_id: int) -> dict | None: ...
-    def list_phases(self, roadmap_id: int) -> list[dict]: ...
-    def list_tasks_by_phase(self, phase_id: int) -> list[dict]: ...
-    def update_phase_status(self, phase_id: int, status: str) -> None: ...
+Operational data:
 
-    # Tasks
-    def create_task(self, roadmap_id: int, phase_id: int, number: str, title: str, description: str) -> int: ...
-    def get_task(self, task_id: int) -> dict | None: ...
-    def list_tasks(self, project_id: int | None = None, status: str | None = None) -> list[dict]: ...
-    def assign_task(self, task_id: int, agent: str, branch: str, worktree: str, signal_dir: str) -> None: ...
-    def complete_task(self, task_id: int, status: str) -> None: ...
-    def fail_task(self, task_id: int, failure_msg: str) -> None: ...
-    def queue_task(self, task_id: int) -> None: ...
-    def count_active_tasks(self, project_id: int | None = None) -> int: ...
+- `log_event(...)`, `list_events(...)`
+- `create_alert(...)`, `list_alerts(...)`, `ack_alert(...)`
+- `get_scheduler_config()`, `update_scheduler_config(...)`
 
-    # Events
-    def log_event(self, kind: str, message: str, project_id: int | None = None, task_id: int | None = None) -> None: ...
-    def list_events(self, limit: int = 50) -> list[dict]: ...
+## Dependency Handling
 
-    # Alerts
-    def create_alert(self, severity: str, message: str, project_id: int | None = None, task_id: int | None = None) -> None: ...
-    def list_alerts(self, acked: bool = False) -> list[dict]: ...
-    def ack_alert(self, alert_id: int) -> None: ...
+Dependency refs are parsed from task description metadata:
 
-    # Scheduler
-    def get_scheduler_config(self) -> dict: ...
-    def update_scheduler_config(self, **kwargs) -> None: ...
-```
+- `**Depends on:** 1.1, 1.2` (also accepts `P0.1` format)
 
-## Connection Management
+When persisting roadmap dependencies:
 
-```python
-import sqlite3
-from pathlib import Path
+1. Map task numbers to DB task IDs.
+2. Validate unknown/self references.
+3. Detect cycles.
+4. Replace dependency edges for that roadmap atomically.
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-```
+## In-Place Roadmap Edit Rules
+
+`edit_roadmap_in_place` enforces history safety:
+
+- Editable task statuses: `pending`, `queued`
+- Locked task statuses: `paused`, `in-progress`, `done`, `failed`, `blocked`
+- Non-draft roadmaps cannot add/remove/reorder phases
+- Completed/failed phases cannot be structurally changed
+
+It synchronizes tasks using task-number and title/description fingerprint matching so
+renumbering and content updates remain stable for editable tasks.
+
+## Migrations
+
+`init_db()` applies:
+
+- legacy schema migration (`root_path -> repo_root`, old status mapping)
+- `roadmaps.integration_branch` backfill when missing
+- tasks-table rebuild to include `paused` status when upgrading older DBs

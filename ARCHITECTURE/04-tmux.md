@@ -2,85 +2,40 @@
 
 ## Purpose
 
-Each worker agent runs inside a **detached tmux session**. This allows:
-- Background execution without blocking the CLI
-- Live attachment for observation (`yeehaw attach`)
-- Clean process isolation and cleanup
-- Full scrollback capture for logging
+Workers run in detached tmux sessions so the orchestrator can continue ticking while
+operators optionally attach to live agent terminals.
 
-## Session Naming
+## Session Identity
 
-```
-yeehaw-task-{task_id}
-```
+Session name format:
+
+`yeehaw-task-<task_id>`
 
 ## Operations
 
-### Ensure Session
+`tmux.session` exposes:
 
-```python
-import subprocess
+- `ensure_session(session_name, working_dir)`
+- `send_text(session_name, text)`
+- `launch_agent(session_name, working_dir, command)` (ensure + send)
+- `has_session(session_name)`
+- `capture_pane(session_name)`
+- `kill_session(session_name)`
+- `attach_session(session_name)` (replaces current process)
+- `pipe_output(session_name, log_path)` (streams pane output to file)
 
-def ensure_session(session_name: str, working_dir: str) -> None:
-    subprocess.run([
-        "tmux", "new-session", "-d", "-s", session_name, "-c", working_dir,
-    ], check=True, capture_output=True)
-```
+## Logging
 
-### Send Command
+After launch, orchestrator calls `pipe_output`:
 
-```python
-def send_text(session_name: str, text: str) -> None:
-    subprocess.run([
-        "tmux", "send-keys", "-t", session_name, text, "Enter",
-    ], check=True, capture_output=True)
-```
+- command: `tmux pipe-pane -o ... "cat >> <log_path>"`
+- one file per task attempt:
+  - `<runtime_root>/logs/task-<id>/attempt-XX-<agent>.log`
 
-### Check Liveness
+If log piping fails, task keeps running and an event/alert is emitted.
 
-```python
-def has_session(session_name: str) -> bool:
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session_name], capture_output=True,
-    )
-    return result.returncode == 0
-```
+## Operator Interaction
 
-### Capture Pane
-
-```python
-def capture_pane(session_name: str) -> str:
-    result = subprocess.run(
-        ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-"],
-        capture_output=True, text=True,
-    )
-    return result.stdout
-```
-
-### Kill Session
-
-```python
-def kill_session(session_name: str) -> None:
-    subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
-```
-
-## Agent Launch Pattern
-
-```python
-def launch_agent(session_name: str, working_dir: str, command: str) -> None:
-    ensure_session(session_name, working_dir)
-    send_text(session_name, command)
-```
-
-## User Interaction
-
-`yeehaw attach <task-id>` resolves the session name and replaces the process:
-
-```python
-import os
-
-def attach_session(session_name: str) -> None:
-    os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
-```
-
-The user detaches with `Ctrl+b, d` and the agent keeps running.
+- `yeehaw attach <task_id>` attaches to active session
+- detach with `Ctrl+b`, then `d`
+- `yeehaw logs <task_id> --follow` provides non-tmux live output view
