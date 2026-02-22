@@ -17,6 +17,7 @@ import yeehaw.cli.run as cli_run
 import yeehaw.cli.scheduler as cli_scheduler
 import yeehaw.cli.status as cli_status
 import yeehaw.cli.stop as cli_stop
+import yeehaw.cli.workers as cli_workers
 from yeehaw.store.store import Store
 
 
@@ -88,6 +89,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.logs.handle_logs", _capture("logs"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
+    monkeypatch.setattr("yeehaw.cli.workers.handle_workers", _capture("workers"))
 
     cli_main.main(["init"])
     cli_main.main(["roadmap", "show", "--project", "p"])  # routing only
@@ -102,6 +104,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["logs", "1"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["alerts"])
+    cli_main.main(["workers", "show"])
 
     names = [name for name, _ in calls]
     assert names == [
@@ -116,6 +119,7 @@ def test_cli_main_dispatches_remaining_commands(
         "logs",
         "scheduler",
         "alerts",
+        "workers",
     ]
     assert all(db == tmp_path / ".yeehaw" / "yeehaw.db" for _, db in calls)
 
@@ -507,6 +511,44 @@ def test_handle_scheduler_show_config_and_no_changes(
     out = capsys.readouterr().out
     assert "Scheduler config updated" in out
     assert "max_global_tasks = 9" in out
+
+
+def test_handle_workers_show_default_custom_and_invalid(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli_workers.handle_workers(Namespace(workers_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "Worker Configuration:" in out
+    assert "workers.json (not found)" in out
+    assert "[claude]" in out
+    assert "[gemini]" in out
+    assert "[codex]" in out
+
+    workers_path = db_path.parent / "workers.json"
+    workers_path.parent.mkdir(parents=True, exist_ok=True)
+    workers_path.write_text(
+        (
+            "{"
+            '"disable_default_mcp": true,'
+            '"extra_args": ["--global"],'
+            '"agents": {"codex": {"disable_default_mcp": false, "extra_args": ["--agent"]}}'
+            "}"
+        )
+    )
+
+    cli_workers.handle_workers(Namespace(workers_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "workers.json (found)" in out
+    assert "[codex]" in out
+    assert "disable_default_mcp: false" in out
+    assert "default_no_mcp_args: (none)" in out
+    assert "extra_args: --global --agent" in out
+
+    workers_path.write_text("{not-json")
+    cli_workers.handle_workers(Namespace(workers_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "Error: Invalid JSON in" in out
 
 
 def test_handle_attach_paths(

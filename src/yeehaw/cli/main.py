@@ -163,6 +163,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Acknowledge alert by ID",
     )
 
+    workers_parser = subparsers.add_parser("workers", help="Show worker runtime configuration")
+    workers_sub = workers_parser.add_subparsers(dest="workers_command", required=True)
+    workers_sub.add_parser("show", help="Show effective worker launch configuration")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -219,3 +223,8 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.status import handle_alerts
 
         handle_alerts(args, _get_db_path())
+
+    elif args.command == "workers":
+        from yeehaw.cli.workers import handle_workers
+
+        handle_workers(args, _get_db_path())
