@@ -450,6 +450,30 @@ def test_handle_status_sorts_tasks_by_id(db_path: Path, capsys: pytest.CaptureFi
     assert first_idx < second_idx
 
 
+def test_handle_status_truncates_long_title(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    long_title = "Create script skeleton and module contract that should be truncated"
+
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(roadmap_id, phase_id, "1.1", long_title, "desc")
+        store.queue_task(task_id)
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+
+    expected = f"{long_title[:32]}..."
+    assert expected in out
+    assert long_title not in out
+
+    row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
+    assert row[54:60] == "queued"
+
+
 def test_handle_scheduler_show_config_and_no_changes(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],

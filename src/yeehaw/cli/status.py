@@ -8,6 +8,19 @@ from typing import Any
 
 from yeehaw.store.store import Store
 
+TITLE_WIDTH = 35
+
+
+def _truncate_for_column(value: str, width: int) -> str:
+    """Truncate text to fixed column width, adding ellipsis when needed."""
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return "." * width
+    return f"{value[: width - 3]}..."
+
 
 def handle_status(args: Any, db_path: Path) -> None:
     """Handle `yeehaw status` output."""
@@ -34,12 +47,13 @@ def handle_status(args: Any, db_path: Path) -> None:
             print("No tasks.")
             return
 
-        print(f"{'ID':<6} {'Task':<10} {'Title':<35} {'Status':<14} {'Agent':<10}")
+        print(f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} {'Status':<14} {'Agent':<10}")
         print("-" * 80)
         for task in tasks:
             agent = task.get("assigned_agent") or ""
+            title = _truncate_for_column(task["title"], TITLE_WIDTH)
             print(
-                f"{task['id']:<6} {task['task_number']:<10} {task['title']:<35} "
+                f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
                 f"{task['status']:<14} {agent:<10}"
             )
 
