@@ -39,6 +39,23 @@ def build_task_prompt(
     parts.extend(
         [
             "",
+            "## Completion Requirements",
+            "",
+            "Before writing the signal file, you MUST:",
+            "",
+            "1. Stage and commit your task changes on the current task branch.",
+            "2. Confirm the worktree is clean (excluding `.yeehaw`) by running:",
+            "   `git status --porcelain -- . ':(exclude).yeehaw'`",
+            "3. Ensure that command returns no output.",
+            "",
+            "If you cannot satisfy these requirements, set signal `status` to `\"failed\"`",
+            "or `\"blocked\"` with a clear summary instead of reporting done.",
+        ]
+    )
+
+    parts.extend(
+        [
+            "",
             "## Signal Protocol",
             "",
             (
