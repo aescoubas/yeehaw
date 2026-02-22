@@ -513,24 +513,47 @@ def test_handle_plan_missing_and_success(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = Namespace(briefing="missing.txt", agent="claude")
+    args = Namespace(briefing="missing.txt", agent="claude", project=None)
     cli_plan.handle_plan(args, db_path)
     assert "Briefing file 'missing.txt' not found" in capsys.readouterr().out
+
+    cli_plan.handle_plan(Namespace(briefing=None, agent="codex", project="missing"), db_path)
+    assert "Project 'missing' not found" in capsys.readouterr().out
+
+    store = Store(db_path)
+    store.create_project("proj-a", "/tmp/repo-a")
+    store.close()
 
     briefing = db_path.parent.parent / "briefing.txt"
     briefing.write_text("content")
 
-    called: list[tuple[Path, Path | None, str]] = []
+    called: list[tuple[Path, Path | None, str, str | None]] = []
 
-    def fake_start(db: Path, briefing_file: Path | None, agent: str) -> None:
-        called.append((db, briefing_file, agent))
+    def fake_start(
+        db: Path,
+        briefing_file: Path | None,
+        agent: str,
+        project_name: str | None,
+    ) -> None:
+        called.append((db, briefing_file, agent, project_name))
 
     monkeypatch.setattr(cli_plan, "start_planner_session", fake_start)
-    cli_plan.handle_plan(Namespace(briefing=str(briefing), agent="gemini"), db_path)
+    cli_plan.handle_plan(
+        Namespace(briefing=str(briefing), agent="gemini", project="proj-a"),
+        db_path,
+    )
 
     out = capsys.readouterr().out
-    assert "Starting planner session" in out
-    assert called == [(db_path, briefing, "gemini")]
+    assert "Starting interactive planner session" in out
+    assert called == [(db_path, briefing, "gemini", "proj-a")]
+
+    monkeypatch.setattr(
+        cli_plan,
+        "start_planner_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("planner failed")),
+    )
+    cli_plan.handle_plan(Namespace(briefing=None, agent="codex", project=None), db_path)
+    assert "Error: planner failed" in capsys.readouterr().out
 
 
 def test_handle_run_paths(

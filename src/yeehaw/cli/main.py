@@ -82,13 +82,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Approve generated roadmap immediately",
     )
 
-    plan_parser = subparsers.add_parser("plan", help="Start AI planning session")
+    plan_parser = subparsers.add_parser("plan", help="Start interactive AI planning session")
     plan_parser.add_argument("briefing", nargs="?", help="Briefing file (optional)")
+    plan_parser.add_argument("--project", help="Existing project name to plan for")
     plan_parser.add_argument(
         "--agent",
-        default="claude",
-        choices=["claude", "gemini"],
-        help="Planner agent (default: claude)",
+        default="codex",
+        choices=["claude", "gemini", "codex"],
+        help="Planner agent (default: codex)",
     )
 
     run_parser = subparsers.add_parser("run", help="Start the orchestrator")
