@@ -49,8 +49,10 @@ def test_dispatch_queued_launches_task(
     ids = _seed_single_task(store, status="queued")
 
     launched: dict[str, Any] = {}
+    prepare_calls: list[tuple[Path, str]] = []
 
     def fake_prepare_worktree(_repo_root: Path, _branch: str) -> Path:
+        prepare_calls.append((_repo_root, _branch))
         worktree = repo_root / "worktree"
         worktree.mkdir(parents=True, exist_ok=True)
         return worktree
@@ -79,6 +81,8 @@ def test_dispatch_queued_launches_task(
     assert launched["session"] == f"yeehaw-task-{ids['task_id']}"
     assert piped["session"] == f"yeehaw-task-{ids['task_id']}"
     assert f".yeehaw/logs/task-{ids['task_id']}/attempt-01-claude.log" in piped["log_path"]
+    assert prepare_calls
+    assert prepare_calls[0][0] == Path("/tmp/repo")
 
     events = store.list_events()
     assert events[0]["kind"] == "task_launched"
@@ -422,6 +426,65 @@ def test_is_timed_out_true_for_old_started_at(orchestrator_store: tuple[Store, P
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert orchestrator._is_timed_out(task) is True
+
+
+def test_stop_sets_stop_event(orchestrator_store: tuple[Store, Path]) -> None:
+    store, repo_root = orchestrator_store
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator.running = True
+
+    orchestrator.stop()
+
+    assert orchestrator.running is False
+    assert orchestrator._stop_event.is_set() is True
+
+
+def test_run_uses_stop_event_wait(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    orchestrator = Orchestrator(store, repo_root)
+
+    monkeypatch.setattr(orchestrator, "_write_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(orchestrator, "_remove_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "start", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "stop", lambda: None)
+    monkeypatch.setattr(orchestrator, "_tick", lambda _project_id: None)
+
+    wait_calls: list[int] = []
+    monkeypatch.setattr(
+        orchestrator._stop_event,
+        "wait",
+        lambda timeout: wait_calls.append(timeout) or True,
+    )
+
+    orchestrator.run(project_id=None)
+
+    assert wait_calls == [orchestrator.config["tick_interval_sec"]]
+
+
+def test_run_does_not_wait_after_stop_requested_in_tick(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    orchestrator = Orchestrator(store, repo_root)
+
+    monkeypatch.setattr(orchestrator, "_write_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(orchestrator, "_remove_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "start", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "stop", lambda: None)
+    monkeypatch.setattr(orchestrator, "_tick", lambda _project_id: orchestrator.stop())
+    monkeypatch.setattr(
+        orchestrator._stop_event,
+        "wait",
+        lambda _timeout: (_ for _ in ()).throw(AssertionError("wait() should not be called")),
+    )
+
+    orchestrator.run(project_id=None)
 
 
 def test_handle_timeout_records_log_hints(

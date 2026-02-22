@@ -729,21 +729,21 @@ def test_handle_stop_paths(
     ids = _seed_project_with_task(db_path, task_status="in-progress")
 
     killed: list[str] = []
-    cleaned: list[Path] = []
+    cleaned: list[tuple[Path, Path]] = []
 
     monkeypatch.setattr(cli_stop, "has_session", lambda _session: True)
     monkeypatch.setattr(cli_stop, "kill_session", lambda session: killed.append(session))
     monkeypatch.setattr(
         cli_stop,
         "cleanup_worktree",
-        lambda _repo_root, worktree: cleaned.append(worktree),
+        lambda repo_root, worktree: cleaned.append((repo_root, worktree)),
     )
 
     cli_stop.handle_stop(Namespace(all=False, task_id=ids["task_id"]), db_path)
     out = capsys.readouterr().out
     assert "Stopped task" in out
     assert killed == [f"yeehaw-task-{ids['task_id']}"]
-    assert cleaned == [Path("/tmp/worktree")]
+    assert cleaned == [(Path("/tmp/repo-a"), Path("/tmp/worktree"))]
 
     # --all path
     ids2 = _seed_project_with_task(db_path, task_status="in-progress")

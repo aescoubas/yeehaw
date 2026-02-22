@@ -196,7 +196,8 @@ class Store:
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         """Get task plus project metadata."""
         row = self._conn.execute(
-            "SELECT t.*, p.name as project_name, p.id as project_id "
+            "SELECT t.*, p.name as project_name, p.id as project_id, "
+            "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
             "JOIN projects p ON r.project_id = p.id "
@@ -212,7 +213,8 @@ class Store:
     ) -> list[dict[str, Any]]:
         """List tasks, optionally filtered by project and status."""
         query = (
-            "SELECT t.*, p.name as project_name, p.id as project_id "
+            "SELECT t.*, p.name as project_name, p.id as project_id, "
+            "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
             "JOIN projects p ON r.project_id = p.id "

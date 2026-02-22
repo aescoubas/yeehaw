@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ class Orchestrator:
         self.signal_watcher = SignalWatcher(repo_root / ".yeehaw" / "signals")
         self.default_agent = resolve_profile(default_agent).name if default_agent else None
         self.running = False
+        self._stop_event = threading.Event()
         self._poll_counter = 0
 
     def run(self, project_id: int | None = None) -> None:
@@ -47,13 +49,17 @@ class Orchestrator:
         self._write_pid_file()
         self._install_signal_handlers()
         self.running = True
+        self._stop_event.clear()
         self.signal_watcher.start()
         self.store.log_event("orchestrator_start", "Orchestrator started")
 
         try:
             while self.running:
                 self._tick(project_id)
-                time.sleep(self.config["tick_interval_sec"])
+                if not self.running:
+                    break
+                if self._stop_event.wait(self.config["tick_interval_sec"]):
+                    break
         finally:
             self.signal_watcher.stop()
             self._remove_pid_file()
@@ -62,6 +68,7 @@ class Orchestrator:
     def stop(self) -> None:
         """Request orchestrator shutdown."""
         self.running = False
+        self._stop_event.set()
 
     def _tick(self, project_id: int | None) -> None:
         self._monitor_active(project_id)
@@ -126,7 +133,7 @@ class Orchestrator:
 
         kill_session(session)
         if task.get("worktree_path"):
-            cleanup_worktree(self.repo_root, Path(task["worktree_path"]))
+            cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
         self._check_phase_completion(task["phase_id"])
 
@@ -146,10 +153,11 @@ class Orchestrator:
 
     def _launch_task(self, task: dict[str, Any]) -> None:
         try:
+            task_repo_root = self._task_repo_root(task)
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
             worker_cfg = resolve_worker_launch_config(self.repo_root, profile.name)
             branch = branch_name(task["task_number"], task["title"])
-            worktree_path = prepare_worktree(self.repo_root, branch)
+            worktree_path = prepare_worktree(task_repo_root, branch)
             attempt_num = int(task.get("attempts") or 0) + 1
 
             signal_dir = self.repo_root / ".yeehaw" / "signals" / f"task-{task['id']}"
@@ -220,10 +228,11 @@ class Orchestrator:
         phase = self.store.get_phase(task["phase_id"])
         if not phase or not phase.get("verify_cmd"):
             return True
+        task_repo_root = self._task_repo_root(task)
         result = subprocess.run(
             phase["verify_cmd"],
             shell=True,
-            cwd=self.repo_root,
+            cwd=task_repo_root,
             capture_output=True,
             text=True,
             timeout=120,
@@ -256,7 +265,7 @@ class Orchestrator:
         self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
-            cleanup_worktree(self.repo_root, Path(task["worktree_path"]))
+            cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
     def _handle_crash(self, task: dict[str, Any]) -> None:
         failure_msg = "Tmux session lost"
@@ -267,7 +276,7 @@ class Orchestrator:
         self.store.log_event("session_lost", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
-            cleanup_worktree(self.repo_root, Path(task["worktree_path"]))
+            cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
     def _maybe_retry(self, task: dict[str, Any]) -> None:
         if task["attempts"] < task["max_attempts"]:
@@ -290,11 +299,12 @@ class Orchestrator:
             return
         if all(task["status"] == "done" for task in tasks):
             phase = self.store.get_phase(phase_id)
+            verify_repo_root = self._phase_repo_root(phase_id)
             if phase and phase.get("verify_cmd"):
                 result = subprocess.run(
                     phase["verify_cmd"],
                     shell=True,
-                    cwd=self.repo_root,
+                    cwd=verify_repo_root,
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -349,6 +359,23 @@ class Orchestrator:
         snapshot_path = logs_root / f"{kind}-pane-{timestamp}.txt"
         snapshot_path.write_text(pane_text)
         return snapshot_path
+
+    def _task_repo_root(self, task: dict[str, Any]) -> Path:
+        """Resolve git repo root for a task from project metadata."""
+        candidate = task.get("project_repo_root")
+        if isinstance(candidate, str) and candidate:
+            return Path(candidate)
+        return self.repo_root
+
+    def _phase_repo_root(self, phase_id: int) -> Path:
+        """Resolve git repo root for phase verification."""
+        phase_tasks = self.store.list_tasks_by_phase(phase_id)
+        if not phase_tasks:
+            return self.repo_root
+        first = self.store.get_task(int(phase_tasks[0]["id"]))
+        if first is None:
+            return self.repo_root
+        return self._task_repo_root(first)
 
     def _write_pid_file(self) -> None:
         """Ensure only one orchestrator process owns this repo."""

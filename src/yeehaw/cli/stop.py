@@ -13,7 +13,6 @@ from yeehaw.tmux.session import has_session, kill_session
 def handle_stop(args: Any, db_path: Path) -> None:
     """Stop one or all in-progress tasks and clean resources."""
     store = Store(db_path)
-    repo_root = db_path.parent.parent
 
     try:
         if args.all:
@@ -32,7 +31,7 @@ def handle_stop(args: Any, db_path: Path) -> None:
             if has_session(session):
                 kill_session(session)
             if task.get("worktree_path"):
-                cleanup_worktree(repo_root, Path(task["worktree_path"]))
+                cleanup_worktree(_task_repo_root(task, db_path), Path(task["worktree_path"]))
             store.fail_task(task["id"], "Manually stopped")
             store.log_event(
                 "task_stopped",
@@ -45,3 +44,11 @@ def handle_stop(args: Any, db_path: Path) -> None:
             print("No matching tasks found.")
     finally:
         store.close()
+
+
+def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
+    """Resolve repo root for a task, falling back to the local harness repo."""
+    candidate = task.get("project_repo_root")
+    if isinstance(candidate, str) and candidate:
+        return Path(candidate)
+    return db_path.parent.parent
