@@ -12,6 +12,7 @@ from typing import Any
 
 from yeehaw.agent.launcher import build_task_prompt, write_launcher
 from yeehaw.agent.profiles import resolve_profile
+from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_launch_config
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
@@ -146,6 +147,7 @@ class Orchestrator:
     def _launch_task(self, task: dict[str, Any]) -> None:
         try:
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
+            worker_cfg = resolve_worker_launch_config(self.repo_root, profile.name)
             branch = branch_name(task["task_number"], task["title"])
             worktree_path = prepare_worktree(self.repo_root, branch)
             attempt_num = int(task.get("attempts") or 0) + 1
@@ -155,7 +157,21 @@ class Orchestrator:
             log_path = self._task_log_path(task["id"], attempt_num, profile.name)
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
-            prompt = build_task_prompt(task, str(signal_dir), task.get("last_failure"))
+            prompt_path = worktree_path / ".yeehaw" / f"task-{task['id']}-prompt.md"
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt = build_task_prompt(
+                task,
+                str(signal_dir),
+                task.get("last_failure"),
+                prompt_file=str(prompt_path),
+            )
+            prompt_path.write_text(prompt)
+
+            launch_args = list(worker_cfg.extra_args)
+            if worker_cfg.disable_default_mcp:
+                launch_args = [*default_no_mcp_args(profile.name), *launch_args]
+            launch_env = dict(worker_cfg.env)
+            launch_env.setdefault("YEEHAW_TASK_PROMPT_FILE", str(prompt_path))
 
             self.store.assign_task(
                 task["id"],
@@ -167,7 +183,13 @@ class Orchestrator:
 
             session = f"yeehaw-task-{task['id']}"
             launcher_path = signal_dir / "launch.sh"
-            write_launcher(launcher_path, profile, prompt)
+            write_launcher(
+                launcher_path,
+                profile,
+                prompt,
+                extra_args=launch_args,
+                env=launch_env,
+            )
             launch_agent(session, str(worktree_path), str(launcher_path))
             try:
                 pipe_output(session, str(log_path))
@@ -181,11 +203,11 @@ class Orchestrator:
 
             self.store.log_event(
                 "task_launched",
-                f"Agent: {profile.name}, log: {log_path}",
+                f"Agent: {profile.name}, log: {log_path}, prompt: {prompt_path}",
                 task_id=task["id"],
             )
 
-        except (subprocess.CalledProcessError, OSError) as exc:
+        except (subprocess.CalledProcessError, OSError, ValueError) as exc:
             self.store.fail_task(task["id"], str(exc))
             self.store.create_alert(
                 "error",

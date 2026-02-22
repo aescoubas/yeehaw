@@ -38,10 +38,13 @@ def test_build_task_prompt_includes_signal_contract() -> None:
         },
         signal_dir="/tmp/signal-dir",
         previous_failure="timeout",
+        prompt_file="/tmp/worktree/.yeehaw/task-42-prompt.md",
     )
 
     assert "# Task 1.2: Implement parser" in prompt
     assert "`/tmp/signal-dir/signal.json`" in prompt
+    assert "Persistent Task Context" in prompt
+    assert "/tmp/worktree/.yeehaw/task-42-prompt.md" in prompt
     assert '"task_id": 42' in prompt
     assert '"status": "done"' in prompt
     assert "## Previous Attempt Failed" in prompt
@@ -61,10 +64,18 @@ def test_write_launcher_creates_executable_script(tmp_path: Path) -> None:
     script_path = tmp_path / "launch.sh"
     profile = resolve_profile("gemini")
 
-    write_launcher(script_path, profile, "hello")
+    write_launcher(
+        script_path,
+        profile,
+        "hello",
+        extra_args=["--model", "gemini-pro"],
+        env={"YEEHAW_TASK_PROMPT_FILE": "/tmp/prompt.md"},
+    )
 
     content = script_path.read_text()
     assert content.startswith("#!/bin/bash")
+    assert "set -euo pipefail" in content
+    assert "export YEEHAW_TASK_PROMPT_FILE=/tmp/prompt.md" in content
     assert "YEEHAW_PROMPT_EOF" in content
-    assert "exec gemini -p" in content
+    assert "exec gemini --model gemini-pro -p" in content
     assert script_path.stat().st_mode & 0o111

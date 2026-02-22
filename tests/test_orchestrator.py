@@ -104,6 +104,124 @@ def test_dispatch_queued_uses_default_agent_override(
     assert task["assigned_agent"] == "codex"
 
 
+def test_dispatch_queued_applies_worker_runtime_config(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    config_path = repo_root / ".yeehaw" / "workers.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "extra_args": ["--global-flag"],
+                "env": {"GLOBAL_ENV": "yes"},
+                "agents": {
+                    "claude": {
+                        "disable_default_mcp": False,
+                        "extra_args": ["--agent-flag"],
+                        "env": {"AGENT_ENV": "yes"},
+                    }
+                },
+            }
+        )
+    )
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    captured: dict[str, Any] = {}
+
+    def fake_write_launcher(
+        script_path: Path,
+        profile: Any,
+        prompt: str,
+        extra_args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        captured["script_path"] = script_path
+        captured["profile_name"] = profile.name
+        captured["prompt"] = prompt
+        captured["extra_args"] = extra_args or []
+        captured["env"] = env or {}
+
+    monkeypatch.setattr(engine, "write_launcher", fake_write_launcher)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    assert captured["profile_name"] == "claude"
+    assert captured["extra_args"] == ["--global-flag", "--agent-flag"]
+    assert captured["env"]["GLOBAL_ENV"] == "yes"
+    assert captured["env"]["AGENT_ENV"] == "yes"
+    prompt_file = Path(captured["env"]["YEEHAW_TASK_PROMPT_FILE"])
+    assert prompt_file.exists()
+    assert "# Task 1.1: Task 1" in prompt_file.read_text()
+    assert "Persistent Task Context" in captured["prompt"]
+
+
+def test_dispatch_queued_disables_default_mcp_by_default(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    _seed_single_task(store, status="queued")
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    captured: dict[str, Any] = {}
+
+    def fake_write_launcher(
+        _script_path: Path,
+        _profile: Any,
+        _prompt: str,
+        extra_args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        captured["extra_args"] = extra_args or []
+        captured["env"] = env or {}
+
+    monkeypatch.setattr(engine, "write_launcher", fake_write_launcher)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    assert "--strict-mcp-config" in captured["extra_args"]
+    assert "--mcp-config" in captured["extra_args"]
+    assert "YEEHAW_TASK_PROMPT_FILE" in captured["env"]
+
+
+def test_dispatch_queued_invalid_worker_config_fails_task(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    cfg_path = repo_root / ".yeehaw" / "workers.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text("{not-json")
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+
+    alerts = store.list_alerts()
+    assert any("Failed to launch task" in alert["message"] for alert in alerts)
+
+
 def test_process_signal_done_completes_task(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,

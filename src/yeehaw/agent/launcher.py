@@ -13,12 +13,31 @@ def build_task_prompt(
     task: dict[str, Any],
     signal_dir: str,
     previous_failure: str | None = None,
+    prompt_file: str | None = None,
 ) -> str:
     """Build full worker prompt including mandatory signal protocol."""
     parts = [
         f"# Task {task['task_number']}: {task['title']}",
         "",
         task["description"],
+    ]
+
+    if prompt_file:
+        parts.extend(
+            [
+                "",
+                "## Persistent Task Context",
+                "",
+                (
+                    "The complete task prompt is saved at "
+                    f"`{prompt_file}`. If context gets long, reopen this file to refresh "
+                    "the original instructions."
+                ),
+            ]
+        )
+
+    parts.extend(
+        [
         "",
         "## Signal Protocol",
         "",
@@ -42,6 +61,7 @@ def build_task_prompt(
         "",
         "**This signal file is mandatory.** Without it, your task will time out.",
     ]
+    )
 
     if previous_failure:
         parts.extend(
@@ -67,13 +87,32 @@ def build_launch_command(profile: AgentProfile, prompt: str) -> str:
     return " ".join(parts)
 
 
-def write_launcher(script_path: Path, profile: AgentProfile, prompt: str) -> None:
+def write_launcher(
+    script_path: Path,
+    profile: AgentProfile,
+    prompt: str,
+    extra_args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     """Write a launcher script that feeds long prompts via heredoc."""
-    prompt_flag = f"{profile.prompt_flag} " if profile.prompt_flag else ""
+    extra_args = extra_args or []
+    env = env or {}
+    command_parts = [
+        *shlex.split(profile.command),
+        *extra_args,
+        *shlex.split(profile.prompt_flag),
+    ]
+    quoted_cmd = " ".join(shlex.quote(part) for part in command_parts)
+    env_exports = "".join(
+        f"export {key}={shlex.quote(value)}\n"
+        for key, value in sorted(env.items())
+    )
     script_path.write_text(
         "#!/bin/bash\n"
-        f"exec {profile.command} {prompt_flag}"
-        f"\"$(cat <<'YEEHAW_PROMPT_EOF'\n{prompt}\nYEEHAW_PROMPT_EOF\n)\"\n",
+        "set -euo pipefail\n"
+        f"{env_exports}"
+        f"PROMPT=\"$(cat <<'YEEHAW_PROMPT_EOF'\n{prompt}\nYEEHAW_PROMPT_EOF\n)\"\n"
+        f"exec {quoted_cmd} \"$PROMPT\"\n",
     )
     script_path.chmod(0o755)
 
