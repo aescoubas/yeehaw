@@ -102,6 +102,95 @@ def main(argv: list[str] | None = None) -> None:
         help="Default worker agent for unassigned tasks",
     )
 
+    daemon_parser = subparsers.add_parser(
+        "daemon",
+        help="Manage persistent orchestrator daemon (systemd user service)",
+    )
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_command", required=True)
+
+    install_daemon = daemon_sub.add_parser("install", help="Install user systemd service")
+    install_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+    install_daemon.add_argument(
+        "--agent",
+        choices=["claude", "gemini", "codex"],
+        help="Default worker agent for unassigned tasks",
+    )
+    install_daemon.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing unit file",
+    )
+    install_daemon.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Do not enable the service",
+    )
+    install_daemon.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Do not start the service after install",
+    )
+
+    uninstall_daemon = daemon_sub.add_parser(
+        "uninstall",
+        help="Stop/disable and remove user systemd service",
+    )
+    uninstall_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+
+    start_daemon = daemon_sub.add_parser("start", help="Start user systemd service")
+    start_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+
+    stop_daemon = daemon_sub.add_parser("stop", help="Stop user systemd service")
+    stop_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+
+    restart_daemon = daemon_sub.add_parser("restart", help="Restart user systemd service")
+    restart_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+
+    status_daemon = daemon_sub.add_parser("status", help="Show user systemd service status")
+    status_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+
+    logs_daemon = daemon_sub.add_parser("logs", help="Show daemon journal logs")
+    logs_daemon.add_argument(
+        "--service-name",
+        default="yeehaw-orchestrator",
+        help="Systemd user service name (default: yeehaw-orchestrator)",
+    )
+    logs_daemon.add_argument(
+        "--lines",
+        type=int,
+        default=200,
+        help="Number of log lines to show (default: 200)",
+    )
+    logs_daemon.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow daemon logs",
+    )
+
     status_parser = subparsers.add_parser("status", help="Show task status")
     status_parser.add_argument("--project", help="Filter by project")
     status_parser.add_argument(
@@ -195,6 +284,11 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.run import handle_run
 
         handle_run(args, _get_db_path())
+
+    elif args.command == "daemon":
+        from yeehaw.cli.daemon import handle_daemon
+
+        handle_daemon(args, _get_db_path())
 
     elif args.command == "status":
         from yeehaw.cli.status import handle_status

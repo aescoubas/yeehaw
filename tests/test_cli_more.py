@@ -11,6 +11,7 @@ import pytest
 
 import yeehaw.cli.main as cli_main
 import yeehaw.cli.attach as cli_attach
+import yeehaw.cli.daemon as cli_daemon
 import yeehaw.cli.logs as cli_logs
 import yeehaw.cli.plan as cli_plan
 import yeehaw.cli.roadmap as cli_roadmap
@@ -90,6 +91,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.attach.handle_attach", _capture("attach"))
     monkeypatch.setattr("yeehaw.cli.stop.handle_stop", _capture("stop"))
     monkeypatch.setattr("yeehaw.cli.logs.handle_logs", _capture("logs"))
+    monkeypatch.setattr("yeehaw.cli.daemon.handle_daemon", _capture("daemon"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
     monkeypatch.setattr("yeehaw.cli.workers.handle_workers", _capture("workers"))
@@ -105,6 +107,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["attach", "1"])
     cli_main.main(["stop", "1"])
     cli_main.main(["logs", "1"])
+    cli_main.main(["daemon", "status"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["alerts"])
     cli_main.main(["workers", "show"])
@@ -120,6 +123,7 @@ def test_cli_main_dispatches_remaining_commands(
         "attach",
         "stop",
         "logs",
+        "daemon",
         "scheduler",
         "alerts",
         "workers",
@@ -791,6 +795,172 @@ def test_handle_run_paths(
     cli_run.handle_run(Namespace(project=None, agent=None), db_path)
     out = capsys.readouterr().out
     assert "Stopping" in out
+
+
+def test_handle_daemon_install_lifecycle(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    commands: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        if name in {"systemctl", "journalctl"}:
+            return f"/usr/bin/{name}"
+        if name == "codex":
+            return "/opt/codex/bin/codex"
+        return None
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool = False,
+        text: bool = False,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (capture_output, text, check)
+        commands.append(cmd)
+        if cmd[:3] == ["systemctl", "--user", "status"]:
+            return subprocess.CompletedProcess(cmd, 0, "active (running)\n", "")
+        if cmd and cmd[0] == "journalctl":
+            return subprocess.CompletedProcess(cmd, 0, "daemon log line\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(cli_daemon.shutil, "which", fake_which)
+    monkeypatch.setattr(cli_daemon.subprocess, "run", fake_run)
+
+    cli_daemon.handle_daemon(
+        Namespace(
+            daemon_command="install",
+            service_name="yeehaw-orchestrator",
+            agent="codex",
+            force=False,
+            no_enable=False,
+            no_start=False,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Installed yeehaw-orchestrator.service" in out
+    assert "Service enabled" in out
+    assert "Service started" in out
+
+    unit_path = home / ".config" / "systemd" / "user" / "yeehaw-orchestrator.service"
+    assert unit_path.exists() is True
+    unit_text = unit_path.read_text()
+    assert "ExecStart=" in unit_text
+    assert "-m yeehaw run --agent codex" in unit_text
+    assert f"Environment=YEEHAW_HOME={db_path.parent}" in unit_text
+    assert "Environment=PATH=" in unit_text
+    assert "/opt/codex/bin" in unit_text
+    assert f"WorkingDirectory={home}" in unit_text
+
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="status", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "active (running)" in out
+
+    cli_daemon.handle_daemon(
+        Namespace(
+            daemon_command="logs",
+            service_name="yeehaw-orchestrator",
+            lines=50,
+            follow=False,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "daemon log line" in out
+
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="start", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="restart", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="stop", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Started yeehaw-orchestrator.service." in out
+    assert "Restarted yeehaw-orchestrator.service." in out
+    assert "Stopped yeehaw-orchestrator.service." in out
+
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="uninstall", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Removed yeehaw-orchestrator.service" in out
+    assert unit_path.exists() is False
+
+    assert ["systemctl", "--user", "daemon-reload"] in commands
+    assert ["systemctl", "--user", "enable", "yeehaw-orchestrator.service"] in commands
+    assert ["systemctl", "--user", "start", "yeehaw-orchestrator.service"] in commands
+    assert ["systemctl", "--user", "restart", "yeehaw-orchestrator.service"] in commands
+    assert ["systemctl", "--user", "stop", "yeehaw-orchestrator.service"] in commands
+    assert ["systemctl", "--user", "disable", "yeehaw-orchestrator.service"] in commands
+    assert ["journalctl", "--user", "-u", "yeehaw-orchestrator.service", "-n", "50", "--no-pager"] in commands
+
+
+def test_handle_daemon_install_requires_force_to_overwrite(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    unit_path = home / ".config" / "systemd" / "user" / "yeehaw-orchestrator.service"
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text("old")
+    monkeypatch.setenv("HOME", str(home))
+
+    monkeypatch.setattr(cli_daemon.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        cli_daemon.subprocess,
+        "run",
+        lambda cmd, capture_output=True, text=True, check=False: subprocess.CompletedProcess(
+            cmd, 0, "", ""
+        ),
+    )
+
+    cli_daemon.handle_daemon(
+        Namespace(
+            daemon_command="install",
+            service_name="yeehaw-orchestrator",
+            agent=None,
+            force=False,
+            no_enable=True,
+            no_start=True,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "already exists" in out
+    assert unit_path.read_text() == "old"
+
+
+def test_handle_daemon_errors_when_systemctl_missing(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_daemon.shutil, "which", lambda _name: None)
+    cli_daemon.handle_daemon(
+        Namespace(daemon_command="status", service_name="yeehaw-orchestrator"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Error: systemctl not found on PATH" in out
 
 
 def test_handle_logs_paths(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

@@ -97,7 +97,7 @@ uv run yeehaw logs 11 --follow
 Top-level:
 
 ```bash
-uv run yeehaw {init,project,roadmap,plan,run,status,attach,stop,logs,scheduler,alerts,workers}
+uv run yeehaw {init,project,roadmap,plan,run,daemon,status,attach,stop,logs,scheduler,alerts,workers}
 ```
 
 ### `init`
@@ -181,6 +181,38 @@ uv run yeehaw run --project demo --agent gemini
 ```
 
 `--agent` sets default worker agent for unassigned tasks.
+
+### `daemon`
+
+Manage a persistent orchestrator via user-level systemd service.
+
+Install + enable + start:
+
+```bash
+uv run yeehaw daemon install --agent codex
+```
+
+Check status / logs:
+
+```bash
+uv run yeehaw daemon status
+uv run yeehaw daemon logs --lines 200
+uv run yeehaw daemon logs --follow
+```
+
+Control lifecycle:
+
+```bash
+uv run yeehaw daemon start
+uv run yeehaw daemon stop
+uv run yeehaw daemon restart
+uv run yeehaw daemon uninstall
+```
+
+Notes:
+- Service name defaults to `yeehaw-orchestrator.service` (override with `--service-name`).
+- `daemon install` writes a unit file under `~/.config/systemd/user/`.
+- Unit uses your Yeehaw runtime root (`YEEHAW_HOME` / `~/.yeehaw`) and runs `python -m yeehaw run`.
 
 ### `status`
 
