@@ -97,3 +97,35 @@ Implement envelope types and response helpers.
     assert "**Depends on:** none" in task.description
     assert "- [ ] Envelope serializes correctly" in task.description
     assert validate_roadmap(roadmap) == []
+
+
+def test_validate_roadmap_rejects_unknown_dependency() -> None:
+    roadmap = parse_roadmap(
+        """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+**Depends on:** none
+### Task 1.2: Build
+**Depends on:** 1.9
+""".strip()
+    )
+
+    errors = validate_roadmap(roadmap)
+    assert "Task 1.2 depends on unknown task 1.9" in errors
+
+
+def test_validate_roadmap_rejects_dependency_cycle() -> None:
+    roadmap = parse_roadmap(
+        """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+**Depends on:** 1.2
+### Task 1.2: Build
+**Depends on:** 1.1
+""".strip()
+    )
+
+    errors = validate_roadmap(roadmap)
+    assert any(error.startswith("Task dependency cycle detected:") for error in errors)

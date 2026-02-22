@@ -34,16 +34,21 @@ uv run yeehaw ...
 
 ## Important Path Behavior
 
-Yeehaw is **current-directory scoped**.
+Yeehaw runtime state is **global by default**.
 
-- Database path is always: `./.yeehaw/yeehaw.db` (relative to where you run `yeehaw`).
-- Orchestrator runtime files are stored in that same `./.yeehaw/`.
+- Runtime root defaults to: `~/.yeehaw`
+- Database path defaults to: `~/.yeehaw/yeehaw.db`
+- Logs, signals, PID, worker config, and worktrees are all under `~/.yeehaw`
 
-If you run commands from a different directory, you are using a different Yeehaw state.
+You can override the runtime root with `YEEHAW_HOME`:
+
+```bash
+export YEEHAW_HOME=/custom/path/to/yeehaw-runtime
+```
 
 ## Quick Start
 
-1. Initialize Yeehaw state in your current directory:
+1. Initialize Yeehaw runtime state:
 
 ```bash
 uv run yeehaw init
@@ -90,7 +95,7 @@ uv run yeehaw {init,project,roadmap,plan,run,status,attach,stop,logs,scheduler,a
 
 ### `init`
 
-Initialize `.yeehaw/` and database.
+Initialize runtime directory and database.
 
 ```bash
 uv run yeehaw init
@@ -184,10 +189,10 @@ Columns:
 - `Title`: truncated to fixed width.
 - `Status`: task status.
 - `Agent`: assigned agent.
-- `Branch`: git ancestry state:
+- `Branch`: git ancestry state (against roadmap integration branch when present, otherwise `main`):
   - `n/a`: no branch or branch missing
-  - `ahead`: branch has commits not in `main`
-  - `diverged`: both branch and `main` moved
+  - `ahead`: branch has commits not in target base branch
+  - `diverged`: both branch and target base branch moved
   - `merged`: no branch-only commits remain
 - `Tokens`: parsed token usage from latest in-progress log (if detectable), else `n/a`.
 
@@ -264,6 +269,7 @@ Supported:
 - Task headings can be:
   - `### Task N.M: ...`
   - `### P0.1: ...`
+- `**Depends on:**` metadata is parsed and enforced by scheduler.
 - Optional trailing checklist marker in title is normalized (for example `[x]` is stripped from title text).
 
 Verbose format example:
@@ -299,6 +305,7 @@ Task statuses:
 
 Phase flow:
 - On roadmap approval, first phase tasks are queued.
+- Queued tasks only dispatch when all declared dependencies are `done`.
 - When all tasks in a phase are `done`, phase verify command runs.
 - If verify passes, next phase is queued.
 - If no next phase, roadmap becomes `completed`.
@@ -313,15 +320,20 @@ Failure/retry behavior:
 Per-task branch name:
 - `yeehaw/task-<task_number>-<slug>`
 
+Per-roadmap integration branch:
+- `yeehaw/roadmap-<roadmap_id>` (created on first dispatch for that roadmap)
+- Task worktrees are based on this branch.
+- On `done`, Yeehaw auto-merges task branch into this integration branch.
+
 Worktree location:
-- Under target project repo: `<project_repo>/.yeehaw/worktrees/...`
+- `~/.yeehaw/worktrees/<repo-key>/...`
 
 Orchestrator runtime/log locations:
-- `<cwd>/.yeehaw/logs/task-<id>/attempt-XX-<agent>.log`
-- `<cwd>/.yeehaw/signals/task-<id>/signal.json`
-- `<cwd>/.yeehaw/orchestrator.pid`
+- `~/.yeehaw/logs/task-<id>/attempt-XX-<agent>.log`
+- `~/.yeehaw/signals/task-<id>/signal.json`
+- `~/.yeehaw/orchestrator.pid`
 
-## Worker Configuration (`.yeehaw/workers.json`)
+## Worker Configuration (`~/.yeehaw/workers.json`)
 
 Workers default to **no MCP servers configured** unless overridden.
 
@@ -357,7 +369,7 @@ Resolution rules:
 Run server directly:
 
 ```bash
-uv run python -m yeehaw.mcp.server --db .yeehaw/yeehaw.db
+uv run python -m yeehaw.mcp.server --db ~/.yeehaw/yeehaw.db
 ```
 
 Exposed tools:
@@ -414,18 +426,16 @@ Planner prompt is configured to:
 - Stop old process or remove stale PID file:
 
 ```bash
-rm -f .yeehaw/orchestrator.pid
+rm -f ~/.yeehaw/orchestrator.pid
 ```
 
 ### Want a clean reset of local Yeehaw state
 
-Run from the same directory you use for `yeehaw`:
-
 ```bash
 ts=$(date -u +%Y%m%dT%H%M%SZ)
-mv .yeehaw/yeehaw.db .yeehaw/yeehaw.db.reset-$ts.bak 2>/dev/null || true
-mv .yeehaw/yeehaw.db-shm .yeehaw/yeehaw.db-shm.reset-$ts.bak 2>/dev/null || true
-mv .yeehaw/yeehaw.db-wal .yeehaw/yeehaw.db-wal.reset-$ts.bak 2>/dev/null || true
+mv ~/.yeehaw/yeehaw.db ~/.yeehaw/yeehaw.db.reset-$ts.bak 2>/dev/null || true
+mv ~/.yeehaw/yeehaw.db-shm ~/.yeehaw/yeehaw.db-shm.reset-$ts.bak 2>/dev/null || true
+mv ~/.yeehaw/yeehaw.db-wal ~/.yeehaw/yeehaw.db-wal.reset-$ts.bak 2>/dev/null || true
 uv run yeehaw init
 ```
 
@@ -433,7 +443,7 @@ Then re-add projects and roadmaps.
 
 ### `project add` succeeded but `project list` is empty
 
-You are likely in a different working directory. DB is per-current-directory at `./.yeehaw/yeehaw.db`.
+You are likely using a different runtime root (for example a different `YEEHAW_HOME` value).
 
 ### No logs for a task
 

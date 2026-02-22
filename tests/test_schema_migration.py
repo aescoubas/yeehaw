@@ -307,6 +307,15 @@ def test_existing_modern_db_migrates_tasks_to_support_paused(tmp_path: Path) -> 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
     ).fetchone()
+    roadmap_cols = {
+        str(item[1])
+        for item in conn.execute("PRAGMA table_info(roadmaps)").fetchall()
+    }
+    task_dependencies = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_dependencies'"
+    ).fetchone()
     conn.close()
     assert row is not None
     assert "'paused'" in str(row[0] or "")
+    assert "integration_branch" in roadmap_cols
+    assert task_dependencies is not None

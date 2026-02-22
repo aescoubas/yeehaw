@@ -25,6 +25,10 @@ from yeehaw.tmux.session import (
     pipe_output,
 )
 
+MAIN_BRANCH = "main"
+INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
+MERGE_WORKTREE_DIR = "merge-worktrees"
+
 
 class Orchestrator:
     """Coordinates task dispatch, monitoring, and completion processing."""
@@ -33,12 +37,14 @@ class Orchestrator:
         self,
         store: Store,
         repo_root: Path,
+        runtime_root: Path | None = None,
         default_agent: str | None = None,
     ) -> None:
         self.store = store
         self.repo_root = repo_root
+        self.runtime_root = runtime_root or (repo_root / ".yeehaw")
         self.config = store.get_scheduler_config()
-        self.signal_watcher = SignalWatcher(repo_root / ".yeehaw" / "signals")
+        self.signal_watcher = SignalWatcher(self.runtime_root / "signals")
         self.default_agent = resolve_profile(default_agent).name if default_agent else None
         self.running = False
         self._stop_event = threading.Event()
@@ -117,10 +123,15 @@ class Orchestrator:
                 self.store.fail_task(task["id"], cleanliness_error)
                 self._maybe_retry(task)
             else:
-                # Phase verify commands are phase-level gates and should run only
-                # once all tasks in the phase report done.
-                self.store.complete_task(task["id"], "done")
-                self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
+                merge_error = self._merge_done_task_branch(task)
+                if merge_error:
+                    self.store.fail_task(task["id"], merge_error)
+                    self._maybe_retry(task)
+                else:
+                    # Phase verify commands are phase-level gates and should run only
+                    # once all tasks in the phase report done.
+                    self.store.complete_task(task["id"], "done")
+                    self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
 
         elif data["status"] == "failed":
             self.store.fail_task(task["id"], data.get("summary", "Unknown failure"))
@@ -152,13 +163,16 @@ class Orchestrator:
             project_active = self.store.count_active_tasks(task["project_id"])
             if project_active >= self.config["max_per_project"]:
                 continue
+            if not self.store.are_task_dependencies_satisfied(int(task["id"])):
+                continue
             self._launch_task(task)
 
     def _launch_task(self, task: dict[str, Any]) -> None:
         try:
             task_repo_root = self._task_repo_root(task)
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
-            worker_cfg = resolve_worker_launch_config(self.repo_root, profile.name)
+            worker_cfg = resolve_worker_launch_config(self.runtime_root, profile.name)
+            integration_branch = self._ensure_integration_branch(task)
             branch = str(task.get("branch_name") or branch_name(task["task_number"], task["title"]))
             existing_worktree = task.get("worktree_path")
             worktree_path: Path
@@ -167,19 +181,29 @@ class Orchestrator:
                 if candidate.exists():
                     worktree_path = candidate
                 else:
-                    worktree_path = prepare_worktree(task_repo_root, branch)
+                    worktree_path = prepare_worktree(
+                        task_repo_root,
+                        self.runtime_root,
+                        branch,
+                        base_ref=integration_branch,
+                    )
             else:
-                worktree_path = prepare_worktree(task_repo_root, branch)
+                worktree_path = prepare_worktree(
+                    task_repo_root,
+                    self.runtime_root,
+                    branch,
+                    base_ref=integration_branch,
+                )
             attempt_num = int(task.get("attempts") or 0) + 1
 
-            signal_dir = self.repo_root / ".yeehaw" / "signals" / f"task-{task['id']}"
+            signal_dir = self.runtime_root / "signals" / f"task-{task['id']}"
             signal_dir.mkdir(parents=True, exist_ok=True)
             # Prevent stale completion signals from previous attempts being reprocessed.
             (signal_dir / "signal.json").unlink(missing_ok=True)
             log_path = self._task_log_path(task["id"], attempt_num, profile.name)
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
-            prompt_path = worktree_path / ".yeehaw" / f"task-{task['id']}-prompt.md"
+            prompt_path = signal_dir / f"task-{task['id']}-prompt.md"
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
             prompt = build_task_prompt(
                 task,
@@ -353,12 +377,212 @@ class Orchestrator:
                 f"Roadmap {phase['roadmap_id']} finished",
             )
 
+    def _ensure_integration_branch(self, task: dict[str, Any]) -> str:
+        """Ensure roadmap integration branch exists and return its name."""
+        existing = task.get("roadmap_integration_branch")
+        if isinstance(existing, str) and existing:
+            if self._git_branch_exists(self._task_repo_root(task), existing):
+                return existing
+            raise RuntimeError(
+                f"Integration branch '{existing}' is missing for roadmap {task['roadmap_id']}"
+            )
+
+        roadmap_id = int(task["roadmap_id"])
+        branch = f"{INTEGRATION_BRANCH_PREFIX}{roadmap_id}"
+        repo_root = self._task_repo_root(task)
+        if not self._git_branch_exists(repo_root, branch):
+            subprocess.run(
+                ["git", "branch", branch, "HEAD"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.store.log_event(
+                "roadmap_branch_created",
+                f"Created integration branch {branch}",
+                project_id=int(task["project_id"]),
+                task_id=int(task["id"]),
+            )
+
+        self.store.set_roadmap_integration_branch(roadmap_id, branch)
+        task["roadmap_integration_branch"] = branch
+        return branch
+
+    def _resolve_merge_target_branch(self, task: dict[str, Any]) -> str:
+        """Resolve branch where completed task changes should be merged."""
+        integration_branch = task.get("roadmap_integration_branch")
+        if isinstance(integration_branch, str) and integration_branch:
+            return integration_branch
+        return MAIN_BRANCH
+
+    def _merge_done_task_branch(self, task: dict[str, Any]) -> str | None:
+        """Merge completed task branch into the roadmap integration branch."""
+        source_branch = task.get("branch_name")
+        if not isinstance(source_branch, str) or not source_branch:
+            return None
+
+        repo_root = self._task_repo_root(task)
+        if task.get("roadmap_integration_branch"):
+            target_branch = self._resolve_merge_target_branch(task)
+        else:
+            try:
+                target_branch = self._ensure_integration_branch(task)
+            except RuntimeError as exc:
+                return str(exc)
+
+        if not self._git_branch_exists(repo_root, source_branch):
+            return f"Task branch '{source_branch}' is missing"
+        if not self._git_branch_exists(repo_root, target_branch):
+            return f"Merge target branch '{target_branch}' is missing"
+
+        if self._git_is_ancestor(repo_root, source_branch, target_branch):
+            self.store.log_event(
+                "task_merge_skipped",
+                f"Task branch {source_branch} already merged into {target_branch}",
+                task_id=int(task["id"]),
+            )
+            return None
+
+        merge_root = self.runtime_root / MERGE_WORKTREE_DIR
+        merge_root.mkdir(parents=True, exist_ok=True)
+        merge_worktree = merge_root / f"task-{task['id']}"
+        if merge_worktree.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(merge_worktree)],
+                cwd=repo_root,
+                capture_output=True,
+            )
+
+        add_result = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(merge_worktree), f"refs/heads/{target_branch}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if add_result.returncode != 0:
+            detail = add_result.stderr.strip() or add_result.stdout.strip() or "unknown git error"
+            return f"Failed to prepare merge worktree: {detail}"
+
+        try:
+            target_before = self._git_ref(repo_root, target_branch)
+            if target_before is None:
+                return f"Merge target branch '{target_branch}' is missing"
+
+            merge_env = dict(os.environ)
+            merge_env.setdefault("GIT_AUTHOR_NAME", "Yeehaw")
+            merge_env.setdefault("GIT_AUTHOR_EMAIL", "yeehaw@local")
+            merge_env.setdefault("GIT_COMMITTER_NAME", "Yeehaw")
+            merge_env.setdefault("GIT_COMMITTER_EMAIL", "yeehaw@local")
+
+            merge_result = subprocess.run(
+                ["git", "merge", "--no-edit", f"refs/heads/{source_branch}"],
+                cwd=merge_worktree,
+                capture_output=True,
+                text=True,
+                env=merge_env,
+            )
+            if merge_result.returncode != 0:
+                subprocess.run(
+                    ["git", "merge", "--abort"],
+                    cwd=merge_worktree,
+                    capture_output=True,
+                    text=True,
+                )
+                detail = merge_result.stderr.strip() or merge_result.stdout.strip() or "unknown merge error"
+                return (
+                    f"Failed to merge {source_branch} into {target_branch}: {detail}. "
+                    "Task will be retried against latest integration branch."
+                )
+
+            merged_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=merge_worktree,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+            update = subprocess.run(
+                [
+                    "git",
+                    "update-ref",
+                    f"refs/heads/{target_branch}",
+                    merged_head,
+                    target_before,
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            if update.returncode != 0:
+                detail = update.stderr.strip() or update.stdout.strip() or "unknown update-ref error"
+                return f"Failed to update integration branch '{target_branch}': {detail}"
+
+            self.store.log_event(
+                "task_merged",
+                f"Merged {source_branch} into {target_branch}",
+                task_id=int(task["id"]),
+            )
+            return None
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(merge_worktree)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+
+    @staticmethod
+    def _git_branch_exists(repo_root: Path, branch: str) -> bool:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    @staticmethod
+    def _git_ref(repo_root: Path, branch: str) -> str | None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    @staticmethod
+    def _git_is_ancestor(repo_root: Path, maybe_ancestor: str, maybe_descendant: str) -> bool:
+        result = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                f"refs/heads/{maybe_ancestor}",
+                f"refs/heads/{maybe_descendant}",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
     def _task_log_path(self, task_id: int, attempt: int, agent: str) -> Path:
-        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        logs_root = self.runtime_root / "logs" / f"task-{task_id}"
         return logs_root / f"attempt-{attempt:02d}-{agent}.log"
 
     def _latest_task_log_path(self, task_id: int) -> Path | None:
-        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        logs_root = self.runtime_root / "logs" / f"task-{task_id}"
         if not logs_root.exists():
             return None
         candidates = sorted(logs_root.glob("attempt-*.log"))
@@ -367,7 +591,7 @@ class Orchestrator:
         return candidates[-1]
 
     def _write_pane_snapshot(self, task_id: int, pane_text: str, kind: str) -> Path:
-        logs_root = self.repo_root / ".yeehaw" / "logs" / f"task-{task_id}"
+        logs_root = self.runtime_root / "logs" / f"task-{task_id}"
         logs_root.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         snapshot_path = logs_root / f"{kind}-pane-{timestamp}.txt"
@@ -411,7 +635,7 @@ class Orchestrator:
             return "Task reported done but worktree path is missing"
 
         result = subprocess.run(
-            ["git", "status", "--porcelain", "--", ".", ":(exclude).yeehaw"],
+            ["git", "status", "--porcelain"],
             cwd=candidate,
             capture_output=True,
             text=True,
@@ -428,7 +652,7 @@ class Orchestrator:
 
     def _write_pid_file(self) -> None:
         """Ensure only one orchestrator process owns this repo."""
-        pid_path = self.repo_root / ".yeehaw" / "orchestrator.pid"
+        pid_path = self.runtime_root / "orchestrator.pid"
         pid_path.parent.mkdir(parents=True, exist_ok=True)
 
         if pid_path.exists():
@@ -446,7 +670,7 @@ class Orchestrator:
 
     def _remove_pid_file(self) -> None:
         """Remove orchestrator pid file."""
-        pid_path = self.repo_root / ".yeehaw" / "orchestrator.pid"
+        pid_path = self.runtime_root / "orchestrator.pid"
         pid_path.unlink(missing_ok=True)
 
     def _install_signal_handlers(self) -> None:

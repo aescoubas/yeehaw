@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS roadmaps (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id  INTEGER NOT NULL REFERENCES projects(id),
     raw_md      TEXT    NOT NULL,
+    integration_branch TEXT,
     status      TEXT    NOT NULL DEFAULT 'draft'
                 CHECK (status IN ('draft','approved','executing','completed','invalid')),
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -57,6 +58,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at    TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    blocked_task_id INTEGER NOT NULL REFERENCES tasks(id),
+    blocker_task_id INTEGER NOT NULL REFERENCES tasks(id),
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (blocked_task_id, blocker_task_id)
 );
 
 CREATE TABLE IF NOT EXISTS git_worktrees (
@@ -133,6 +142,22 @@ def _tasks_support_paused_status(conn: sqlite3.Connection) -> bool:
         return True
     sql = str(row[0] or "")
     return "'paused'" in sql
+
+
+def _roadmaps_support_integration_branch(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "roadmaps"):
+        return False
+    return "integration_branch" in _column_names(conn, "roadmaps")
+
+
+def _migrate_roadmaps_add_integration_branch(conn: sqlite3.Connection) -> None:
+    """Add integration_branch column to roadmaps when missing."""
+    if not _table_exists(conn, "roadmaps"):
+        return
+    if _roadmaps_support_integration_branch(conn):
+        return
+    conn.execute("ALTER TABLE roadmaps ADD COLUMN integration_branch TEXT")
+    conn.commit()
 
 
 def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
@@ -250,10 +275,13 @@ def _migrate_legacy_schema(conn: sqlite3.Connection, db_path: Path) -> None:
         if _table_exists(conn, "roadmaps__legacy"):
             conn.execute(
                 """
-                INSERT INTO roadmaps (id, project_id, raw_md, status, created_at, updated_at)
+                INSERT INTO roadmaps (
+                    id, project_id, raw_md, integration_branch, status, created_at, updated_at
+                )
                 SELECT id,
                        project_id,
                        raw_text,
+                       NULL,
                        CASE
                          WHEN status IN ('draft','approved','executing','completed','invalid')
                          THEN status
@@ -400,5 +428,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     if _is_legacy_schema(conn):
         _migrate_legacy_schema(conn, db_path)
     conn.executescript(SCHEMA_DDL)
+    _migrate_roadmaps_add_integration_branch(conn)
     _migrate_tasks_add_paused_status(conn)
     return conn

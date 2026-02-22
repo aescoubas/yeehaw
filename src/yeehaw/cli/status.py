@@ -68,10 +68,10 @@ def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
     candidate = task.get("project_repo_root")
     if isinstance(candidate, str) and candidate:
         return Path(candidate)
-    return db_path.parent.parent
+    return Path.cwd()
 
 
-def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
+def _resolve_branch_state(repo_root: Path, branch_name: str, target_branch: str) -> str:
     """Resolve branch state from git ancestry for one task branch."""
     try:
         rev_parse = subprocess.run(
@@ -87,7 +87,7 @@ def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
         return BRANCH_NA
 
     main_parse = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{MAIN_BRANCH}"],
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{target_branch}"],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -101,7 +101,7 @@ def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
             "rev-list",
             "--left-right",
             "--count",
-            f"refs/heads/{MAIN_BRANCH}...refs/heads/{branch_name}",
+            f"refs/heads/{target_branch}...refs/heads/{branch_name}",
         ],
         cwd=repo_root,
         capture_output=True,
@@ -128,16 +128,17 @@ def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
 
 def _annotate_branch_states(tasks: list[dict[str, Any]], db_path: Path) -> None:
     """Attach branch_state to each task for status rendering."""
-    cache: dict[tuple[str, str], str] = {}
+    cache: dict[tuple[str, str, str], str] = {}
     for task in tasks:
         branch_name = task.get("branch_name")
         if not isinstance(branch_name, str) or not branch_name:
             task["branch_state"] = BRANCH_NA
             continue
         repo_root = _task_repo_root(task, db_path)
-        key = (str(repo_root), branch_name)
+        target_branch = str(task.get("roadmap_integration_branch") or MAIN_BRANCH)
+        key = (str(repo_root), target_branch, branch_name)
         if key not in cache:
-            cache[key] = _resolve_branch_state(repo_root, branch_name)
+            cache[key] = _resolve_branch_state(repo_root, branch_name, target_branch)
         task["branch_state"] = cache[key]
 
 

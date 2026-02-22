@@ -16,11 +16,13 @@ def test_main_routes_project_command(
     tmp_path: Path,
 ) -> None:
     called: dict[str, object] = {}
+    runtime_root = tmp_path / "runtime-home"
 
     def fake_handle_project(args: Namespace, db_path: Path) -> None:
         called["args"] = args
         called["db_path"] = db_path
 
+    monkeypatch.setenv("YEEHAW_HOME", str(runtime_root))
     monkeypatch.chdir(tmp_path)
     import yeehaw.cli.project as project_module
 
@@ -32,7 +34,7 @@ def test_main_routes_project_command(
     args = called["args"]
     assert isinstance(args, Namespace)
     assert args.project_command == "list"
-    assert called["db_path"] == tmp_path / ".yeehaw" / "yeehaw.db"
+    assert called["db_path"] == runtime_root / "yeehaw.db"
 
 
 def test_main_routes_status_json(
@@ -40,11 +42,13 @@ def test_main_routes_status_json(
     tmp_path: Path,
 ) -> None:
     called: dict[str, object] = {}
+    runtime_root = tmp_path / "runtime-home"
 
     def fake_handle_status(args: Namespace, db_path: Path) -> None:
         called["args"] = args
         called["db_path"] = db_path
 
+    monkeypatch.setenv("YEEHAW_HOME", str(runtime_root))
     monkeypatch.chdir(tmp_path)
     import yeehaw.cli.status as status_module
 
@@ -55,7 +59,7 @@ def test_main_routes_status_json(
     args = called["args"]
     assert isinstance(args, Namespace)
     assert args.as_json is True
-    assert called["db_path"] == tmp_path / ".yeehaw" / "yeehaw.db"
+    assert called["db_path"] == runtime_root / "yeehaw.db"
 
 
 def test_project_handlers_round_trip(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:

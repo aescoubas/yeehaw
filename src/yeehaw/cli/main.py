@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from yeehaw.runtime import default_db_path
+
 
 def _get_db_path() -> Path:
-    """Resolve default database path in current working directory."""
-    return Path.cwd() / ".yeehaw" / "yeehaw.db"
+    """Resolve default database path in Yeehaw runtime directory."""
+    return default_db_path()
 
 
 def main(argv: list[str] | None = None) -> None:

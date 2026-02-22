@@ -12,7 +12,8 @@ from yeehaw.store.store import Store
 def handle_run(args: Any, db_path: Path) -> None:
     """Launch orchestrator loop."""
     store = Store(db_path)
-    repo_root = db_path.parent.parent
+    repo_root = Path.cwd()
+    runtime_root = db_path.parent
 
     project_id = None
     if args.project:
@@ -26,7 +27,12 @@ def handle_run(args: Any, db_path: Path) -> None:
     default_agent = getattr(args, "agent", None)
     print("Starting orchestrator... (Ctrl+C to stop)")
     try:
-        orchestrator = Orchestrator(store, repo_root, default_agent=default_agent)
+        orchestrator = Orchestrator(
+            store,
+            repo_root,
+            runtime_root=runtime_root,
+            default_agent=default_agent,
+        )
     except ValueError as exc:
         print(f"Error: {exc}")
         store.close()

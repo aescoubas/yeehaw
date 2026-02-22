@@ -20,7 +20,7 @@ def handle_logs(args: Any, db_path: Path) -> None:
             print(f"Error: Task {args.task_id} not found.")
             return
 
-        logs_dir = db_path.parent.parent / ".yeehaw" / "logs" / f"task-{task['id']}"
+        logs_dir = db_path.parent / "logs" / f"task-{task['id']}"
         if not logs_dir.exists():
             print(f"No logs found for task {task['id']}.")
             return

@@ -6,7 +6,7 @@ You are a coding agent working inside the **yeehaw** orchestration harness. Foll
 
 - You are running in a **git worktree** branched from the project's main branch.
 - Your working directory is the root of this worktree.
-- A `.yeehaw/` directory exists in the repo root with runtime metadata.
+- Yeehaw runtime metadata is stored under `~/.yeehaw` (or `YEEHAW_HOME` if set).
 - You have a **signal directory** at the path provided in your task prompt.
 
 ## Task Protocol

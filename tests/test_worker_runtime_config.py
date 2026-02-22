@@ -20,7 +20,7 @@ def test_resolve_worker_launch_config_defaults(tmp_path: Path) -> None:
 
 
 def test_resolve_worker_launch_config_merges_global_and_agent(tmp_path: Path) -> None:
-    cfg_dir = tmp_path / ".yeehaw"
+    cfg_dir = tmp_path
     cfg_dir.mkdir(parents=True, exist_ok=True)
     config_path = cfg_dir / "workers.json"
     config_path.write_text(
@@ -47,7 +47,7 @@ def test_resolve_worker_launch_config_merges_global_and_agent(tmp_path: Path) ->
 
 
 def test_resolve_worker_launch_config_invalid_json(tmp_path: Path) -> None:
-    cfg_dir = tmp_path / ".yeehaw"
+    cfg_dir = tmp_path
     cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "workers.json").write_text("{not-json")
 

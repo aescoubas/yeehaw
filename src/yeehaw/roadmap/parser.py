@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from yeehaw.roadmap.dependencies import parse_task_dependencies
+
 
 @dataclass
 class Task:
@@ -139,6 +141,61 @@ def validate_roadmap(roadmap: Roadmap) -> list[str]:
                     f"Task {task.number} out of sequence (expected {expected_task})"
                 )
 
+    dependency_graph: dict[str, list[str]] = {}
+    task_numbers = {
+        task.number
+        for phase in roadmap.phases
+        for task in phase.tasks
+    }
+
+    for phase in roadmap.phases:
+        for task in phase.tasks:
+            deps = parse_task_dependencies(task.description)
+            dependency_graph[task.number] = deps
+            for dep in deps:
+                if dep not in task_numbers:
+                    errors.append(f"Task {task.number} depends on unknown task {dep}")
+                if dep == task.number:
+                    errors.append(f"Task {task.number} cannot depend on itself")
+
+    errors.extend(_validate_dependency_cycles(dependency_graph))
+
+    return errors
+
+
+def _validate_dependency_cycles(graph: dict[str, list[str]]) -> list[str]:
+    """Detect dependency cycles and return validation errors."""
+    temp_mark: set[str] = set()
+    perm_mark: set[str] = set()
+    stack: list[str] = []
+    errors: list[str] = []
+
+    def visit(node: str) -> None:
+        if node in perm_mark:
+            return
+        if node in temp_mark:
+            if errors:
+                return
+            cycle_start = stack.index(node) if node in stack else 0
+            cycle_path = stack[cycle_start:] + [node]
+            errors.append(
+                "Task dependency cycle detected: " + " -> ".join(cycle_path)
+            )
+            return
+
+        temp_mark.add(node)
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep in graph:
+                visit(dep)
+        stack.pop()
+        temp_mark.remove(node)
+        perm_mark.add(node)
+
+    for candidate in graph:
+        if errors:
+            break
+        visit(candidate)
     return errors
 
 

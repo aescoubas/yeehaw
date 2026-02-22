@@ -53,7 +53,8 @@ def test_prepare_and_cleanup_worktree(tmp_path: Path) -> None:
     )
 
     branch = branch_name("1.1", "Add parser")
-    worktree = prepare_worktree(repo, branch)
+    runtime_root = tmp_path / "runtime"
+    worktree = prepare_worktree(repo, runtime_root, branch)
 
     assert worktree.exists()
     assert (worktree / "README.md").exists()

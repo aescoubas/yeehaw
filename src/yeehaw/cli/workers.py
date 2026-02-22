@@ -13,12 +13,12 @@ from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_laun
 def handle_workers(args: Any, db_path: Path) -> None:
     """Handle `yeehaw workers` subcommands."""
     if args.workers_command == "show":
-        _show_workers(db_path.parent.parent)
+        _show_workers(db_path.parent)
 
 
-def _show_workers(repo_root: Path) -> None:
+def _show_workers(runtime_root: Path) -> None:
     """Show effective worker launch configuration per agent."""
-    config_path = repo_root / ".yeehaw" / "workers.json"
+    config_path = runtime_root / "workers.json"
     status = "found" if config_path.exists() else "not found"
 
     print("Worker Configuration:")
@@ -26,7 +26,7 @@ def _show_workers(repo_root: Path) -> None:
 
     for agent_name in AGENT_REGISTRY:
         try:
-            cfg = resolve_worker_launch_config(repo_root, agent_name)
+            cfg = resolve_worker_launch_config(runtime_root, agent_name)
         except ValueError as exc:
             print(f"Error: {exc}")
             return

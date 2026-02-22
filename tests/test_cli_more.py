@@ -70,6 +70,8 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    runtime_root = tmp_path / "runtime-home"
+    monkeypatch.setenv("YEEHAW_HOME", str(runtime_root))
     monkeypatch.chdir(tmp_path)
 
     calls: list[tuple[str, Path]] = []
@@ -122,7 +124,7 @@ def test_cli_main_dispatches_remaining_commands(
         "alerts",
         "workers",
     ]
-    assert all(db == tmp_path / ".yeehaw" / "yeehaw.db" for _, db in calls)
+    assert all(db == runtime_root / "yeehaw.db" for _, db in calls)
 
 
 def test_handle_roadmap_create_branches(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -759,10 +761,12 @@ def test_handle_run_paths(
             self,
             store: Store,
             repo_root: Path,
+            runtime_root: Path | None = None,
             default_agent: str | None = None,
         ) -> None:
             self.store = store
             self.repo_root = repo_root
+            self.runtime_root = runtime_root
             self.default_agent = default_agent
             self.called_with: list[int | None] = []
 
@@ -797,7 +801,7 @@ def test_handle_logs_paths(db_path: Path, capsys: pytest.CaptureFixture[str]) ->
     cli_logs.handle_logs(Namespace(task_id=ids["task_id"], attempt=None, tail=10), db_path)
     assert "No logs found for task" in capsys.readouterr().out
 
-    logs_dir = db_path.parent.parent / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    logs_dir = db_path.parent / "logs" / f"task-{ids['task_id']}"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / "attempt-01-claude.log"
     log_path.write_text("line1\\nline2\\nline3\\n")
@@ -815,7 +819,7 @@ def test_handle_logs_follow_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ids = _seed_project_with_task(db_path)
-    logs_dir = db_path.parent.parent / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    logs_dir = db_path.parent / "logs" / f"task-{ids['task_id']}"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / "attempt-01-claude.log"
     log_path.write_text("line1\n")

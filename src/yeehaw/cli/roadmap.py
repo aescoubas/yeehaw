@@ -59,6 +59,13 @@ def _create_roadmap(store: Store, args: Any) -> None:
         for task in phase.tasks:
             store.create_task(roadmap_id, phase_id, task.number, task.title, task.description)
 
+    try:
+        store.apply_roadmap_dependencies(roadmap_id, roadmap)
+    except ValueError as exc:
+        store.delete_roadmap(roadmap_id)
+        print(f"Error: {exc}")
+        return
+
     total_tasks = sum(len(phase.tasks) for phase in roadmap.phases)
     print(
         f"Roadmap created (id={roadmap_id}): "

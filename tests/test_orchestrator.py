@@ -42,6 +42,25 @@ def _seed_single_task(store: Store, status: str = "pending") -> dict[str, int]:
     }
 
 
+def _init_git_repo(repo_root: Path) -> None:
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Yeehaw Test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "yeehaw@example.com"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("seed\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo_root, check=True, capture_output=True)
+
+
 def test_dispatch_queued_launches_task(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -52,7 +71,13 @@ def test_dispatch_queued_launches_task(
     launched: dict[str, Any] = {}
     prepare_calls: list[tuple[Path, str]] = []
 
-    def fake_prepare_worktree(_repo_root: Path, _branch: str) -> Path:
+    def fake_prepare_worktree(
+        _repo_root: Path,
+        _runtime_root: Path,
+        _branch: str,
+        base_ref: str = "HEAD",
+    ) -> Path:
+        _ = base_ref
         prepare_calls.append((_repo_root, _branch))
         worktree = repo_root / "worktree"
         worktree.mkdir(parents=True, exist_ok=True)
@@ -72,6 +97,11 @@ def test_dispatch_queued_launches_task(
     monkeypatch.setattr(engine, "pipe_output", fake_pipe_output)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     task = store.get_task(ids["task_id"])
@@ -102,6 +132,11 @@ def test_dispatch_queued_uses_default_agent_override(
     monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
 
     orchestrator = Orchestrator(store, repo_root, default_agent="codex")
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     task = store.get_task(ids["task_id"])
@@ -126,6 +161,11 @@ def test_dispatch_queued_clears_stale_signal_file(
     monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     assert stale_signal.exists() is False
@@ -150,7 +190,10 @@ def test_dispatch_queued_reuses_existing_worktree_path(
     monkeypatch.setattr(
         engine,
         "prepare_worktree",
-        lambda repo_root_arg, branch_arg: prepare_calls.append((repo_root_arg, branch_arg)) or repo_root,
+        lambda repo_root_arg, _runtime_root_arg, branch_arg, **_kwargs: prepare_calls.append(
+            (repo_root_arg, branch_arg)
+        )
+        or repo_root,
     )
 
     launched: dict[str, str] = {}
@@ -162,6 +205,11 @@ def test_dispatch_queued_reuses_existing_worktree_path(
     monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     task = store.get_task(ids["task_id"])
@@ -219,6 +267,11 @@ def test_dispatch_queued_applies_worker_runtime_config(
     monkeypatch.setattr(engine, "write_launcher", fake_write_launcher)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     assert captured["profile_name"] == "claude"
@@ -257,6 +310,11 @@ def test_dispatch_queued_disables_default_mcp_by_default(
     monkeypatch.setattr(engine, "write_launcher", fake_write_launcher)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     assert "--strict-mcp-config" in captured["extra_args"]
@@ -280,6 +338,11 @@ def test_dispatch_queued_invalid_worker_config_fails_task(
     monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
 
     orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
     orchestrator._dispatch_queued(project_id=None)
 
     task = store.get_task(ids["task_id"])
@@ -288,6 +351,82 @@ def test_dispatch_queued_invalid_worker_config_fails_task(
 
     alerts = store.list_alerts()
     assert any("Failed to launch task" in alert["message"] for alert in alerts)
+
+
+def test_dispatch_queued_skips_tasks_with_unsatisfied_dependencies(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Task 2", "**Depends on:** 1.1")
+    store.queue_task(task_11)
+    store.queue_task(task_12)
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (task_12, task_11),
+    )
+    store._conn.commit()
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
+    orchestrator._dispatch_queued(project_id=None)
+
+    first = store.get_task(task_11)
+    second = store.get_task(task_12)
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "in-progress"
+    assert second["status"] == "queued"
+
+
+def test_dispatch_queued_creates_integration_branch_and_uses_as_base(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    store.queue_task(task_id)
+
+    captured: dict[str, Any] = {}
+
+    def fake_prepare(
+        _repo_root: Path,
+        _runtime_root: Path,
+        _branch: str,
+        base_ref: str = "HEAD",
+    ) -> Path:
+        captured["base_ref"] = base_ref
+        return repo_root
+
+    monkeypatch.setattr(engine, "prepare_worktree", fake_prepare)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._dispatch_queued(project_id=None)
+
+    roadmap = store.get_roadmap(roadmap_id)
+    assert roadmap is not None
+    assert roadmap["integration_branch"] == f"yeehaw/roadmap-{roadmap_id}"
+    assert captured["base_ref"] == f"yeehaw/roadmap-{roadmap_id}"
 
 
 def test_process_signal_done_completes_task(
@@ -326,6 +465,7 @@ def test_process_signal_done_completes_task(
 
     orchestrator = Orchestrator(store, repo_root)
     monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "_merge_done_task_branch", lambda _task: None)
     monkeypatch.setattr(orchestrator, "_run_verification", fake_verify)
     orchestrator._process_signal_file(signal_file)
 
@@ -392,6 +532,50 @@ def test_process_signal_done_with_dirty_worktree_queues_retry(
     assert task["status"] == "queued"
     assert task["last_failure"] == "Task reported done with uncommitted changes in worktree"
     assert verify_called["called"] is False
+
+
+def test_process_signal_done_with_merge_failure_queues_retry(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(
+        json.dumps({"task_id": ids["task_id"], "status": "done", "summary": "ok"}),
+    )
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_merge_done_task_branch",
+        lambda _task: "Failed to merge task branch",
+    )
+
+    orchestrator._process_signal_file(signal_file)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "queued"
+    assert task["last_failure"] == "Failed to merge task branch"
 
 
 def test_process_signal_failed_queues_retry(

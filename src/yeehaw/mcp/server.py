@@ -188,6 +188,12 @@ def create_roadmap(project_name: str, markdown: str) -> dict[str, Any]:
             store.create_task(roadmap_id, phase_id, task.number, task.title, task.description)
             task_count += 1
 
+    try:
+        store.apply_roadmap_dependencies(roadmap_id, roadmap)
+    except ValueError as exc:
+        store.delete_roadmap(roadmap_id)
+        return {"error": str(exc)}
+
     return {
         "roadmap_id": roadmap_id,
         "phases": len(roadmap.phases),

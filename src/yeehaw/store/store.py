@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from yeehaw.roadmap.dependencies import parse_task_dependencies
 from yeehaw.store.schema import init_db
 
 if TYPE_CHECKING:
@@ -242,6 +243,7 @@ class Store:
                 for key, value in phase_stats.items():
                     stats[key] += value
 
+            self._replace_roadmap_dependencies(roadmap_id, roadmap)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -256,6 +258,24 @@ class Store:
             (status, self._now(), roadmap_id),
         )
         self._conn.commit()
+
+    def set_roadmap_integration_branch(self, roadmap_id: int, branch_name: str) -> None:
+        """Persist integration branch for a roadmap execution."""
+        self._conn.execute(
+            "UPDATE roadmaps SET integration_branch = ?, updated_at = ? WHERE id = ?",
+            (branch_name, self._now(), roadmap_id),
+        )
+        self._conn.commit()
+
+    def apply_roadmap_dependencies(self, roadmap_id: int, roadmap: "Roadmap") -> None:
+        """Apply parsed task dependency edges for one roadmap."""
+        self._conn.execute("BEGIN")
+        try:
+            self._replace_roadmap_dependencies(roadmap_id, roadmap)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def create_phase(
         self,
@@ -321,7 +341,8 @@ class Store:
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         """Get task plus project metadata."""
         row = self._conn.execute(
-            "SELECT t.*, r.status as roadmap_status, p.name as project_name, p.id as project_id, "
+            "SELECT t.*, r.status as roadmap_status, r.integration_branch as roadmap_integration_branch, "
+            "p.name as project_name, p.id as project_id, "
             "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
@@ -338,7 +359,8 @@ class Store:
     ) -> list[dict[str, Any]]:
         """List tasks, optionally filtered by project and status."""
         query = (
-            "SELECT t.*, r.status as roadmap_status, p.name as project_name, p.id as project_id, "
+            "SELECT t.*, r.status as roadmap_status, r.integration_branch as roadmap_integration_branch, "
+            "p.name as project_name, p.id as project_id, "
             "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
@@ -436,6 +458,19 @@ class Store:
         )
         self._conn.commit()
         return True
+
+    def are_task_dependencies_satisfied(self, task_id: int) -> bool:
+        """Return True when all blocker tasks for task_id are done."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM task_dependencies d
+            JOIN tasks blocker ON blocker.id = d.blocker_task_id
+            WHERE d.blocked_task_id = ? AND blocker.status != 'done'
+            """,
+            (task_id,),
+        ).fetchone()
+        return int(row[0]) == 0
 
     def count_active_tasks(self, project_id: int | None = None) -> int:
         """Count in-progress tasks, optionally for a project."""
@@ -707,6 +742,89 @@ class Store:
             "tasks_queued": tasks_queued,
         }
 
+    def _replace_roadmap_dependencies(self, roadmap_id: int, roadmap: "Roadmap") -> None:
+        """Replace dependency edges for one roadmap based on parsed task metadata."""
+        task_rows = self._conn.execute(
+            "SELECT id, task_number FROM tasks WHERE roadmap_id = ?",
+            (roadmap_id,),
+        ).fetchall()
+        task_id_by_number = {
+            str(row["task_number"]).strip(): int(row["id"])
+            for row in task_rows
+        }
+
+        edges: list[tuple[int, int]] = []
+        graph: dict[str, list[str]] = {}
+        for phase in roadmap.phases:
+            for task in phase.tasks:
+                blocked_number = task.number.strip()
+                blocked_id = task_id_by_number.get(blocked_number)
+                if blocked_id is None:
+                    raise ValueError(f"Cannot map dependencies: missing task {blocked_number}")
+                refs = parse_task_dependencies(task.description)
+                graph[blocked_number] = refs
+                for ref in refs:
+                    blocker_id = task_id_by_number.get(ref)
+                    if blocker_id is None:
+                        raise ValueError(
+                            f"Cannot map dependencies: task {blocked_number} depends on unknown task {ref}"
+                        )
+                    if blocker_id == blocked_id:
+                        raise ValueError(f"Task {blocked_number} cannot depend on itself")
+                    edges.append((blocked_id, blocker_id))
+
+        cycle = self._find_dependency_cycle(graph)
+        if cycle:
+            raise ValueError("Task dependency cycle detected: " + " -> ".join(cycle))
+
+        task_ids = [int(row["id"]) for row in task_rows]
+        if task_ids:
+            placeholders = ", ".join("?" for _ in task_ids)
+            self._conn.execute(
+                f"DELETE FROM task_dependencies WHERE blocked_task_id IN ({placeholders}) "
+                f"OR blocker_task_id IN ({placeholders})",
+                [*task_ids, *task_ids],
+            )
+        if edges:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO task_dependencies (blocked_task_id, blocker_task_id) "
+                "VALUES (?, ?)",
+                edges,
+            )
+
+    @staticmethod
+    def _find_dependency_cycle(graph: dict[str, list[str]]) -> list[str]:
+        """Return one cycle path when graph contains a dependency cycle."""
+        temp_mark: set[str] = set()
+        perm_mark: set[str] = set()
+        stack: list[str] = []
+
+        def visit(node: str) -> list[str]:
+            if node in perm_mark:
+                return []
+            if node in temp_mark:
+                idx = stack.index(node) if node in stack else 0
+                return stack[idx:] + [node]
+
+            temp_mark.add(node)
+            stack.append(node)
+            for dep in graph.get(node, []):
+                if dep not in graph:
+                    continue
+                cycle = visit(dep)
+                if cycle:
+                    return cycle
+            stack.pop()
+            temp_mark.remove(node)
+            perm_mark.add(node)
+            return []
+
+        for candidate in graph:
+            cycle = visit(candidate)
+            if cycle:
+                return cycle
+        return []
+
     def _list_tasks_for_phase(self, phase_id: int) -> list[dict[str, Any]]:
         """List tasks for one phase in stable numeric order."""
         rows = self._conn.execute(
@@ -751,4 +869,9 @@ class Store:
         self._conn.execute(
             f"DELETE FROM git_worktrees WHERE task_id IN ({placeholders})",
             task_ids,
+        )
+        self._conn.execute(
+            f"DELETE FROM task_dependencies WHERE blocked_task_id IN ({placeholders}) "
+            f"OR blocker_task_id IN ({placeholders})",
+            [*task_ids, *task_ids],
         )

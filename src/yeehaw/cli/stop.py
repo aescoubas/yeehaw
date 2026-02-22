@@ -51,4 +51,4 @@ def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
     candidate = task.get("project_repo_root")
     if isinstance(candidate, str) and candidate:
         return Path(candidate)
-    return db_path.parent.parent
+    return Path.cwd()

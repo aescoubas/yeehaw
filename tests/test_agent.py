@@ -49,7 +49,7 @@ def test_build_task_prompt_includes_signal_contract() -> None:
     assert '"status": "done"' in prompt
     assert "## Completion Requirements" in prompt
     assert "Stage and commit your task changes on the current task branch." in prompt
-    assert "git status --porcelain -- . ':(exclude).yeehaw'" in prompt
+    assert "git status --porcelain" in prompt
     assert "## Previous Attempt Failed" in prompt
     assert "timeout" in prompt
 

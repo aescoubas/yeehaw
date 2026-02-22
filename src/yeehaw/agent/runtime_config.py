@@ -19,9 +19,9 @@ class WorkerLaunchConfig:
     env: dict[str, str] = field(default_factory=dict)
 
 
-def resolve_worker_launch_config(repo_root: Path, agent_name: str) -> WorkerLaunchConfig:
-    """Resolve worker launch config from `.yeehaw/workers.json` with defaults."""
-    config_path = repo_root / ".yeehaw" / "workers.json"
+def resolve_worker_launch_config(runtime_root: Path, agent_name: str) -> WorkerLaunchConfig:
+    """Resolve worker launch config from `<runtime_root>/workers.json` with defaults."""
+    config_path = runtime_root / "workers.json"
     if not config_path.exists():
         return WorkerLaunchConfig()
 

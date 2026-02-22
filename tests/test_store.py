@@ -168,12 +168,17 @@ def test_delete_roadmap_removes_dependencies(store: Store) -> None:
     roadmap_id = store.create_roadmap(project_id, "# Roadmap")
     phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
     task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+    task_2 = store.create_task(roadmap_id, phase_id, "1.2", "Validate", "**Depends on:** 1.1")
 
     store.log_event("evt", "msg", project_id=project_id, task_id=task_id)
     store.create_alert("warn", "msg", project_id=project_id, task_id=task_id)
     store._conn.execute(
         "INSERT INTO git_worktrees (task_id, branch, path) VALUES (?, ?, ?)",
         (task_id, "b", "/tmp/wt"),
+    )
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (task_2, task_id),
     )
     store._conn.commit()
 
@@ -192,6 +197,10 @@ def test_delete_roadmap_removes_dependencies(store: Store) -> None:
 
     assert (
         store._conn.execute("SELECT COUNT(*) FROM git_worktrees").fetchone()[0]
+        == 0
+    )
+    assert (
+        store._conn.execute("SELECT COUNT(*) FROM task_dependencies").fetchone()[0]
         == 0
     )
     assert store.delete_roadmap(roadmap_id) is False
@@ -279,3 +288,43 @@ Initial setup
 
     with pytest.raises(ValueError, match="Cannot modify task 1.1"):
         store.edit_roadmap_in_place(roadmap_id, edited_raw, edited)
+
+
+def test_apply_roadmap_dependencies_and_satisfaction(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    raw = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+**Depends on:** none
+Do setup
+### Task 1.2: Build
+**Depends on:** 1.1
+Do build
+""".strip()
+    roadmap = parse_roadmap(raw)
+    roadmap_id = store.create_roadmap(project_id, raw)
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Setup", roadmap.phases[0].tasks[0].description)
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Build", roadmap.phases[0].tasks[1].description)
+
+    store.apply_roadmap_dependencies(roadmap_id, roadmap)
+
+    dep_count = store._conn.execute(
+        "SELECT COUNT(*) FROM task_dependencies WHERE blocked_task_id = ? AND blocker_task_id = ?",
+        (task_12, task_11),
+    ).fetchone()[0]
+    assert dep_count == 1
+
+    assert store.are_task_dependencies_satisfied(task_12) is False
+    store.complete_task(task_11, "done")
+    assert store.are_task_dependencies_satisfied(task_12) is True
+
+
+def test_set_roadmap_integration_branch_persists(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    store.set_roadmap_integration_branch(roadmap_id, "yeehaw/roadmap-123")
+    roadmap = store.get_roadmap(roadmap_id)
+    assert roadmap is not None
+    assert roadmap["integration_branch"] == "yeehaw/roadmap-123"
