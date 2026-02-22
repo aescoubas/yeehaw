@@ -415,6 +415,7 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     out = capsys.readouterr().out
     assert "ID" in out
     assert "Branch" in out
+    assert "Tokens" in out
     assert "n/a" in out
     assert "Total:" in out
 
@@ -538,9 +539,67 @@ def test_handle_status_branch_states_ahead_diverged_and_merged(
     ahead_row = next(line for line in out.splitlines() if line.startswith(f"{task_ahead:<6}"))
     diverged_row = next(line for line in out.splitlines() if line.startswith(f"{task_diverged:<6}"))
     merged_row = next(line for line in out.splitlines() if line.startswith(f"{task_merged:<6}"))
-    assert ahead_row.rstrip().endswith("ahead")
-    assert diverged_row.rstrip().endswith("diverged")
-    assert merged_row.rstrip().endswith("merged")
+    assert "ahead" in ahead_row
+    assert ahead_row.rstrip().endswith("n/a")
+    assert "diverged" in diverged_row
+    assert diverged_row.rstrip().endswith("n/a")
+    assert "merged" in merged_row
+    assert merged_row.rstrip().endswith("n/a")
+
+
+def test_handle_status_shows_tokens_for_in_progress_task(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(roadmap_id, phase_id, "1.1", "Running task", "desc")
+        store.assign_task(task_id, "codex", "yeehaw/task-1.1-running-task", "/tmp/w", "/tmp/s")
+    finally:
+        store.close()
+
+    logs_dir = db_path.parent / "logs" / f"task-{task_id}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "attempt-01-codex.log"
+    log_path.write_text(
+        "step output\n"
+        "\x1b[3m\x1b[35mtokens used\x1b[0m\n"
+        "27,315\n"
+        "more output\n",
+    )
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+
+    row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
+    assert "Tokens" in out
+    assert "27,315" in row
+
+
+def test_parse_tokens_used_supports_total_tokens_line() -> None:
+    text = (
+        "Assistant run complete\n"
+        "Input tokens: 1200\n"
+        "Output tokens: 300\n"
+        "Total tokens: 1,500\n"
+    )
+    assert cli_status._parse_tokens_used(text) == 1500
+
+
+def test_parse_tokens_used_supports_gemini_usage_metadata_json() -> None:
+    text = (
+        '{"usageMetadata":{"promptTokenCount":1200,'
+        '"candidatesTokenCount":300,"totalTokenCount":1500}}'
+    )
+    assert cli_status._parse_tokens_used(text) == 1500
+
+
+def test_parse_tokens_used_sums_input_and_output_when_total_missing() -> None:
+    text = "input tokens: 1,200\ncompletion tokens: 300\n"
+    assert cli_status._parse_tokens_used(text) == 1500
 
 
 def test_handle_scheduler_show_config_and_no_changes(
