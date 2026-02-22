@@ -38,29 +38,29 @@ def build_task_prompt(
 
     parts.extend(
         [
-        "",
-        "## Signal Protocol",
-        "",
-        (
-            "When you are finished, create the file "
-            f"`{signal_dir}/signal.json` with this format:"
-        ),
-        "",
-        "```json",
-        "{",
-        f'  "task_id": {task["id"]},',
-        '  "status": "done",',
-        '  "summary": "Brief description of what you did",',
-        '  "artifacts": ["list", "of", "key", "files", "changed"],',
-        f'  "timestamp": "{_iso_now_placeholder()}"',
-        "}",
-        "```",
-        "",
-        'Set `status` to `"done"` on success, `"failed"` if you cannot complete the task,',
-        'or `"blocked"` if you need external input.',
-        "",
-        "**This signal file is mandatory.** Without it, your task will time out.",
-    ]
+            "",
+            "## Signal Protocol",
+            "",
+            (
+                "When you are finished, create the file "
+                f"`{signal_dir}/signal.json` with this format:"
+            ),
+            "",
+            "```json",
+            "{",
+            f'  "task_id": {task["id"]},',
+            '  "status": "done",',
+            '  "summary": "Brief description of what you did",',
+            '  "artifacts": ["list", "of", "key", "files", "changed"],',
+            f'  "timestamp": "{_iso_now_placeholder()}"',
+            "}",
+            "```",
+            "",
+            'Set `status` to `"done"` on success, `"failed"` if you cannot complete the task,',
+            'or `"blocked"` if you need external input.',
+            "",
+            "**This signal file is mandatory.** Without it, your task will time out.",
+        ]
     )
 
     if previous_failure:
