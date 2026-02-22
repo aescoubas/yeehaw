@@ -12,8 +12,10 @@ from yeehaw.store.store import Store
 TITLE_WIDTH = 35
 BRANCH_WIDTH = 8
 BRANCH_NA = "n/a"
-BRANCH_OPEN = "open"
+BRANCH_AHEAD = "ahead"
+BRANCH_DIVERGED = "diverged"
 BRANCH_MERGED = "merged"
+MAIN_BRANCH = "main"
 
 
 def _truncate_for_column(value: str, width: int) -> str:
@@ -36,7 +38,7 @@ def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
 
 
 def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
-    """Resolve branch state from git refs for one task."""
+    """Resolve branch state from git ancestry for one task branch."""
     try:
         rev_parse = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
@@ -50,27 +52,44 @@ def _resolve_branch_state(repo_root: Path, branch_name: str) -> str:
     if rev_parse.returncode != 0:
         return BRANCH_NA
 
-    commit_sha = rev_parse.stdout.strip()
-    if not commit_sha:
-        return BRANCH_NA
-
-    contains = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)", "--contains", commit_sha, "refs/heads"],
+    main_parse = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{MAIN_BRANCH}"],
         cwd=repo_root,
         capture_output=True,
         text=True,
     )
-    if contains.returncode != 0:
-        return BRANCH_OPEN
+    if main_parse.returncode != 0:
+        return BRANCH_NA
 
-    containing_branches = [
-        line.strip()
-        for line in contains.stdout.splitlines()
-        if line.strip()
-    ]
-    if any(ref != branch_name for ref in containing_branches):
+    ancestry = subprocess.run(
+        [
+            "git",
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"refs/heads/{MAIN_BRANCH}...refs/heads/{branch_name}",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if ancestry.returncode != 0:
+        return BRANCH_NA
+
+    parts = ancestry.stdout.strip().split()
+    if len(parts) != 2:
+        return BRANCH_NA
+
+    try:
+        main_only, branch_only = (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return BRANCH_NA
+
+    if branch_only == 0:
         return BRANCH_MERGED
-    return BRANCH_OPEN
+    if main_only == 0:
+        return BRANCH_AHEAD
+    return BRANCH_DIVERGED
 
 
 def _annotate_branch_states(tasks: list[dict[str, Any]], db_path: Path) -> None:

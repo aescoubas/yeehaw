@@ -271,7 +271,7 @@ def test_handle_roadmap_clear(db_path: Path, capsys: pytest.CaptureFixture[str])
 
     cli_roadmap.handle_roadmap(clear_args, db_path)
     out = capsys.readouterr().out
-    assert "Cleared 2 roadmap(s)" in out
+    assert "Cleared 1 roadmap(s)" in out
     assert "tasks removed" in out
 
     store = Store(db_path)
@@ -435,13 +435,10 @@ def test_handle_status_sorts_tasks_by_id(db_path: Path, capsys: pytest.CaptureFi
     store = Store(db_path)
     try:
         project_id = store.create_project("proj-a", "/tmp/repo-a")
-        roadmap_1 = store.create_roadmap(project_id, "# Roadmap 1")
-        phase_1 = store.create_phase(roadmap_1, 1, "P1", None)
-        task_1 = store.create_task(roadmap_1, phase_1, "1.1", "First", "desc")
-
-        roadmap_2 = store.create_roadmap(project_id, "# Roadmap 2")
-        phase_2 = store.create_phase(roadmap_2, 2, "P2", None)
-        task_2 = store.create_task(roadmap_2, phase_2, "2.1", "Second", "desc")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap 1")
+        phase_id = store.create_phase(roadmap_id, 1, "P1", None)
+        task_1 = store.create_task(roadmap_id, phase_id, "1.1", "First", "desc")
+        task_2 = store.create_task(roadmap_id, phase_id, "1.2", "Second", "desc")
 
         assert task_1 < task_2
     finally:
@@ -481,23 +478,26 @@ def test_handle_status_truncates_long_title(db_path: Path, capsys: pytest.Captur
     assert row[54:60] == "queued"
 
 
-def test_handle_status_branch_states_open_and_merged(
+def test_handle_status_branch_states_ahead_diverged_and_merged(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    open_branch = "yeehaw/task-1.1-open"
-    merged_branch = "yeehaw/task-1.2-merged"
+    ahead_branch = "yeehaw/task-1.1-ahead"
+    diverged_branch = "yeehaw/task-1.2-diverged"
+    merged_branch = "yeehaw/task-1.3-merged"
 
     store = Store(db_path)
     try:
         project_id = store.create_project("proj-a", "/tmp/repo-a")
         roadmap_id = store.create_roadmap(project_id, "# Roadmap")
         phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
-        task_open = store.create_task(roadmap_id, phase_id, "1.1", "Open branch", "desc")
-        task_merged = store.create_task(roadmap_id, phase_id, "1.2", "Merged branch", "desc")
-        store.assign_task(task_open, "codex", open_branch, "/tmp/w1", "/tmp/s1")
-        store.assign_task(task_merged, "codex", merged_branch, "/tmp/w2", "/tmp/s2")
+        task_ahead = store.create_task(roadmap_id, phase_id, "1.1", "Ahead branch", "desc")
+        task_diverged = store.create_task(roadmap_id, phase_id, "1.2", "Diverged branch", "desc")
+        task_merged = store.create_task(roadmap_id, phase_id, "1.3", "Merged branch", "desc")
+        store.assign_task(task_ahead, "codex", ahead_branch, "/tmp/w1", "/tmp/s1")
+        store.assign_task(task_diverged, "codex", diverged_branch, "/tmp/w2", "/tmp/s2")
+        store.assign_task(task_merged, "codex", merged_branch, "/tmp/w3", "/tmp/s3")
     finally:
         store.close()
 
@@ -510,22 +510,22 @@ def test_handle_status_branch_states_open_and_merged(
         assert cmd and cmd[0] == "git"
         if cmd[1] == "rev-parse":
             branch_ref = cmd[4]
-            if branch_ref == f"refs/heads/{open_branch}":
-                return subprocess.CompletedProcess(cmd, 0, "open-sha\n", "")
-            if branch_ref == f"refs/heads/{merged_branch}":
-                return subprocess.CompletedProcess(cmd, 0, "merged-sha\n", "")
+            if branch_ref in (
+                "refs/heads/main",
+                f"refs/heads/{ahead_branch}",
+                f"refs/heads/{diverged_branch}",
+                f"refs/heads/{merged_branch}",
+            ):
+                return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
             return subprocess.CompletedProcess(cmd, 1, "", "")
-        if cmd[1] == "for-each-ref":
-            commit_sha = cmd[4]
-            if commit_sha == "open-sha":
-                return subprocess.CompletedProcess(cmd, 0, f"{open_branch}\n", "")
-            if commit_sha == "merged-sha":
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    f"{merged_branch}\nmain\n",
-                    "",
-                )
+        if cmd[1] == "rev-list":
+            rev_range = cmd[4]
+            if rev_range == f"refs/heads/main...refs/heads/{ahead_branch}":
+                return subprocess.CompletedProcess(cmd, 0, "0\t2\n", "")
+            if rev_range == f"refs/heads/main...refs/heads/{diverged_branch}":
+                return subprocess.CompletedProcess(cmd, 0, "1\t2\n", "")
+            if rev_range == f"refs/heads/main...refs/heads/{merged_branch}":
+                return subprocess.CompletedProcess(cmd, 0, "2\t0\n", "")
             return subprocess.CompletedProcess(cmd, 1, "", "")
         raise AssertionError(f"Unexpected git command: {cmd}")
 
@@ -535,9 +535,11 @@ def test_handle_status_branch_states_open_and_merged(
     out = capsys.readouterr().out
     assert "Branch" in out
 
-    open_row = next(line for line in out.splitlines() if line.startswith(f"{task_open:<6}"))
+    ahead_row = next(line for line in out.splitlines() if line.startswith(f"{task_ahead:<6}"))
+    diverged_row = next(line for line in out.splitlines() if line.startswith(f"{task_diverged:<6}"))
     merged_row = next(line for line in out.splitlines() if line.startswith(f"{task_merged:<6}"))
-    assert open_row.rstrip().endswith("open")
+    assert ahead_row.rstrip().endswith("ahead")
+    assert diverged_row.rstrip().endswith("diverged")
     assert merged_row.rstrip().endswith("merged")
 
 

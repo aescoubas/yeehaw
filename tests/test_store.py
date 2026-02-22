@@ -87,6 +87,23 @@ def test_failed_task_and_list_filters(store: Store) -> None:
     assert [task["task_number"] for task in queued] == ["1.2"]
 
 
+def test_create_roadmap_supersedes_previous_for_same_project(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_1 = store.create_roadmap(project_id, "# Roadmap 1")
+    roadmap_2 = store.create_roadmap(project_id, "# Roadmap 2")
+
+    first = store.get_roadmap(roadmap_1)
+    second = store.get_roadmap(roadmap_2)
+    active = store.get_active_roadmap(project_id)
+
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "invalid"
+    assert second["status"] == "draft"
+    assert active is not None
+    assert active["id"] == roadmap_2
+
+
 def test_events_alerts_and_scheduler_config(store: Store) -> None:
     project_id = store.create_project("proj-a", "/tmp/repo-a")
     roadmap_id = store.create_roadmap(project_id, "# Roadmap")

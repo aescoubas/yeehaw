@@ -57,7 +57,17 @@ class Store:
         return cur.rowcount > 0
 
     def create_roadmap(self, project_id: int, raw_md: str) -> int:
-        """Insert a roadmap and return its id."""
+        """Insert a roadmap and return its id.
+
+        A project may only have one active roadmap at a time. Creating a new roadmap
+        supersedes older non-invalid roadmaps for the same project.
+        """
+        now = self._now()
+        self._conn.execute(
+            "UPDATE roadmaps SET status = 'invalid', updated_at = ? "
+            "WHERE project_id = ? AND status != 'invalid'",
+            (now, project_id),
+        )
         cur = self._conn.execute(
             "INSERT INTO roadmaps (project_id, raw_md) VALUES (?, ?)",
             (project_id, raw_md),
@@ -196,7 +206,7 @@ class Store:
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         """Get task plus project metadata."""
         row = self._conn.execute(
-            "SELECT t.*, p.name as project_name, p.id as project_id, "
+            "SELECT t.*, r.status as roadmap_status, p.name as project_name, p.id as project_id, "
             "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
@@ -213,12 +223,12 @@ class Store:
     ) -> list[dict[str, Any]]:
         """List tasks, optionally filtered by project and status."""
         query = (
-            "SELECT t.*, p.name as project_name, p.id as project_id, "
+            "SELECT t.*, r.status as roadmap_status, p.name as project_name, p.id as project_id, "
             "p.repo_root as project_repo_root "
             "FROM tasks t "
             "JOIN roadmaps r ON t.roadmap_id = r.id "
             "JOIN projects p ON r.project_id = p.id "
-            "WHERE 1=1"
+            "WHERE r.status != 'invalid'"
         )
         params: list[Any] = []
         if project_id is not None:
@@ -280,12 +290,13 @@ class Store:
         if project_id is not None:
             row = self._conn.execute(
                 "SELECT COUNT(*) FROM tasks t JOIN roadmaps r ON t.roadmap_id = r.id "
-                "WHERE r.project_id = ? AND t.status = 'in-progress'",
+                "WHERE r.project_id = ? AND r.status != 'invalid' AND t.status = 'in-progress'",
                 (project_id,),
             ).fetchone()
         else:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'in-progress'",
+                "SELECT COUNT(*) FROM tasks t JOIN roadmaps r ON t.roadmap_id = r.id "
+                "WHERE r.status != 'invalid' AND t.status = 'in-progress'",
             ).fetchone()
         return int(row[0])
 
