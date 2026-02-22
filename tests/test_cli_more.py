@@ -640,6 +640,39 @@ def test_handle_logs_paths(db_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert "line3" in out
 
 
+def test_handle_logs_follow_mode(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = _seed_project_with_task(db_path)
+    logs_dir = db_path.parent.parent / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "attempt-01-claude.log"
+    log_path.write_text("line1\n")
+
+    calls = {"count": 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            log_path.write_text("line1\nline2\n")
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_logs.time, "sleep", fake_sleep)
+
+    cli_logs.handle_logs(
+        Namespace(task_id=ids["task_id"], attempt=None, tail=1, follow=True),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Following live output" in out
+    assert "line1" in out
+    assert "line2" in out
+    assert "Stopped following." in out
+
+
 def test_handle_stop_paths(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -132,6 +132,11 @@ def main(argv: list[str] | None = None) -> None:
         default=200,
         help="Number of trailing log lines to show (default: 200)",
     )
+    logs_parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow log output live",
+    )
 
     scheduler_parser = subparsers.add_parser("scheduler", help="Manage scheduler config")
     scheduler_sub = scheduler_parser.add_subparsers(
