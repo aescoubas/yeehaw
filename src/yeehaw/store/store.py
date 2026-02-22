@@ -400,6 +400,15 @@ class Store:
         )
         self._conn.commit()
 
+    def reset_task_attempts(self, task_id: int) -> bool:
+        """Reset retry attempt metadata for a task."""
+        cur = self._conn.execute(
+            "UPDATE tasks SET attempts = 0, last_failure = NULL, updated_at = ? WHERE id = ?",
+            (self._now(), task_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def pause_task(self, task_id: int) -> bool:
         """Pause a task that is pending, queued, or in-progress."""
         task = self.get_task(task_id)

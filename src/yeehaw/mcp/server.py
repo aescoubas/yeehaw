@@ -380,12 +380,16 @@ def update_task(
     task_id: int,
     status: str | None = None,
     assigned_agent: str | None = None,
+    reset_attempts: bool = False,
 ) -> dict[str, Any]:
     """Update task status and assignment metadata."""
     store = _get_store()
     task = store.get_task(task_id)
     if not task:
         return {"error": f"Task {task_id} not found"}
+
+    if reset_attempts:
+        store.reset_task_attempts(task_id)
 
     if status:
         if status in ("done", "blocked"):

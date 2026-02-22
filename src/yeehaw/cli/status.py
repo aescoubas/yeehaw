@@ -12,6 +12,7 @@ from yeehaw.store.store import Store
 
 TITLE_WIDTH = 35
 BRANCH_WIDTH = 8
+ATTEMPTS_WIDTH = 8
 TOKENS_WIDTH = 12
 BRANCH_NA = "n/a"
 BRANCH_AHEAD = "ahead"
@@ -221,6 +222,15 @@ def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path) -> None:
         task["tokens_used"] = _resolve_tokens_used(task, db_path)
 
 
+def _format_attempts(task: dict[str, Any]) -> str:
+    """Format attempts as '<attempts>/<max_attempts>' for status output."""
+    attempts = task.get("attempts")
+    max_attempts = task.get("max_attempts")
+    if not isinstance(attempts, int) or not isinstance(max_attempts, int):
+        return "n/a"
+    return f"{attempts}/{max_attempts}"
+
+
 def handle_status(args: Any, db_path: Path) -> None:
     """Handle `yeehaw status` output."""
     store = Store(db_path)
@@ -250,7 +260,8 @@ def handle_status(args: Any, db_path: Path) -> None:
 
         header = (
             f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} "
-            f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}} {'Tokens':<{TOKENS_WIDTH}}"
+            f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}} "
+            f"{'Attempts':<{ATTEMPTS_WIDTH}} {'Tokens':<{TOKENS_WIDTH}}"
         )
         print(header)
         print("-" * len(header))
@@ -258,6 +269,7 @@ def handle_status(args: Any, db_path: Path) -> None:
             agent = task.get("assigned_agent") or ""
             title = _truncate_for_column(task["title"], TITLE_WIDTH)
             branch_state = task.get("branch_state") or BRANCH_NA
+            attempts_display = _format_attempts(task)
             tokens_used = task.get("tokens_used")
             tokens_display = (
                 f"{int(tokens_used):,}"
@@ -266,7 +278,8 @@ def handle_status(args: Any, db_path: Path) -> None:
             )
             print(
                 f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
-                f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}} {tokens_display:<{TOKENS_WIDTH}}"
+                f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}} "
+                f"{attempts_display:<{ATTEMPTS_WIDTH}} {tokens_display:<{TOKENS_WIDTH}}"
             )
 
         by_status: dict[str, int] = {}

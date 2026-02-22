@@ -249,6 +249,17 @@ def test_mcp_approve_and_update_task_branches(mcp_store_extra: Store) -> None:
     assert mcp_server.update_task(task_id_2, status="queued")["updated"] is True
     assert mcp_store_extra.get_task(task_id_2)["status"] == "queued"
 
+    mcp_store_extra._conn.execute(
+        "UPDATE tasks SET attempts = 3, last_failure = ? WHERE id = ?",
+        ("previous failure", task_id_2),
+    )
+    mcp_store_extra._conn.commit()
+    assert mcp_server.update_task(task_id_2, reset_attempts=True)["updated"] is True
+    reset_task = mcp_store_extra.get_task(task_id_2)
+    assert reset_task is not None
+    assert reset_task["attempts"] == 0
+    assert reset_task["last_failure"] is None
+
     assert mcp_server.update_task(task_id_2, status="blocked")["updated"] is True
     assert mcp_store_extra.get_task(task_id_2)["status"] == "blocked"
 

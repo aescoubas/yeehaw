@@ -415,6 +415,7 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     out = capsys.readouterr().out
     assert "ID" in out
     assert "Branch" in out
+    assert "Attempts" in out
     assert "Tokens" in out
     assert "n/a" in out
     assert "Total:" in out
@@ -476,7 +477,8 @@ def test_handle_status_truncates_long_title(db_path: Path, capsys: pytest.Captur
     assert long_title not in out
 
     row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
-    assert row[54:60] == "queued"
+    assert "queued" in row
+    assert "0/4" in row
 
 
 def test_handle_status_branch_states_ahead_diverged_and_merged(
@@ -577,6 +579,7 @@ def test_handle_status_shows_tokens_for_in_progress_task(
     row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
     assert "Tokens" in out
     assert "27,315" in row
+    assert "1/4" in row
 
 
 def test_parse_tokens_used_supports_total_tokens_line() -> None:
