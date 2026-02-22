@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> None:
     approve_roadmap = roadmap_sub.add_parser("approve", help="Approve roadmap for execution")
     approve_roadmap.add_argument("--project", required=True, help="Project name")
 
+    clear_roadmap = roadmap_sub.add_parser("clear", help="Clear active roadmap")
+    clear_roadmap.add_argument("--project", required=True, help="Project name")
+
     plan_parser = subparsers.add_parser("plan", help="Start AI planning session")
     plan_parser.add_argument("briefing", nargs="?", help="Briefing file (optional)")
     plan_parser.add_argument(

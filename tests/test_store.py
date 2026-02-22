@@ -114,3 +114,37 @@ def test_events_alerts_and_scheduler_config(store: Store) -> None:
     updated = store.get_scheduler_config()
     assert updated["max_global_tasks"] == 7
     assert updated["tick_interval_sec"] == 10
+
+
+def test_delete_roadmap_removes_dependencies(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    store.log_event("evt", "msg", project_id=project_id, task_id=task_id)
+    store.create_alert("warn", "msg", project_id=project_id, task_id=task_id)
+    store._conn.execute(
+        "INSERT INTO git_worktrees (task_id, branch, path) VALUES (?, ?, ?)",
+        (task_id, "b", "/tmp/wt"),
+    )
+    store._conn.commit()
+
+    assert store.delete_roadmap(roadmap_id) is True
+    assert store.get_roadmap(roadmap_id) is None
+    assert store.list_phases(roadmap_id) == []
+    assert store.list_tasks(project_id=project_id) == []
+
+    events = store.list_events()
+    assert len(events) == 1
+    assert events[0]["task_id"] is None
+
+    alerts = store.list_alerts()
+    assert len(alerts) == 1
+    assert alerts[0]["task_id"] is None
+
+    assert (
+        store._conn.execute("SELECT COUNT(*) FROM git_worktrees").fetchone()[0]
+        == 0
+    )
+    assert store.delete_roadmap(roadmap_id) is False

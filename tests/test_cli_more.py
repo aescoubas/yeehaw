@@ -91,6 +91,7 @@ def test_cli_main_dispatches_remaining_commands(
 
     cli_main.main(["init"])
     cli_main.main(["roadmap", "show", "--project", "p"])  # routing only
+    cli_main.main(["roadmap", "clear", "--project", "p"])  # routing only
     cli_main.main(["plan"])
     cli_main.main(["run", "--agent", "codex"])
     cli_main.main(["attach", "1"])
@@ -102,6 +103,7 @@ def test_cli_main_dispatches_remaining_commands(
     names = [name for name, _ in calls]
     assert names == [
         "init",
+        "roadmap",
         "roadmap",
         "plan",
         "run",
@@ -217,6 +219,60 @@ def test_handle_roadmap_show_and_approve(db_path: Path, capsys: pytest.CaptureFi
     approve_args = Namespace(roadmap_command="approve", project="proj-a")
     cli_roadmap.handle_roadmap(approve_args, db_path)
     assert "not 'draft'" in capsys.readouterr().out
+
+
+def test_handle_roadmap_clear(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    clear_args = Namespace(roadmap_command="clear", project="missing")
+    cli_roadmap.handle_roadmap(clear_args, db_path)
+    assert "Project 'missing' not found" in capsys.readouterr().out
+
+    store = Store(db_path)
+    store.create_project("proj-a", "/tmp/repo-a")
+    store.close()
+
+    clear_args = Namespace(roadmap_command="clear", project="proj-a")
+    cli_roadmap.handle_roadmap(clear_args, db_path)
+    assert "No active roadmap." in capsys.readouterr().out
+
+    markdown_path = db_path.parent / "to-clear-1.md"
+    markdown_path.write_text(
+        "# Roadmap: proj-a\n"
+        "## Phase 1: Foundation\n"
+        "### Task 1.1: Build\n"
+        "desc\n"
+    )
+
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="create", file=str(markdown_path), project="proj-a"),
+        db_path,
+    )
+
+    markdown_path_2 = db_path.parent / "to-clear-2.md"
+    markdown_path_2.write_text(
+        "# Roadmap: proj-a\n"
+        "## Phase 1: Foundation\n"
+        "### Task 1.1: Build again\n"
+        "desc\n"
+    )
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="create", file=str(markdown_path_2), project="proj-a"),
+        db_path,
+    )
+    capsys.readouterr()
+
+    cli_roadmap.handle_roadmap(clear_args, db_path)
+    out = capsys.readouterr().out
+    assert "Cleared 2 roadmap(s)" in out
+    assert "tasks removed" in out
+
+    store = Store(db_path)
+    try:
+        project = store.get_project("proj-a")
+        assert project is not None
+        assert store.get_active_roadmap(project["id"]) is None
+        assert store.list_tasks(project_id=project["id"]) == []
+    finally:
+        store.close()
 
 
 def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

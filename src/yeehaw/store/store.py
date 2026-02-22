@@ -82,6 +82,44 @@ class Store:
         ).fetchone()
         return self._row_to_dict(row)
 
+    def delete_roadmap(self, roadmap_id: int) -> bool:
+        """Delete a roadmap and all dependent phase/task/worktree rows."""
+        existing = self.get_roadmap(roadmap_id)
+        if existing is None:
+            return False
+
+        task_rows = self._conn.execute(
+            "SELECT id FROM tasks WHERE roadmap_id = ?",
+            (roadmap_id,),
+        ).fetchall()
+        task_ids = [int(row[0]) for row in task_rows]
+
+        try:
+            if task_ids:
+                placeholders = ", ".join("?" for _ in task_ids)
+                self._conn.execute(
+                    f"UPDATE events SET task_id = NULL WHERE task_id IN ({placeholders})",
+                    task_ids,
+                )
+                self._conn.execute(
+                    f"UPDATE alerts SET task_id = NULL WHERE task_id IN ({placeholders})",
+                    task_ids,
+                )
+                self._conn.execute(
+                    f"DELETE FROM git_worktrees WHERE task_id IN ({placeholders})",
+                    task_ids,
+                )
+
+            self._conn.execute("DELETE FROM tasks WHERE roadmap_id = ?", (roadmap_id,))
+            self._conn.execute("DELETE FROM roadmap_phases WHERE roadmap_id = ?", (roadmap_id,))
+            self._conn.execute("DELETE FROM roadmaps WHERE id = ?", (roadmap_id,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        return True
+
     def update_roadmap_status(self, roadmap_id: int, status: str) -> None:
         """Update roadmap status."""
         self._conn.execute(

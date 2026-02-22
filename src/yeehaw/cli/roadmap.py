@@ -19,6 +19,8 @@ def handle_roadmap(args: Any, db_path: Path) -> None:
             _show_roadmap(store, args)
         elif args.roadmap_command == "approve":
             _approve_roadmap(store, args)
+        elif args.roadmap_command == "clear":
+            _clear_roadmap(store, args)
     finally:
         store.close()
 
@@ -122,3 +124,41 @@ def _approve_roadmap(store: Store, args: Any) -> None:
 
     store.update_roadmap_status(roadmap["id"], "executing")
     print(f"Roadmap approved. {queued} tasks queued for Phase 1.")
+
+
+def _clear_roadmap(store: Store, args: Any) -> None:
+    project = store.get_project(args.project)
+    if not project:
+        print(f"Error: Project '{args.project}' not found.")
+        return
+
+    first = store.get_active_roadmap(project["id"])
+    if not first:
+        print("No active roadmap.")
+        return
+
+    removed_roadmaps = 0
+    phases_total = 0
+    tasks_total = 0
+    last_cleared_id = first["id"]
+
+    while True:
+        roadmap = store.get_active_roadmap(project["id"])
+        if not roadmap:
+            break
+        phases = store.list_phases(roadmap["id"])
+        phases_total += len(phases)
+        tasks_total += sum(len(store.list_tasks_by_phase(phase["id"])) for phase in phases)
+        if not store.delete_roadmap(roadmap["id"]):
+            break
+        removed_roadmaps += 1
+        last_cleared_id = roadmap["id"]
+
+    if removed_roadmaps == 0:
+        print("No roadmap cleared.")
+        return
+
+    print(
+        f"Cleared {removed_roadmaps} roadmap(s) for project '{args.project}' "
+        f"(latest #{last_cleared_id}, {phases_total} phases, {tasks_total} tasks removed)."
+    )
