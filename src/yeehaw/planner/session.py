@@ -38,22 +38,34 @@ def _build_planner_prompt(project_name: str | None, briefing_file: Path | None) 
         "You are a project planning assistant connected to the yeehaw MCP server.",
         "Have an interactive planning conversation with the human.",
         "",
-        "Available MCP tools include: create_project, create_roadmap, list_projects,",
-        "list_tasks, get_project_status, approve_roadmap, update_task.",
+        "Available MCP tools include: create_project, get_roadmap, create_roadmap,",
+        "edit_roadmap, preview_roadmap, list_projects, list_tasks, get_project_status,",
+        "approve_roadmap, update_task.",
         "",
         "Your objective:",
         "1) Ask clarifying questions until requirements are concrete.",
-        "2) Propose a phased implementation plan.",
-        "3) After user confirmation, persist the roadmap using create_roadmap.",
+        "2) Draft a phased implementation roadmap in verbose task format.",
+        "3) During discussion, call preview_roadmap(markdown=<draft>, color=True)",
+        "   and show the returned preview so the human sees a colorized roadmap draft.",
+        "4) After user confirmation, persist with create_roadmap (new roadmap)",
+        "   or edit_roadmap (update current active roadmap in place).",
         "",
-        "Roadmap markdown format required by yeehaw:",
+        "Roadmap markdown format supported by yeehaw:",
         "# Roadmap: <project-name>",
         "## Phase N: <title>",
         "**Verify:** `<command>` (optional)",
-        "### Task N.M: <title>",
-        "<description>",
+        "### Task N.M: <title>  (or `### P0.1: <title>`)",
+        "**Depends on:** <none|task refs>",
+        "**Repo:** <repo-name>",
+        "**Files:**",
+        "- `<path>` — <change summary>",
+        "**Description:**",
+        "<implementation details>",
+        "**Done when:**",
+        "- [ ] <acceptance criterion>",
         "",
-        "Phases must be numbered 1..N and tasks per phase must be N.1, N.2, ...",
+        "Phases may start at 0 or 1 and must remain sequential.",
+        "Tasks per phase must be sequential for that phase (N.1, N.2, ...).",
     ]
 
     if project_name:
@@ -62,7 +74,11 @@ def _build_planner_prompt(project_name: str | None, briefing_file: Path | None) 
                 "",
                 f"Target project: '{project_name}'.",
                 "Do not create a new project; create/update roadmap for this project.",
-                f"When persisting, call create_roadmap(project_name='{project_name}', markdown=...).",
+                (
+                    f"When persisting, call create_roadmap(project_name='{project_name}', markdown=...) "
+                    f"for first creation, or edit_roadmap(project_name='{project_name}', markdown=...) "
+                    "to update the active roadmap."
+                ),
             ]
         )
 

@@ -36,7 +36,9 @@ class Roadmap:
 _RE_HEADER = re.compile(r"^#\s+Roadmap:\s+(.+)$")
 _RE_PHASE = re.compile(r"^##\s+Phase\s+(\d+):\s+(.+)$")
 _RE_VERIFY = re.compile(r"^\*\*Verify:\*\*\s+`(.+)`$")
-_RE_TASK = re.compile(r"^###\s+Task\s+([\d.]+):\s+(.+)$")
+_RE_TASK = re.compile(r"^###\s+(?:Task\s+)?([Pp]?\d+\.\d+):\s+(.+)$")
+_RE_TASK_STATUS_SUFFIX = re.compile(r"\s+\[(?:x|X| )\]\s*$")
+_RE_TASK_COMPONENTS = re.compile(r"^[Pp]?(\d+)\.(\d+)$")
 
 
 def parse_roadmap(text: str) -> Roadmap:
@@ -80,9 +82,13 @@ def parse_roadmap(text: str) -> Roadmap:
         task_match = _RE_TASK.match(line)
         if task_match:
             flush_task()
+            raw_task_num = task_match.group(1).strip()
+            normalized_task_num = _normalize_task_number(raw_task_num)
+            raw_title = task_match.group(2).strip()
+            title = _RE_TASK_STATUS_SUFFIX.sub("", raw_title).strip()
             current_task = Task(
-                number=task_match.group(1),
-                title=task_match.group(2).strip(),
+                number=normalized_task_num,
+                title=title,
                 description="",
             )
             task_lines = []
@@ -109,8 +115,10 @@ def validate_roadmap(roadmap: Roadmap) -> list[str]:
         errors.append("Roadmap must have at least one phase")
         return errors
 
+    phase_start = 0 if roadmap.phases[0].number == 0 else 1
+
     for i, phase in enumerate(roadmap.phases):
-        expected_num = i + 1
+        expected_num = phase_start + i
         if phase.number != expected_num:
             errors.append(
                 f"Phase {phase.number} out of sequence (expected {expected_num})"
@@ -120,9 +128,31 @@ def validate_roadmap(roadmap: Roadmap) -> list[str]:
 
         for j, task in enumerate(phase.tasks):
             expected_task = f"{phase.number}.{j + 1}"
-            if task.number != expected_task:
+            components = _parse_task_components(task.number)
+            if components is None:
+                errors.append(
+                    f"Task {task.number} has invalid number format (expected {expected_task})"
+                )
+                continue
+            if components != (phase.number, j + 1):
                 errors.append(
                     f"Task {task.number} out of sequence (expected {expected_task})"
                 )
 
     return errors
+
+
+def _normalize_task_number(raw_number: str) -> str:
+    """Normalize task numbers (e.g. P0.1 -> 0.1) for storage and validation."""
+    components = _parse_task_components(raw_number)
+    if components is None:
+        return raw_number
+    return f"{components[0]}.{components[1]}"
+
+
+def _parse_task_components(task_number: str) -> tuple[int, int] | None:
+    """Parse task number into (phase, index), allowing optional leading P prefix."""
+    match = _RE_TASK_COMPONENTS.match(task_number.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))

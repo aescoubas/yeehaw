@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from yeehaw.roadmap.parser import parse_roadmap
 from yeehaw.store.store import Store
 
 
@@ -165,3 +168,87 @@ def test_delete_roadmap_removes_dependencies(store: Store) -> None:
         == 0
     )
     assert store.delete_roadmap(roadmap_id) is False
+
+
+def test_edit_roadmap_in_place_inserts_task_for_executing_phase(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    raw = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+Initial setup
+### Task 1.2: Build core
+Implement core
+### Task 1.3: Add tests
+Add baseline tests
+""".strip()
+    roadmap_id = store.create_roadmap(project_id, raw)
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Setup", "Initial setup")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Build core", "Implement core")
+    task_13 = store.create_task(roadmap_id, phase_id, "1.3", "Add tests", "Add baseline tests")
+
+    store.update_roadmap_status(roadmap_id, "executing")
+    store.update_phase_status(phase_id, "executing")
+    store.complete_task(task_11, "done")
+    store.queue_task(task_12)
+
+    edited_raw = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+Initial setup
+### Task 1.2: Build core
+Implement core
+### Task 1.3: Implement migration
+Create migration helpers before tests
+### Task 1.4: Add tests
+Add baseline tests
+""".strip()
+    edited = parse_roadmap(edited_raw)
+
+    stats = store.edit_roadmap_in_place(roadmap_id, edited_raw, edited)
+    assert stats["tasks_created"] == 1
+    assert stats["tasks_updated"] == 1
+    assert stats["tasks_deleted"] == 0
+    assert stats["tasks_queued"] == 1
+
+    roadmap = store.get_roadmap(roadmap_id)
+    assert roadmap is not None
+    assert "Implement migration" in roadmap["raw_md"]
+
+    tasks = store.list_tasks_by_phase(phase_id)
+    by_number = {task["task_number"]: task for task in tasks}
+    assert [task["task_number"] for task in tasks] == ["1.1", "1.2", "1.3", "1.4"]
+    assert by_number["1.1"]["status"] == "done"
+    assert by_number["1.2"]["status"] == "queued"
+    assert by_number["1.3"]["status"] == "queued"
+    assert by_number["1.4"]["status"] == "pending"
+    assert by_number["1.1"]["id"] == task_11
+    assert by_number["1.2"]["id"] == task_12
+    assert by_number["1.4"]["id"] == task_13
+
+
+def test_edit_roadmap_in_place_rejects_modifying_done_task(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    raw = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup
+Initial setup
+""".strip()
+    roadmap_id = store.create_roadmap(project_id, raw)
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Setup", "Initial setup")
+    store.complete_task(task_id, "done")
+
+    edited_raw = """
+# Roadmap: proj-a
+## Phase 1: Foundation
+### Task 1.1: Setup updated
+Initial setup
+""".strip()
+    edited = parse_roadmap(edited_raw)
+
+    with pytest.raises(ValueError, match="Cannot modify task 1.1"):
+        store.edit_roadmap_in_place(roadmap_id, edited_raw, edited)

@@ -62,3 +62,38 @@ def test_validate_roadmap_phase_without_tasks() -> None:
 
     errors = validate_roadmap(roadmap)
     assert errors == ["Phase 1 has no tasks"]
+
+
+def test_parse_roadmap_verbose_phase_zero_and_prefixed_tasks() -> None:
+    roadmap = parse_roadmap(
+        """
+# Roadmap: chamicore-lib
+## Phase 0: Foundation (chamicore-lib)
+### P0.1: httputil — envelope types and response helpers [x]
+
+**Depends on:** none
+**Repo:** chamicore-lib
+
+**Files:**
+- `httputil/envelope.go` — envelope model types
+
+**Description:**
+Implement envelope types and response helpers.
+
+**Done when:**
+- [ ] Envelope serializes correctly
+- [ ] Problem details are RFC 9457 compliant
+""".strip()
+    )
+
+    assert roadmap.project_name == "chamicore-lib"
+    assert len(roadmap.phases) == 1
+    assert roadmap.phases[0].number == 0
+    assert roadmap.phases[0].title == "Foundation (chamicore-lib)"
+    assert len(roadmap.phases[0].tasks) == 1
+    task = roadmap.phases[0].tasks[0]
+    assert task.number == "0.1"
+    assert task.title == "httputil — envelope types and response helpers"
+    assert "**Depends on:** none" in task.description
+    assert "- [ ] Envelope serializes correctly" in task.description
+    assert validate_roadmap(roadmap) == []
