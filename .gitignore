@@ -1,11 +1,3 @@
-# Go (legacy)
-/yeehaw
-/cmd/yeehaw/yeehaw
-*.exe
-*.test
-*.out
-coverage.out
-
 # Python
 __pycache__/
 *.pyc
