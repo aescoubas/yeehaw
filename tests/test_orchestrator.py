@@ -1256,6 +1256,95 @@ def test_check_phase_completion_queues_next_phase(
     assert next_task["status"] == "queued"
 
 
+def test_queue_next_phase_does_not_auto_publish_when_feature_disabled(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    store.complete_task(task_id, "done")
+    store.set_roadmap_integration_branch(roadmap_id, f"yeehaw/roadmap-{roadmap_id}")
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_auto_publish(
+        *,
+        roadmap_id: int,
+        project_id: int,
+        project_repo_root: Path,
+        integration_branch: str,
+    ) -> None:
+        calls.append(
+            {
+                "roadmap_id": roadmap_id,
+                "project_id": project_id,
+                "project_repo_root": project_repo_root,
+                "integration_branch": integration_branch,
+            }
+        )
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_auto_publish_completed_roadmap", fake_auto_publish)
+    orchestrator._queue_next_phase(phase_id)
+
+    assert calls == []
+    roadmap = store.get_roadmap(roadmap_id)
+    assert roadmap is not None
+    assert roadmap["status"] == "completed"
+
+
+def test_queue_next_phase_auto_publishes_when_feature_enabled(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    store.complete_task(task_id, "done")
+    integration_branch = f"yeehaw/roadmap-{roadmap_id}"
+    store.set_roadmap_integration_branch(roadmap_id, integration_branch)
+
+    runtime_config = repo_root / ".yeehaw" / "config" / "runtime.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(json.dumps({"features": {"pr_automation": True}}))
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_auto_publish(
+        *,
+        roadmap_id: int,
+        project_id: int,
+        project_repo_root: Path,
+        integration_branch: str,
+    ) -> None:
+        calls.append(
+            {
+                "roadmap_id": roadmap_id,
+                "project_id": project_id,
+                "project_repo_root": project_repo_root,
+                "integration_branch": integration_branch,
+            }
+        )
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_auto_publish_completed_roadmap", fake_auto_publish)
+    orchestrator._queue_next_phase(phase_id)
+
+    assert calls == [
+        {
+            "roadmap_id": roadmap_id,
+            "project_id": project_id,
+            "project_repo_root": Path("/tmp/repo"),
+            "integration_branch": integration_branch,
+        }
+    ]
+
+
 def test_run_verification_prefers_worktree_path(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,

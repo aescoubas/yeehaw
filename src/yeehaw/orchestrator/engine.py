@@ -27,6 +27,14 @@ from yeehaw.policy.checks import (
     has_active_builtin_checks,
 )
 from yeehaw.policy.loader import load_policy_pack
+from yeehaw.scm import (
+    GitHubSCMAdapter,
+    LocalGitSCMAdapter,
+    RoadmapPhaseSummary,
+    RoadmapPRPublishRequest,
+    RoadmapTaskSummary,
+    SCMAdapterError,
+)
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
 from yeehaw.tmux.session import (
@@ -44,6 +52,10 @@ REBASE_WORKTREE_DIR = "rebase-worktrees"
 HOOK_SCHEMA_VERSION = 1
 TOKEN_SCAN_WINDOW_LINES = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+GITHUB_OWNER_ENV = "YEEHAW_GITHUB_OWNER"
+GITHUB_REPO_ENV = "YEEHAW_GITHUB_REPO"
+GITHUB_TOKEN_ENV = "YEEHAW_GITHUB_TOKEN"
+GITHUB_API_BASE_URL_ENV = "YEEHAW_GITHUB_API_BASE_URL"
 TOTAL_TOKEN_PATTERNS = (
     re.compile(r"\btokens?\s+used\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
     re.compile(r"\btotal\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
@@ -626,6 +638,139 @@ class Orchestrator:
         feature_flags = load_feature_flags(config_path)
         return feature_flags.memory_packs
 
+    def _roadmap_auto_publish_feature_enabled(self) -> bool:
+        """Return True when runtime feature flag enables completion auto-publish."""
+        config_path = self.runtime_root / "config" / "runtime.json"
+        try:
+            feature_flags = load_feature_flags(config_path)
+        except ValueError as exc:
+            message = f"Invalid runtime config; skipping roadmap auto-publish: {exc}"
+            self.store.log_event("roadmap_publish_skipped", message)
+            self.store.create_alert("warn", message)
+            return False
+        return feature_flags.pr_automation
+
+    def _completed_roadmap_phase_summaries(
+        self,
+        roadmap_id: int,
+    ) -> tuple[RoadmapPhaseSummary, ...]:
+        """Return phase/task summaries for PR publication payloads."""
+        phase_summaries: list[RoadmapPhaseSummary] = []
+        for phase in self.store.list_phases(roadmap_id):
+            task_summaries = tuple(
+                RoadmapTaskSummary(
+                    task_number=str(task["task_number"]),
+                    title=str(task["title"]),
+                    status=str(task["status"]),
+                    summary=str(task["last_failure"]) if task.get("last_failure") else None,
+                )
+                for task in self.store.list_tasks_by_phase(int(phase["id"]))
+            )
+            phase_summaries.append(
+                RoadmapPhaseSummary(
+                    phase_number=int(phase["phase_number"]),
+                    title=str(phase["title"]),
+                    status=str(phase["status"]),
+                    tasks=task_summaries,
+                )
+            )
+        return tuple(phase_summaries)
+
+    def _github_adapter_from_env(self) -> GitHubSCMAdapter | None:
+        """Build optional GitHub adapter from environment configuration."""
+        owner = os.environ.get(GITHUB_OWNER_ENV, "").strip()
+        repo = os.environ.get(GITHUB_REPO_ENV, "").strip()
+        token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
+        api_base_url = os.environ.get(GITHUB_API_BASE_URL_ENV, "").strip()
+
+        if not owner and not repo and not token:
+            return None
+        if not owner or not repo or not token:
+            raise ValueError(
+                "Incomplete GitHub adapter configuration. "
+                f"Set {GITHUB_OWNER_ENV}, {GITHUB_REPO_ENV}, and {GITHUB_TOKEN_ENV}."
+            )
+
+        return GitHubSCMAdapter(
+            owner=owner,
+            repo=repo,
+            token=token,
+            enabled=True,
+            api_base_url=api_base_url or "https://api.github.com",
+        )
+
+    def _auto_publish_completed_roadmap(
+        self,
+        *,
+        roadmap_id: int,
+        project_id: int,
+        project_repo_root: Path,
+        integration_branch: str,
+    ) -> None:
+        """Publish completed roadmap branch and optional PR metadata."""
+        try:
+            publish_result = LocalGitSCMAdapter().publish_roadmap_integration(
+                repo_root=project_repo_root,
+                roadmap_id=roadmap_id,
+                integration_branch=integration_branch,
+                base_branch=MAIN_BRANCH,
+            )
+        except SCMAdapterError as exc:
+            message = f"Roadmap {roadmap_id} auto-publish failed: {exc}"
+            self.store.log_event("roadmap_publish_failed", message, project_id=project_id)
+            self.store.create_alert("warn", message, project_id=project_id)
+            return
+
+        self.store.log_event(
+            "roadmap_published",
+            (
+                f"Roadmap {roadmap_id} published at "
+                f"{publish_result.summary.integration_branch}@{publish_result.summary.head_sha}"
+            ),
+            project_id=project_id,
+        )
+
+        try:
+            github_adapter = self._github_adapter_from_env()
+        except ValueError as exc:
+            message = f"Roadmap {roadmap_id} auto PR publish skipped: {exc}"
+            self.store.log_event("roadmap_publish_skipped", message, project_id=project_id)
+            self.store.create_alert("warn", message, project_id=project_id)
+            return
+
+        if github_adapter is None:
+            return
+
+        publish_request = RoadmapPRPublishRequest(
+            repo_root=project_repo_root,
+            roadmap_id=roadmap_id,
+            integration_branch=integration_branch,
+            base_branch=MAIN_BRANCH,
+            enabled=True,
+            summary=publish_result.summary,
+            phase_summaries=self._completed_roadmap_phase_summaries(roadmap_id),
+        )
+        pr_result = github_adapter.publish_roadmap_pull_request(publish_request)
+
+        for event in pr_result.events:
+            self.store.log_event(event.kind, event.message, project_id=project_id)
+        for alert in pr_result.alerts:
+            self.store.create_alert(alert.severity, alert.message, project_id=project_id)
+
+        publication = pr_result.pull_request
+        if publication is not None:
+            self.store.log_event(
+                "roadmap_pr_trace",
+                f"Roadmap {roadmap_id} PR #{publication.number}: {publication.html_url}",
+                project_id=project_id,
+            )
+        elif pr_result.error:
+            self.store.log_event(
+                "roadmap_publish_failed",
+                f"Roadmap {roadmap_id} auto PR publish failed: {pr_result.error}",
+                project_id=project_id,
+            )
+
     def _run_verification(self, task: dict[str, Any]) -> bool:
         """Run phase verify command if configured."""
         phase = self.store.get_phase(task["phase_id"])
@@ -925,17 +1070,49 @@ class Orchestrator:
                 self.store.queue_task(task["id"])
             self.store.update_phase_status(next_phase["id"], "executing")
         else:
-            self.store.update_roadmap_status(phase["roadmap_id"], "completed")
+            roadmap_id = int(phase["roadmap_id"])
+            self.store.update_roadmap_status(roadmap_id, "completed")
             self.store.log_event(
                 "roadmap_completed",
-                f"Roadmap {phase['roadmap_id']} finished",
+                f"Roadmap {roadmap_id} finished",
             )
+            phase_context = self._phase_task_context(completed_phase_id)
             self._emit_hook_event(
                 "on_roadmap_complete",
-                task=self._phase_task_context(completed_phase_id),
-                roadmap_id=int(phase["roadmap_id"]),
+                task=phase_context,
+                roadmap_id=roadmap_id,
                 phase_id=completed_phase_id,
-                context={"roadmap_id": int(phase["roadmap_id"])},
+                context={"roadmap_id": roadmap_id},
+            )
+
+            if not self._roadmap_auto_publish_feature_enabled():
+                return
+
+            roadmap = self.store.get_roadmap(roadmap_id)
+            project_id = self._as_int(roadmap.get("project_id")) if roadmap is not None else None
+            integration_branch = roadmap.get("integration_branch") if roadmap is not None else None
+            project_repo_root = phase_context.get("project_repo_root") if phase_context else None
+
+            if project_id is None or not isinstance(project_repo_root, str) or not project_repo_root:
+                message = (
+                    f"Roadmap {roadmap_id} completed but project context is missing; "
+                    "auto-publish skipped"
+                )
+                self.store.log_event("roadmap_publish_skipped", message, project_id=project_id)
+                return
+            if not isinstance(integration_branch, str) or not integration_branch:
+                message = (
+                    f"Roadmap {roadmap_id} completed without integration branch; "
+                    "auto-publish skipped"
+                )
+                self.store.log_event("roadmap_publish_skipped", message, project_id=project_id)
+                return
+
+            self._auto_publish_completed_roadmap(
+                roadmap_id=roadmap_id,
+                project_id=project_id,
+                project_repo_root=Path(project_repo_root),
+                integration_branch=integration_branch,
             )
 
     def _ensure_integration_branch(self, task: dict[str, Any]) -> str:

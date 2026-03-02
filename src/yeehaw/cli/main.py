@@ -59,6 +59,12 @@ def main(argv: list[str] | None = None) -> None:
     clear_roadmap = roadmap_sub.add_parser("clear", help="Clear active roadmap")
     clear_roadmap.add_argument("--project", required=True, help="Project name")
 
+    publish_roadmap = roadmap_sub.add_parser(
+        "publish",
+        help="Publish active roadmap integration output",
+    )
+    publish_roadmap.add_argument("--project", required=True, help="Project name")
+
     generate_roadmap = roadmap_sub.add_parser(
         "generate",
         help="Generate roadmap from natural-language text",

@@ -154,6 +154,12 @@ uv run yeehaw roadmap approve --project <name>
 uv run yeehaw roadmap clear --project <name>
 ```
 
+- Publish active roadmap integration output:
+
+```bash
+uv run yeehaw roadmap publish --project <name>
+```
+
 - Generate roadmap from natural text (single-shot planner run):
 
 ```bash
@@ -457,6 +463,32 @@ Failure/retry behavior:
 - Crash, timeout, dirty `done` signal, rebase/merge failure, or worker `failed` signal marks task failed.
 - Task is re-queued until `max_attempts` is exhausted (default `4`).
 - Exhaustion emits an alert.
+
+## Roadmap Publish Workflow
+
+Manual publish command:
+
+```bash
+uv run yeehaw roadmap publish --project <name>
+```
+
+Behavior:
+- Publishes the roadmap integration branch summary with the local git SCM adapter.
+- Prints traceable publish metadata including integration branch and head SHA.
+- When GitHub PR adapter is configured, output includes PR number and URL.
+
+GitHub PR adapter configuration:
+- Feature flag must be enabled: `uv run yeehaw config set pr_automation true`
+- Environment variables:
+  - `YEEHAW_GITHUB_OWNER`
+  - `YEEHAW_GITHUB_REPO`
+  - `YEEHAW_GITHUB_TOKEN`
+  - optional: `YEEHAW_GITHUB_API_BASE_URL` (defaults to `https://api.github.com`)
+
+Auto-publish on completion:
+- When `pr_automation=true`, roadmap completion triggers automatic publish.
+- Auto-publish is fail-open: roadmap completion state is preserved even if publishing fails.
+- Publish failures/skips are recorded as events/alerts for operator visibility.
 
 ## Extension Model and Compatibility
 

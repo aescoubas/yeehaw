@@ -27,6 +27,14 @@ import yeehaw.cli.workers as cli_workers
 from yeehaw.context import MEMORY_PACK_MAX_BYTES
 from yeehaw.policy.checks import BuiltInPolicyInput
 from yeehaw.policy.models import PolicyPack, QualityPolicy, SafetyPolicy
+from yeehaw.scm.models import (
+    PublishedBranch,
+    RoadmapPRPublication,
+    RoadmapPRPublishResult,
+    RoadmapPublishResult,
+    RoadmapPublishSummary,
+    SCMEvent,
+)
 from yeehaw.store.store import Store
 
 
@@ -124,6 +132,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["init"])
     cli_main.main(["roadmap", "show", "--project", "p"])  # routing only
     cli_main.main(["roadmap", "clear", "--project", "p"])  # routing only
+    cli_main.main(["roadmap", "publish", "--project", "p"])  # routing only
     cli_main.main(
         ["roadmap", "generate", "--project", "p", "--prompt", "build the project roadmap"]
     )
@@ -143,6 +152,7 @@ def test_cli_main_dispatches_remaining_commands(
     names = [name for name, _ in calls]
     assert names == [
         "init",
+        "roadmap",
         "roadmap",
         "roadmap",
         "roadmap",
@@ -616,6 +626,141 @@ def test_handle_roadmap_clear(db_path: Path, capsys: pytest.CaptureFixture[str])
         assert store.list_tasks(project_id=project["id"]) == []
     finally:
         store.close()
+
+
+def test_handle_roadmap_publish_paths(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="publish", project="missing"),
+        db_path,
+    )
+    assert "Project 'missing' not found" in capsys.readouterr().out
+
+    store = Store(db_path)
+    store.create_project("proj-a", "/tmp/repo-a")
+    store.close()
+
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="publish", project="proj-a"),
+        db_path,
+    )
+    assert "No active roadmap." in capsys.readouterr().out
+
+    _seed_project_with_task(db_path, task_status="done")
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="publish", project="proj-a"),
+        db_path,
+    )
+    assert "has no integration branch yet" in capsys.readouterr().out
+
+    store = Store(db_path)
+    try:
+        project = store.get_project("proj-a")
+        assert project is not None
+        roadmap = store.get_active_roadmap(project["id"])
+        assert roadmap is not None
+        roadmap_id = int(roadmap["id"])
+        store.set_roadmap_integration_branch(roadmap_id, "yeehaw/roadmap-1")
+    finally:
+        store.close()
+
+    runtime_config = db_path.parent / "config" / "runtime.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(json.dumps({"features": {"pr_automation": True}}))
+
+    monkeypatch.setenv("YEEHAW_GITHUB_OWNER", "octocat")
+    monkeypatch.setenv("YEEHAW_GITHUB_REPO", "yeehaw")
+    monkeypatch.setenv("YEEHAW_GITHUB_TOKEN", "token")
+
+    class FakeLocalGitSCMAdapter:
+        def publish_roadmap_integration(
+            self,
+            *,
+            repo_root: Path,
+            roadmap_id: int,
+            integration_branch: str,
+            base_branch: str = "main",
+        ) -> RoadmapPublishResult:
+            assert repo_root == Path("/tmp/repo-a")
+            assert roadmap_id == roadmap_id_expected
+            assert integration_branch == "yeehaw/roadmap-1"
+            assert base_branch == "main"
+            return RoadmapPublishResult(
+                branch=PublishedBranch(
+                    provider="git-local",
+                    branch_name=integration_branch,
+                    head_sha="abc123",
+                ),
+                summary=RoadmapPublishSummary(
+                    roadmap_id=roadmap_id,
+                    base_branch=base_branch,
+                    integration_branch=integration_branch,
+                    head_sha="abc123",
+                    commits_ahead=3,
+                    commit_subjects=(),
+                    changed_files=(),
+                ),
+            )
+
+    class FakeGitHubSCMAdapter:
+        def __init__(
+            self,
+            *,
+            owner: str,
+            repo: str,
+            token: str,
+            enabled: bool = False,
+            api_base_url: str = "https://api.github.com",
+            timeout_sec: float = 15.0,
+            user_agent: str = "yeehaw",
+        ) -> None:
+            assert owner == "octocat"
+            assert repo == "yeehaw"
+            assert token == "token"
+            assert enabled is True
+            _ = (api_base_url, timeout_sec, user_agent)
+
+        def publish_roadmap_pull_request(
+            self,
+            publish_request: Any,
+        ) -> RoadmapPRPublishResult:
+            assert publish_request.enabled is True
+            assert publish_request.roadmap_id == roadmap_id_expected
+            assert publish_request.integration_branch == "yeehaw/roadmap-1"
+            return RoadmapPRPublishResult(
+                provider="github",
+                action="created",
+                pull_request=RoadmapPRPublication(
+                    number=55,
+                    html_url="https://github.com/octocat/yeehaw/pull/55",
+                    title="Roadmap 1",
+                    body="body",
+                    state="open",
+                ),
+                events=(
+                    SCMEvent(
+                        kind="roadmap_pr_created",
+                        message="Created roadmap PR #55",
+                    ),
+                ),
+            )
+
+    roadmap_id_expected = roadmap_id
+    monkeypatch.setattr(cli_roadmap, "LocalGitSCMAdapter", FakeLocalGitSCMAdapter)
+    monkeypatch.setattr(cli_roadmap, "GitHubSCMAdapter", FakeGitHubSCMAdapter)
+
+    cli_roadmap.handle_roadmap(
+        Namespace(roadmap_command="publish", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert f"Roadmap published (id={roadmap_id_expected})" in out
+    assert "Head SHA: abc123" in out
+    assert "Pull request: #55 (created)" in out
+    assert "URL: https://github.com/octocat/yeehaw/pull/55" in out
 
 
 def test_handle_roadmap_generate_paths(
