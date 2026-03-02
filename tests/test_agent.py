@@ -52,6 +52,39 @@ def test_build_task_prompt_includes_signal_contract() -> None:
     assert "git status --porcelain" in prompt
     assert "## Previous Attempt Failed" in prompt
     assert "timeout" in prompt
+    assert "## Project Memory Pack" not in prompt
+
+
+def test_build_task_prompt_includes_memory_pack_before_task_description() -> None:
+    prompt = build_task_prompt(
+        {
+            "id": 42,
+            "task_number": "1.2",
+            "title": "Implement parser",
+            "description": "Add parser logic.",
+        },
+        signal_dir="/tmp/signal-dir",
+        prompt_file="/tmp/worktree/.yeehaw/task-42-prompt.md",
+        project_context=(
+            "## Conventions\n"
+            "- Keep public APIs explicit.\n"
+            "\n"
+            "## Architecture Constraints\n"
+            "- Avoid global mutable state.\n"
+            "\n"
+            "## Coding Standards\n"
+            "- Type hint all function signatures."
+        ),
+    )
+
+    assert "## Project Memory Pack" in prompt
+    assert "Apply these project conventions before following task-specific instructions." in prompt
+    assert "## Conventions" in prompt
+    assert "## Architecture Constraints" in prompt
+    assert "## Coding Standards" in prompt
+    assert prompt.index("## Project Memory Pack") < prompt.index("Add parser logic.")
+    assert "Persistent Task Context" in prompt
+    assert "/tmp/worktree/.yeehaw/task-42-prompt.md" in prompt
 
 
 def test_build_launch_command_quotes_prompt() -> None:

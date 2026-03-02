@@ -17,6 +17,8 @@ from uuid import uuid4
 from yeehaw.agent.launcher import build_task_prompt, write_launcher
 from yeehaw.agent.profiles import resolve_profile
 from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_launch_config
+from yeehaw.config.loader import load_feature_flags
+from yeehaw.context.loader import load_project_memory_pack
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.hooks import HookDefinition, HookRequest, HookRunResult, load_hooks, run_hooks
 from yeehaw.policy.checks import (
@@ -338,11 +340,13 @@ class Orchestrator:
 
             prompt_path = signal_dir / f"task-{task['id']}-prompt.md"
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            project_context = self._resolve_task_project_context(task)
             prompt = build_task_prompt(
                 task,
                 str(signal_dir),
                 task.get("last_failure"),
                 prompt_file=str(prompt_path),
+                project_context=project_context,
             )
             prompt_path.write_text(prompt)
 
@@ -601,6 +605,26 @@ class Orchestrator:
         if first_task_id is None:
             return None
         return self.store.get_task(first_task_id)
+
+    def _resolve_task_project_context(self, task: dict[str, Any]) -> str | None:
+        """Resolve optional memory-pack markdown to prepend to task prompts."""
+        if not self._memory_pack_feature_enabled():
+            return None
+
+        project_name = task.get("project_name")
+        if not isinstance(project_name, str) or not project_name.strip():
+            return None
+
+        memory_pack = load_project_memory_pack(project_name, runtime_root=self.runtime_root)
+        if memory_pack.is_empty:
+            return None
+        return memory_pack.markdown
+
+    def _memory_pack_feature_enabled(self) -> bool:
+        """Return True when runtime feature flag enables memory pack injection."""
+        config_path = self.runtime_root / "config" / "runtime.json"
+        feature_flags = load_feature_flags(config_path)
+        return feature_flags.memory_packs
 
     def _run_verification(self, task: dict[str, Any]) -> bool:
         """Run phase verify command if configured."""

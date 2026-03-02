@@ -14,13 +14,25 @@ def build_task_prompt(
     signal_dir: str,
     previous_failure: str | None = None,
     prompt_file: str | None = None,
+    project_context: str | None = None,
 ) -> str:
     """Build full worker prompt including mandatory signal protocol."""
-    parts = [
-        f"# Task {task['task_number']}: {task['title']}",
-        "",
-        task["description"],
-    ]
+    parts = [f"# Task {task['task_number']}: {task['title']}"]
+
+    normalized_project_context = project_context.strip() if isinstance(project_context, str) else ""
+    if normalized_project_context:
+        parts.extend(
+            [
+                "",
+                "## Project Memory Pack",
+                "",
+                "Apply these project conventions before following task-specific instructions.",
+                "",
+                normalized_project_context,
+            ]
+        )
+
+    parts.extend(["", task["description"]])
 
     if prompt_file:
         parts.extend(
