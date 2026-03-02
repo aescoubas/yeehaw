@@ -131,6 +131,28 @@ CREATE INDEX IF NOT EXISTS idx_hook_runs_event ON hook_runs(event_name, id DESC)
 CREATE INDEX IF NOT EXISTS idx_hook_runs_task ON hook_runs(task_id, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_hook_runs_event_hook ON hook_runs(event_id, hook_name);
 
+CREATE TABLE IF NOT EXISTS task_merge_attempts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             INTEGER NOT NULL,
+    attempt_number      INTEGER NOT NULL DEFAULT 1,
+    status              TEXT    NOT NULL
+                        CHECK (status IN ('running','succeeded','failed','skipped')),
+    source_branch       TEXT    NOT NULL,
+    target_branch       TEXT    NOT NULL,
+    source_sha_before   TEXT,
+    source_sha_after    TEXT,
+    target_sha_before   TEXT,
+    target_sha_after    TEXT,
+    conflict_type       TEXT,
+    conflict_files      TEXT,
+    error_detail        TEXT,
+    started_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    completed_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_merge_attempts_task
+    ON task_merge_attempts(task_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS scheduler_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     max_global_tasks    INTEGER NOT NULL DEFAULT 5,

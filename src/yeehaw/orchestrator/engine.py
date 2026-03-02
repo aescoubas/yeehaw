@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import signal
 import subprocess
@@ -32,6 +33,16 @@ INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
 MERGE_WORKTREE_DIR = "merge-worktrees"
 REBASE_WORKTREE_DIR = "rebase-worktrees"
 HOOK_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RebaseResult:
+    """Structured result from rebasing a task branch onto integration."""
+
+    error: str | None
+    source_sha_after: str | None
+    conflict_type: str | None = None
+    conflict_files: tuple[str, ...] = ()
 
 
 class Orchestrator:
@@ -694,6 +705,28 @@ class Orchestrator:
             return integration_branch
         return MAIN_BRANCH
 
+    def _finalize_merge_attempt(
+        self,
+        merge_attempt_id: int,
+        *,
+        status: str,
+        source_sha_after: str | None = None,
+        target_sha_after: str | None = None,
+        conflict_type: str | None = None,
+        conflict_files: list[str] | None = None,
+        error_detail: str | None = None,
+    ) -> None:
+        """Persist terminal state for one merge attempt telemetry row."""
+        self.store.update_task_merge_attempt(
+            merge_attempt_id,
+            status=status,
+            source_sha_after=source_sha_after,
+            target_sha_after=target_sha_after,
+            conflict_type=conflict_type,
+            conflict_files=conflict_files,
+            error_detail=error_detail,
+        )
+
     def _merge_done_task_branch(self, task: dict[str, Any]) -> str | None:
         """Merge completed task branch into the roadmap integration branch."""
         source_branch = task.get("branch_name")
@@ -709,16 +742,52 @@ class Orchestrator:
             except RuntimeError as exc:
                 return str(exc)
 
-        if not self._git_branch_exists(repo_root, source_branch):
-            return f"Task branch '{source_branch}' is missing"
-        if not self._git_branch_exists(repo_root, target_branch):
-            return f"Merge target branch '{target_branch}' is missing"
+        task_id = int(task["id"])
+        attempt_number = max(1, self._as_int(task.get("attempts")) or 0)
+        source_sha_before = self._git_ref(repo_root, source_branch)
+        target_sha_before = self._git_ref(repo_root, target_branch)
+        merge_attempt_id = self.store.create_task_merge_attempt(
+            task_id=task_id,
+            attempt_number=attempt_number,
+            status="running",
+            source_branch=source_branch,
+            target_branch=target_branch,
+            source_sha_before=source_sha_before,
+            target_sha_before=target_sha_before,
+        )
+
+        if source_sha_before is None:
+            error = f"Task branch '{source_branch}' is missing"
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="failed",
+                target_sha_after=target_sha_before,
+                error_detail=error,
+            )
+            return error
+        if target_sha_before is None:
+            error = f"Merge target branch '{target_branch}' is missing"
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="failed",
+                source_sha_after=source_sha_before,
+                error_detail=error,
+            )
+            return error
 
         if self._git_is_ancestor(repo_root, source_branch, target_branch):
+            message = f"Task branch {source_branch} already merged into {target_branch}"
             self.store.log_event(
                 "task_merge_skipped",
-                f"Task branch {source_branch} already merged into {target_branch}",
-                task_id=int(task["id"]),
+                message,
+                task_id=task_id,
+            )
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="skipped",
+                source_sha_after=source_sha_before,
+                target_sha_after=target_sha_before,
+                error_detail=message,
             )
             return None
 
@@ -726,14 +795,26 @@ class Orchestrator:
             repo_root=repo_root,
             source_branch=source_branch,
             target_branch=target_branch,
-            task_id=int(task["id"]),
+            task_id=task_id,
         )
-        if rebase_error:
-            return rebase_error
+        source_sha_after = rebase_error.source_sha_after
+        if source_sha_after is None:
+            source_sha_after = self._git_ref(repo_root, source_branch)
+        if rebase_error.error:
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="failed",
+                source_sha_after=source_sha_after,
+                target_sha_after=target_sha_before,
+                conflict_type=rebase_error.conflict_type,
+                conflict_files=list(rebase_error.conflict_files),
+                error_detail=rebase_error.error,
+            )
+            return rebase_error.error
 
         merge_root = self.runtime_root / MERGE_WORKTREE_DIR
         merge_root.mkdir(parents=True, exist_ok=True)
-        merge_worktree = merge_root / f"task-{task['id']}"
+        merge_worktree = merge_root / f"task-{task_id}"
         if merge_worktree.exists():
             subprocess.run(
                 ["git", "worktree", "remove", "--force", str(merge_worktree)],
@@ -749,12 +830,27 @@ class Orchestrator:
         )
         if add_result.returncode != 0:
             detail = add_result.stderr.strip() or add_result.stdout.strip() or "unknown git error"
-            return f"Failed to prepare merge worktree: {detail}"
+            error = f"Failed to prepare merge worktree: {detail}"
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="failed",
+                source_sha_after=source_sha_after,
+                target_sha_after=target_sha_before,
+                error_detail=error,
+            )
+            return error
 
         try:
             target_before = self._git_ref(repo_root, target_branch)
             if target_before is None:
-                return f"Merge target branch '{target_branch}' is missing"
+                error = f"Merge target branch '{target_branch}' is missing"
+                self._finalize_merge_attempt(
+                    merge_attempt_id,
+                    status="failed",
+                    source_sha_after=source_sha_after,
+                    error_detail=error,
+                )
+                return error
 
             merge_env = dict(os.environ)
             merge_env.setdefault("GIT_AUTHOR_NAME", "Yeehaw")
@@ -778,9 +874,13 @@ class Orchestrator:
                     env=merge_env,
                 )
             if merge_result.returncode != 0:
+                detail = self._git_command_error(merge_result, fallback="unknown merge error")
+                conflict_type = self._classify_conflict(detail)
+                conflict_files = self._git_conflicted_files(merge_worktree)
                 conflict_detail = self._format_conflict_detail(
-                    worktree_path=merge_worktree,
-                    detail=self._git_command_error(merge_result, fallback="unknown merge error"),
+                    detail=detail,
+                    conflict_type=conflict_type,
+                    files=conflict_files,
                 )
                 subprocess.run(
                     ["git", "merge", "--abort"],
@@ -788,10 +888,20 @@ class Orchestrator:
                     capture_output=True,
                     text=True,
                 )
-                return (
+                error = (
                     f"Failed to merge {source_branch} into {target_branch}: {conflict_detail}. "
                     "Task will be retried against latest integration branch."
                 )
+                self._finalize_merge_attempt(
+                    merge_attempt_id,
+                    status="failed",
+                    source_sha_after=source_sha_after,
+                    target_sha_after=target_before,
+                    conflict_type=conflict_type,
+                    conflict_files=conflict_files,
+                    error_detail=error,
+                )
+                return error
 
             merged_head = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -815,12 +925,26 @@ class Orchestrator:
             )
             if update.returncode != 0:
                 detail = update.stderr.strip() or update.stdout.strip() or "unknown update-ref error"
-                return f"Failed to update integration branch '{target_branch}': {detail}"
+                error = f"Failed to update integration branch '{target_branch}': {detail}"
+                self._finalize_merge_attempt(
+                    merge_attempt_id,
+                    status="failed",
+                    source_sha_after=source_sha_after,
+                    target_sha_after=target_before,
+                    error_detail=error,
+                )
+                return error
 
             self.store.log_event(
                 "task_merged",
                 f"Merged {source_branch} into {target_branch}",
-                task_id=int(task["id"]),
+                task_id=task_id,
+            )
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="succeeded",
+                source_sha_after=source_sha_after,
+                target_sha_after=merged_head,
             )
             return None
         finally:
@@ -844,11 +968,14 @@ class Orchestrator:
         source_branch: str,
         target_branch: str,
         task_id: int,
-    ) -> str | None:
+    ) -> RebaseResult:
         """Rebase source branch onto target branch before merge."""
         source_before = self._git_ref(repo_root, source_branch)
         if source_before is None:
-            return f"Task branch '{source_branch}' is missing"
+            return RebaseResult(
+                error=f"Task branch '{source_branch}' is missing",
+                source_sha_after=None,
+            )
 
         rebase_root = self.runtime_root / REBASE_WORKTREE_DIR
         rebase_root.mkdir(parents=True, exist_ok=True)
@@ -869,7 +996,10 @@ class Orchestrator:
         )
         if add_result.returncode != 0:
             detail = self._git_command_error(add_result, fallback="unknown git error")
-            return f"Failed to prepare rebase worktree: {detail}"
+            return RebaseResult(
+                error=f"Failed to prepare rebase worktree: {detail}",
+                source_sha_after=source_before,
+            )
 
         try:
             rebase_result = subprocess.run(
@@ -879,9 +1009,13 @@ class Orchestrator:
                 text=True,
             )
             if rebase_result.returncode != 0:
+                detail = self._git_command_error(rebase_result, fallback="unknown rebase error")
+                conflict_type = self._classify_conflict(detail)
+                conflict_files = self._git_conflicted_files(rebase_worktree)
                 conflict_detail = self._format_conflict_detail(
-                    worktree_path=rebase_worktree,
-                    detail=self._git_command_error(rebase_result, fallback="unknown rebase error"),
+                    detail=detail,
+                    conflict_type=conflict_type,
+                    files=conflict_files,
                 )
                 subprocess.run(
                     ["git", "rebase", "--abort"],
@@ -889,9 +1023,14 @@ class Orchestrator:
                     capture_output=True,
                     text=True,
                 )
-                return (
-                    f"Failed to rebase {source_branch} onto {target_branch}: {conflict_detail}. "
-                    "Task will be retried against latest integration branch."
+                return RebaseResult(
+                    error=(
+                        f"Failed to rebase {source_branch} onto {target_branch}: {conflict_detail}. "
+                        "Task will be retried against latest integration branch."
+                    ),
+                    source_sha_after=source_before,
+                    conflict_type=conflict_type,
+                    conflict_files=tuple(conflict_files),
                 )
 
             rebased_head = subprocess.run(
@@ -910,14 +1049,20 @@ class Orchestrator:
             )
             if update.returncode != 0:
                 detail = self._git_command_error(update, fallback="unknown update-ref error")
-                return f"Failed to update rebased task branch '{source_branch}': {detail}"
+                return RebaseResult(
+                    error=f"Failed to update rebased task branch '{source_branch}': {detail}",
+                    source_sha_after=source_before,
+                )
 
             self.store.log_event(
                 "task_rebased",
                 f"Rebased {source_branch} onto {target_branch}",
                 task_id=task_id,
             )
-            return None
+            return RebaseResult(
+                error=None,
+                source_sha_after=rebased_head,
+            )
         finally:
             subprocess.run(
                 ["git", "worktree", "remove", "--force", str(rebase_worktree)],
@@ -972,10 +1117,14 @@ class Orchestrator:
             return "content_conflict"
         return "unknown_conflict"
 
-    def _format_conflict_detail(self, worktree_path: Path, detail: str) -> str:
+    def _format_conflict_detail(
+        self,
+        *,
+        detail: str,
+        conflict_type: str,
+        files: list[str],
+    ) -> str:
         """Format conflict classification and file list for retry guidance."""
-        conflict_type = self._classify_conflict(detail)
-        files = self._git_conflicted_files(worktree_path)
         if not files:
             return f"{conflict_type}; {detail}"
         preview = ", ".join(files[:5])

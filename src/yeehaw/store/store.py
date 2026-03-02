@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -33,6 +34,28 @@ class Store:
         if row is None:
             return None
         return dict(row)
+
+    @staticmethod
+    def _decode_conflict_files(raw: Any) -> list[str]:
+        if not isinstance(raw, str) or not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed if isinstance(item, str)]
+
+    def _task_merge_attempt_row_to_dict(
+        self,
+        row: sqlite3.Row | None,
+    ) -> dict[str, Any] | None:
+        record = self._row_to_dict(row)
+        if record is None:
+            return None
+        record["conflict_files"] = self._decode_conflict_files(record.get("conflict_files"))
+        return record
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -632,6 +655,116 @@ class Store:
         params.append(limit)
         rows = self._conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def create_task_merge_attempt(
+        self,
+        *,
+        task_id: int,
+        attempt_number: int,
+        status: str,
+        source_branch: str,
+        target_branch: str,
+        source_sha_before: str | None = None,
+        target_sha_before: str | None = None,
+    ) -> int:
+        """Insert one rebase/merge attempt row and return id."""
+        if attempt_number < 1:
+            raise ValueError("attempt_number must be >= 1")
+        cur = self._conn.execute(
+            """
+            INSERT INTO task_merge_attempts (
+                task_id,
+                attempt_number,
+                status,
+                source_branch,
+                target_branch,
+                source_sha_before,
+                target_sha_before,
+                started_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                attempt_number,
+                status,
+                source_branch,
+                target_branch,
+                source_sha_before,
+                target_sha_before,
+                self._now(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def update_task_merge_attempt(
+        self,
+        merge_attempt_id: int,
+        *,
+        status: str,
+        source_sha_after: str | None = None,
+        target_sha_after: str | None = None,
+        conflict_type: str | None = None,
+        conflict_files: list[str] | None = None,
+        error_detail: str | None = None,
+    ) -> None:
+        """Update terminal state and metadata for one merge attempt row."""
+        conflict_files_json: str | None = None
+        if conflict_files is not None:
+            conflict_files_json = json.dumps(conflict_files)
+        self._conn.execute(
+            """
+            UPDATE task_merge_attempts
+            SET status = ?,
+                source_sha_after = ?,
+                target_sha_after = ?,
+                conflict_type = ?,
+                conflict_files = ?,
+                error_detail = ?,
+                completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                source_sha_after,
+                target_sha_after,
+                conflict_type,
+                conflict_files_json,
+                error_detail,
+                self._now(),
+                merge_attempt_id,
+            ),
+        )
+        self._conn.commit()
+
+    def get_task_merge_attempt(self, merge_attempt_id: int) -> dict[str, Any] | None:
+        """Return one merge attempt by id."""
+        row = self._conn.execute(
+            "SELECT * FROM task_merge_attempts WHERE id = ?",
+            (merge_attempt_id,),
+        ).fetchone()
+        return self._task_merge_attempt_row_to_dict(row)
+
+    def list_task_merge_attempts(
+        self,
+        *,
+        task_id: int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List merge attempts for a task, newest first."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = self._conn.execute(
+            "SELECT * FROM task_merge_attempts WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            (task_id, limit),
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._task_merge_attempt_row_to_dict(row)
+            if record is not None:
+                records.append(record)
+        return records
 
     def create_alert(
         self,

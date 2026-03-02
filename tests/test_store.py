@@ -415,3 +415,74 @@ def test_hook_run_persistence_and_filters(store: Store) -> None:
     assert failure_runs[0]["duration_ms"] == 44
     assert failure_runs[0]["summary"] == "merge conflict"
     assert failure_runs[0]["returncode"] == 1
+
+
+def test_task_merge_attempt_persistence_and_retrieval(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    failed_id = store.create_task_merge_attempt(
+        task_id=task_id,
+        attempt_number=1,
+        status="running",
+        source_branch="yeehaw/task-1.1-build",
+        target_branch="yeehaw/roadmap-1",
+        source_sha_before="1111aaaa",
+        target_sha_before="2222bbbb",
+    )
+    store.update_task_merge_attempt(
+        failed_id,
+        status="failed",
+        source_sha_after="1111aaaa",
+        target_sha_after="2222bbbb",
+        conflict_type="content_conflict",
+        conflict_files=["conflict.txt", "src/main.py"],
+        error_detail="Failed to rebase due to content conflict",
+    )
+
+    succeeded_id = store.create_task_merge_attempt(
+        task_id=task_id,
+        attempt_number=2,
+        status="running",
+        source_branch="yeehaw/task-1.1-build",
+        target_branch="yeehaw/roadmap-1",
+        source_sha_before="3333cccc",
+        target_sha_before="4444dddd",
+    )
+    store.update_task_merge_attempt(
+        succeeded_id,
+        status="succeeded",
+        source_sha_after="5555eeee",
+        target_sha_after="6666ffff",
+    )
+
+    failed = store.get_task_merge_attempt(failed_id)
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["conflict_type"] == "content_conflict"
+    assert failed["conflict_files"] == ["conflict.txt", "src/main.py"]
+    assert failed["error_detail"] == "Failed to rebase due to content conflict"
+    assert failed["completed_at"] is not None
+
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=10)
+    assert [row["id"] for row in attempts] == [succeeded_id, failed_id]
+    assert attempts[0]["status"] == "succeeded"
+    assert attempts[0]["conflict_files"] == []
+    assert attempts[1]["status"] == "failed"
+    assert attempts[1]["conflict_files"] == ["conflict.txt", "src/main.py"]
+
+
+def test_task_merge_attempt_input_validation(store: Store) -> None:
+    with pytest.raises(ValueError, match="attempt_number must be >= 1"):
+        store.create_task_merge_attempt(
+            task_id=123,
+            attempt_number=0,
+            status="running",
+            source_branch="source",
+            target_branch="target",
+        )
+
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        store.list_task_merge_attempts(task_id=123, limit=0)

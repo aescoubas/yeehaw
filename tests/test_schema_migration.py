@@ -317,12 +317,16 @@ def test_existing_modern_db_migrates_tasks_to_support_paused(tmp_path: Path) -> 
     task_file_targets = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_file_targets'"
     ).fetchone()
+    task_merge_attempts = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_merge_attempts'"
+    ).fetchone()
     conn.close()
     assert row is not None
     assert "'paused'" in str(row[0] or "")
     assert "integration_branch" in roadmap_cols
     assert task_dependencies is not None
     assert task_file_targets is not None
+    assert task_merge_attempts is not None
 
 
 def test_scheduler_default_per_project_is_bumped_from_3_to_5(tmp_path: Path) -> None:

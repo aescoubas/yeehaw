@@ -1153,6 +1153,19 @@ def test_merge_done_task_branch_rebases_then_merges(orchestrator_store: tuple[St
     assert "task_rebased" in kinds
     assert "task_merged" in kinds
 
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "succeeded"
+    assert attempts[0]["attempt_number"] == 1
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    assert attempts[0]["source_sha_before"] is not None
+    assert attempts[0]["source_sha_after"] is not None
+    assert attempts[0]["target_sha_before"] is not None
+    assert attempts[0]["target_sha_after"] is not None
+    assert attempts[0]["conflict_type"] is None
+    assert attempts[0]["conflict_files"] == []
+
 
 def test_merge_done_task_branch_reports_rebase_conflict(orchestrator_store: tuple[Store, Path]) -> None:
     store, repo_root = orchestrator_store
@@ -1215,3 +1228,13 @@ def test_merge_done_task_branch_reports_rebase_conflict(orchestrator_store: tupl
     assert "Failed to rebase" in error
     assert "content_conflict" in error
     assert "conflict.txt" in error
+
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["attempt_number"] == 1
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    assert attempts[0]["conflict_type"] == "content_conflict"
+    assert attempts[0]["conflict_files"] == ["conflict.txt"]
+    assert "Failed to rebase" in str(attempts[0]["error_detail"] or "")
