@@ -83,6 +83,45 @@ def _hook_definition_for_events(
     )
 
 
+class _RecordingNotificationDispatcher:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.closed = False
+
+    def dispatch(self, event_name: str, payload: dict[str, Any]) -> tuple[object, ...]:
+        self.events.append((event_name, dict(payload)))
+        return ()
+
+    def close(self, *, wait: bool = True) -> None:
+        _ = wait
+        self.closed = True
+
+
+def _enable_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+    dispatcher: _RecordingNotificationDispatcher,
+) -> None:
+    monkeypatch.setattr(
+        engine,
+        "load_feature_flags",
+        lambda _config_path=None: SimpleNamespace(
+            notifications=True,
+            pr_automation=False,
+            memory_packs=False,
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "load_notification_config",
+        lambda _config_path: object(),
+    )
+    monkeypatch.setattr(
+        engine,
+        "NotificationDispatcher",
+        lambda _config: dispatcher,
+    )
+
+
 def test_dispatch_queued_launches_task(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -1223,6 +1262,250 @@ def test_process_signal_failed_exhausted_retries_queues_reconcile_task(
     alerts = store.list_alerts()
     assert len(alerts) == 1
     assert "queued reconcile task" in alerts[0]["message"]
+
+
+def test_notifications_disabled_does_not_initialize_dispatcher(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+
+    monkeypatch.setattr(
+        engine,
+        "NotificationDispatcher",
+        lambda _config: (_ for _ in ()).throw(AssertionError("dispatcher should not initialize")),
+    )
+
+    orchestrator = Orchestrator(store, repo_root)
+    assert orchestrator._notification_dispatcher is None
+
+
+def test_process_signal_blocked_emits_task_blocked_notification(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(
+        json.dumps(
+            {
+                "task_id": ids["task_id"],
+                "status": "blocked",
+                "summary": "Waiting for API credentials",
+            }
+        )
+    )
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    recorder = _RecordingNotificationDispatcher()
+    _enable_notifications(monkeypatch, recorder)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._process_signal_file(signal_file)
+
+    blocked_payloads = [
+        payload
+        for event_name, payload in recorder.events
+        if event_name == engine.NOTIFICATION_EVENT_TASK_BLOCKED
+    ]
+    assert len(blocked_payloads) == 1
+    payload = blocked_payloads[0]
+    assert payload["project_id"] == ids["project_id"]
+    assert payload["roadmap_id"] == ids["roadmap_id"]
+    assert payload["phase_id"] == ids["phase_id"]
+    assert payload["task_id"] == ids["task_id"]
+    assert payload["task_number"] == "1.1"
+    assert payload["task_status"] == "blocked"
+    assert payload["reason"] == "Waiting for API credentials"
+
+
+def test_process_signal_failed_exhausted_retries_emits_retry_exhausted_notification(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    store._conn.execute(
+        "UPDATE tasks SET attempts = 1, max_attempts = 1 WHERE id = ?",
+        (ids["task_id"],),
+    )
+    store._conn.commit()
+
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(
+        json.dumps(
+            {
+                "task_id": ids["task_id"],
+                "status": "failed",
+                "summary": "build failed",
+            }
+        ),
+    )
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    recorder = _RecordingNotificationDispatcher()
+    _enable_notifications(monkeypatch, recorder)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._process_signal_file(signal_file)
+
+    exhausted_payloads = [
+        payload
+        for event_name, payload in recorder.events
+        if event_name == engine.NOTIFICATION_EVENT_TASK_RETRIES_EXHAUSTED
+    ]
+    assert len(exhausted_payloads) == 1
+    payload = exhausted_payloads[0]
+    assert payload["project_id"] == ids["project_id"]
+    assert payload["roadmap_id"] == ids["roadmap_id"]
+    assert payload["phase_id"] == ids["phase_id"]
+    assert payload["task_id"] == ids["task_id"]
+    assert payload["attempts_used"] == 1
+    assert payload["max_attempts"] == 1
+    assert payload["reason"] == f"Task {ids['task_id']} exhausted 1 retries"
+
+
+def test_check_phase_completion_emits_phase_and_roadmap_notifications(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+    store.complete_task(ids["task_id"], "done")
+
+    recorder = _RecordingNotificationDispatcher()
+    _enable_notifications(monkeypatch, recorder)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._check_phase_completion(ids["phase_id"])
+
+    event_names = [event_name for event_name, _payload in recorder.events]
+    assert event_names == [
+        engine.NOTIFICATION_EVENT_PHASE_COMPLETED,
+        engine.NOTIFICATION_EVENT_ROADMAP_COMPLETED,
+    ]
+
+    phase_payload = recorder.events[0][1]
+    assert phase_payload["project_id"] == ids["project_id"]
+    assert phase_payload["task_id"] == ids["task_id"]
+    assert phase_payload["phase_id"] == ids["phase_id"]
+    assert phase_payload["roadmap_id"] == ids["roadmap_id"]
+    assert phase_payload["reason"] == "Phase 1 completed"
+
+    roadmap_payload = recorder.events[1][1]
+    assert roadmap_payload["project_id"] == ids["project_id"]
+    assert roadmap_payload["task_id"] == ids["task_id"]
+    assert roadmap_payload["phase_id"] == ids["phase_id"]
+    assert roadmap_payload["roadmap_id"] == ids["roadmap_id"]
+    assert roadmap_payload["reason"] == f"Roadmap {ids['roadmap_id']} completed"
+    assert roadmap_payload["roadmap_status"] == "completed"
+
+
+def test_handle_crash_emits_daemon_failure_notification(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+    store.assign_task(
+        ids["task_id"],
+        agent="codex",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    recorder = _RecordingNotificationDispatcher()
+    _enable_notifications(monkeypatch, recorder)
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._handle_crash(task)
+
+    daemon_payloads = [
+        payload
+        for event_name, payload in recorder.events
+        if event_name == engine.NOTIFICATION_EVENT_DAEMON_FAILURE
+    ]
+    assert len(daemon_payloads) == 1
+    payload = daemon_payloads[0]
+    assert payload["project_id"] == ids["project_id"]
+    assert payload["task_id"] == ids["task_id"]
+    assert payload["failure_kind"] == "session_lost"
+    assert payload["reason"].startswith("Tmux session lost")
+
+
+def test_run_exception_emits_daemon_failure_notification(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+    recorder = _RecordingNotificationDispatcher()
+    _enable_notifications(monkeypatch, recorder)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_write_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(orchestrator, "_remove_pid_file", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "start", lambda: None)
+    monkeypatch.setattr(orchestrator.signal_watcher, "stop", lambda: None)
+    monkeypatch.setattr(orchestrator, "_tick", lambda _project_id: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        orchestrator.run(project_id=ids["project_id"])
+
+    daemon_payloads = [
+        payload
+        for event_name, payload in recorder.events
+        if event_name == engine.NOTIFICATION_EVENT_DAEMON_FAILURE
+    ]
+    assert len(daemon_payloads) == 1
+    payload = daemon_payloads[0]
+    assert payload["project_id"] == ids["project_id"]
+    assert payload["task_id"] is None
+    assert payload["failure_kind"] == "orchestrator_exception"
+    assert "Orchestrator daemon failed: boom" == payload["reason"]
+    assert recorder.closed is True
 
 
 def test_check_phase_completion_queues_next_phase(

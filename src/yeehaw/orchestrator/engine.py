@@ -21,6 +21,7 @@ from yeehaw.config.loader import load_feature_flags
 from yeehaw.context.loader import load_project_memory_pack
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.hooks import HookDefinition, HookRequest, HookRunResult, load_hooks, run_hooks
+from yeehaw.notify import NotificationDispatcher, load_notification_config
 from yeehaw.policy.checks import (
     collect_builtin_policy_input,
     evaluate_builtin_policy_checks,
@@ -50,6 +51,15 @@ INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
 MERGE_WORKTREE_DIR = "merge-worktrees"
 REBASE_WORKTREE_DIR = "rebase-worktrees"
 HOOK_SCHEMA_VERSION = 1
+NOTIFICATIONS_CONFIG_DIR = "config"
+NOTIFICATIONS_RUNTIME_CONFIG = "runtime.json"
+NOTIFICATIONS_SINK_CONFIG = "notifications.json"
+
+NOTIFICATION_EVENT_TASK_BLOCKED = "task_blocked"
+NOTIFICATION_EVENT_TASK_RETRIES_EXHAUSTED = "task_retries_exhausted"
+NOTIFICATION_EVENT_PHASE_COMPLETED = "phase_completed"
+NOTIFICATION_EVENT_ROADMAP_COMPLETED = "roadmap_completed"
+NOTIFICATION_EVENT_DAEMON_FAILURE = "daemon_failure"
 TOKEN_SCAN_WINDOW_LINES = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 GITHUB_OWNER_ENV = "YEEHAW_GITHUB_OWNER"
@@ -116,6 +126,7 @@ class Orchestrator:
         self._stop_event = threading.Event()
         self._poll_counter = 0
         self._hooks_by_event = self._load_hooks_by_event()
+        self._notification_dispatcher = self._load_notification_dispatcher()
 
     def run(self, project_id: int | None = None) -> None:
         """Start orchestrator loop until stopped."""
@@ -133,8 +144,23 @@ class Orchestrator:
                     break
                 if self._stop_event.wait(self.config["tick_interval_sec"]):
                     break
+        except Exception as exc:
+            failure_reason = f"Orchestrator daemon failed: {exc}"
+            self.store.log_event("orchestrator_failure", failure_reason, project_id=project_id)
+            self.store.create_alert("error", failure_reason, project_id=project_id)
+            self._emit_notification(
+                NOTIFICATION_EVENT_DAEMON_FAILURE,
+                self._notification_payload(
+                    project_id=project_id,
+                    reason=failure_reason,
+                    extra={"failure_kind": "orchestrator_exception"},
+                ),
+            )
+            raise
         finally:
             self.signal_watcher.stop()
+            if self._notification_dispatcher is not None:
+                self._notification_dispatcher.close(wait=True)
             self._remove_pid_file()
             self.store.log_event("orchestrator_stop", "Orchestrator stopped")
 
@@ -262,11 +288,21 @@ class Orchestrator:
             self._maybe_retry(task, failure_reason=failure_reason)
 
         elif data["status"] == "blocked":
+            blocked_reason = str(data.get("summary", "Unknown blocker"))
             self.store.complete_task(task["id"], "blocked")
             self.store.create_alert(
                 "warn",
-                f"Task {task['id']} blocked: {data.get('summary', '')}",
+                f"Task {task['id']} blocked: {blocked_reason}",
                 task_id=task["id"],
+            )
+            blocked_task = self.store.get_task(int(task["id"])) or task
+            self._emit_notification(
+                NOTIFICATION_EVENT_TASK_BLOCKED,
+                self._notification_payload(
+                    task=blocked_task,
+                    reason=blocked_reason,
+                    extra={"signal_status": "blocked"},
+                ),
             )
 
         kill_session(session)
@@ -430,6 +466,113 @@ class Orchestrator:
             event_name: tuple(subscribers)
             for event_name, subscribers in grouped.items()
         }
+
+    def _load_notification_dispatcher(self) -> NotificationDispatcher | None:
+        """Initialize optional notification dispatcher when feature flag is enabled."""
+        config_dir = self.runtime_root / NOTIFICATIONS_CONFIG_DIR
+        runtime_config = config_dir / NOTIFICATIONS_RUNTIME_CONFIG
+        sink_config = config_dir / NOTIFICATIONS_SINK_CONFIG
+
+        try:
+            flags = load_feature_flags(runtime_config)
+        except ValueError as exc:
+            message = f"Failed to load notification feature flags: {exc}"
+            self.store.log_event("notification_configuration_error", message)
+            self.store.create_alert("warn", message)
+            return None
+
+        if not flags.notifications:
+            return None
+
+        try:
+            notification_config = load_notification_config(sink_config)
+            return NotificationDispatcher(notification_config)
+        except ValueError as exc:
+            message = f"Failed to load notification config: {exc}"
+            self.store.log_event("notification_configuration_error", message)
+            self.store.create_alert("warn", message)
+            return None
+        except Exception as exc:
+            message = f"Failed to initialize notification dispatcher: {exc}"
+            self.store.log_event("notification_configuration_error", message)
+            self.store.create_alert("warn", message)
+            return None
+
+    def _emit_notification(self, event_name: str, payload: dict[str, Any]) -> None:
+        """Dispatch one notification event; failures are logged and ignored."""
+        dispatcher = self._notification_dispatcher
+        if dispatcher is None:
+            return
+
+        project_id = self._as_int(payload.get("project_id"))
+        task_id = self._as_int(payload.get("task_id"))
+        try:
+            dispatcher.dispatch(event_name, payload)
+        except Exception as exc:
+            message = f"Failed to dispatch notification '{event_name}': {exc}"
+            self.store.log_event(
+                "notification_dispatch_failed",
+                message,
+                project_id=project_id,
+                task_id=task_id,
+            )
+            self.store.create_alert(
+                "warn",
+                message,
+                project_id=project_id,
+                task_id=task_id,
+            )
+
+    def _notification_payload(
+        self,
+        *,
+        reason: str,
+        task: dict[str, Any] | None = None,
+        project_id: int | None = None,
+        roadmap_id: int | None = None,
+        phase_id: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build normalized notification payload with stable identifiers."""
+        resolved_project_id = project_id
+        resolved_roadmap_id = roadmap_id
+        resolved_phase_id = phase_id
+        resolved_task_id: int | None = None
+        project_name: str | None = None
+        task_number: str | None = None
+        task_status: str | None = None
+
+        if task is not None:
+            if resolved_project_id is None:
+                resolved_project_id = self._as_int(task.get("project_id"))
+            if resolved_roadmap_id is None:
+                resolved_roadmap_id = self._as_int(task.get("roadmap_id"))
+            if resolved_phase_id is None:
+                resolved_phase_id = self._as_int(task.get("phase_id"))
+            resolved_task_id = self._as_int(task.get("id"))
+            raw_project_name = task.get("project_name")
+            if isinstance(raw_project_name, str) and raw_project_name:
+                project_name = raw_project_name
+            raw_task_number = task.get("task_number")
+            if isinstance(raw_task_number, str) and raw_task_number:
+                task_number = raw_task_number
+            raw_task_status = task.get("status")
+            if isinstance(raw_task_status, str) and raw_task_status:
+                task_status = raw_task_status
+
+        payload: dict[str, Any] = {
+            "project_id": resolved_project_id,
+            "project_name": project_name,
+            "roadmap_id": resolved_roadmap_id,
+            "phase_id": resolved_phase_id,
+            "task_id": resolved_task_id,
+            "task_number": task_number,
+            "task_status": task_status,
+            "reason": reason,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
 
     def _emit_hook_event(
         self,
@@ -856,6 +999,14 @@ class Orchestrator:
         failed_task = self.store.get_task(int(task["id"])) or task
         self._emit_on_fail(failed_task, reason=failure_msg, stage="timeout")
         self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
+        self._emit_notification(
+            NOTIFICATION_EVENT_DAEMON_FAILURE,
+            self._notification_payload(
+                task=failed_task,
+                reason=failure_msg,
+                extra={"failure_kind": "task_timeout"},
+            ),
+        )
         self._maybe_retry(task, failure_reason=failure_msg)
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
@@ -946,6 +1097,14 @@ class Orchestrator:
         failed_task = self.store.get_task(int(task["id"])) or task
         self._emit_on_fail(failed_task, reason=failure_msg, stage="session_lost")
         self.store.log_event("session_lost", failure_msg, task_id=task["id"])
+        self._emit_notification(
+            NOTIFICATION_EVENT_DAEMON_FAILURE,
+            self._notification_payload(
+                task=failed_task,
+                reason=failure_msg,
+                extra={"failure_kind": "session_lost"},
+            ),
+        )
         self._maybe_retry(task, failure_reason=failure_msg)
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
@@ -964,10 +1123,24 @@ class Orchestrator:
             )
             return
 
+        exhausted_task = self.store.get_task(task_id) or task
+        exhausted_reason = f"Task {task_id} exhausted {max_attempts} retries"
+        self._emit_notification(
+            NOTIFICATION_EVENT_TASK_RETRIES_EXHAUSTED,
+            self._notification_payload(
+                task=exhausted_task,
+                reason=exhausted_reason,
+                extra={
+                    "attempts_used": attempts,
+                    "max_attempts": max_attempts,
+                },
+            ),
+        )
+
         if self._is_reconcile_task(task):
             self.store.create_alert(
                 "error",
-                f"Task {task_id} exhausted {max_attempts} retries",
+                exhausted_reason,
                 task_id=task_id,
             )
             return
@@ -1040,9 +1213,11 @@ class Orchestrator:
             if status == "completed":
                 completed_phase = self.store.get_phase(phase_id)
                 if completed_phase is not None:
+                    phase_task = self._phase_task_context(phase_id)
+                    phase_reason = f"Phase {completed_phase['phase_number']} completed"
                     self._emit_hook_event(
                         "on_phase_complete",
-                        task=self._phase_task_context(phase_id),
+                        task=phase_task,
                         roadmap_id=int(completed_phase["roadmap_id"]),
                         phase_id=phase_id,
                         context={
@@ -1050,6 +1225,19 @@ class Orchestrator:
                             "phase_title": str(completed_phase["title"]),
                             "status": "completed",
                         },
+                    )
+                    self._emit_notification(
+                        NOTIFICATION_EVENT_PHASE_COMPLETED,
+                        self._notification_payload(
+                            task=phase_task,
+                            roadmap_id=int(completed_phase["roadmap_id"]),
+                            phase_id=phase_id,
+                            reason=phase_reason,
+                            extra={
+                                "phase_number": int(completed_phase["phase_number"]),
+                                "phase_title": str(completed_phase["title"]),
+                            },
+                        ),
                     )
                 self._queue_next_phase(phase_id)
 
@@ -1077,12 +1265,23 @@ class Orchestrator:
                 f"Roadmap {roadmap_id} finished",
             )
             phase_context = self._phase_task_context(completed_phase_id)
+            roadmap_reason = f"Roadmap {roadmap_id} completed"
             self._emit_hook_event(
                 "on_roadmap_complete",
                 task=phase_context,
                 roadmap_id=roadmap_id,
                 phase_id=completed_phase_id,
                 context={"roadmap_id": roadmap_id},
+            )
+            self._emit_notification(
+                NOTIFICATION_EVENT_ROADMAP_COMPLETED,
+                self._notification_payload(
+                    task=phase_context,
+                    roadmap_id=roadmap_id,
+                    phase_id=completed_phase_id,
+                    reason=roadmap_reason,
+                    extra={"roadmap_status": "completed"},
+                ),
             )
 
             if not self._roadmap_auto_publish_feature_enabled():

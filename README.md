@@ -464,6 +464,29 @@ Failure/retry behavior:
 - Task is re-queued until `max_attempts` is exhausted (default `4`).
 - Exhaustion emits an alert.
 
+## Notifications
+
+Notifications are optional and off by default.
+
+- Enable feature flag: `~/.yeehaw/config/runtime.json` with `features.notifications = true`.
+- Configure sinks: `~/.yeehaw/config/notifications.json` (webhook sinks).
+
+High-value notification events emitted by the orchestrator:
+- `task_blocked`
+- `task_retries_exhausted`
+- `phase_completed`
+- `roadmap_completed`
+- `daemon_failure` (timeout, lost tmux session, or orchestrator daemon exception)
+
+Notification payloads include stable identifiers and reason fields:
+- `project_id`
+- `roadmap_id`
+- `phase_id`
+- `task_id`
+- `task_number`
+- `task_status`
+- `reason`
+
 ## Roadmap Publish Workflow
 
 Manual publish command:
