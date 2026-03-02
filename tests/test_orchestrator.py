@@ -1909,6 +1909,8 @@ def test_monitor_active_runtime_budget_breach_fails_task_with_alert(
         event["kind"] == "task_budget_exceeded" and "Runtime budget exceeded" in event["message"]
         for event in events
     )
+    assert not any(event["kind"] == "task_retry" for event in events)
+    assert len(store.list_tasks(project_id=ids["project_id"])) == 1
 
 
 def test_monitor_active_token_budget_breach_fails_task_with_alert(
@@ -1961,6 +1963,8 @@ def test_monitor_active_token_budget_breach_fails_task_with_alert(
         event["kind"] == "task_budget_exceeded" and "Token budget exceeded" in event["message"]
         for event in events
     )
+    assert not any(event["kind"] == "task_retry" for event in events)
+    assert len(store.list_tasks(project_id=ids["project_id"])) == 1
 
 
 def test_merge_done_task_branch_rebases_then_merges(orchestrator_store: tuple[Store, Path]) -> None:

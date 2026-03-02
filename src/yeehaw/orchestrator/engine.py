@@ -1108,6 +1108,7 @@ class Orchestrator:
             f"Task {task['id']} runtime budget breached. {failure_msg}",
             task_id=task["id"],
         )
+        # Budget breaches are terminal to prevent deterministic runaway retries.
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
@@ -1146,6 +1147,7 @@ class Orchestrator:
             f"Task {task['id']} token budget breached. {failure_msg}",
             task_id=task["id"],
         )
+        # Budget breaches are terminal to prevent deterministic runaway retries.
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
