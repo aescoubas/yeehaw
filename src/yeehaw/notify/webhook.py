@@ -49,7 +49,13 @@ def send_webhook(
         try:
             status_code = deliver(request)
         except Exception as exc:  # pragma: no cover - exercised via tests with custom transport
-            if attempt < attempt_limit and _is_retryable_exception(exc):
+            status_code = _http_status_code_from_exception(exc)
+            should_retry = attempt < attempt_limit and (
+                _is_retryable_http_code(status_code)
+                if status_code is not None
+                else _is_retryable_exception(exc)
+            )
+            if should_retry:
                 _sleep(backoff_delay, sleep_func)
                 backoff_delay = _next_backoff(backoff_delay, backoff_multiplier, backoff_max)
                 continue
@@ -58,6 +64,7 @@ def send_webhook(
                 sink_type=sink.sink_type,
                 event_name=event.event_name,
                 attempts=attempt,
+                status_code=status_code,
                 error=str(exc),
             )
 
@@ -146,11 +153,24 @@ def _transport_via_urllib(request: WebhookRequest) -> int:
 
 
 def _is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        # HTTPError includes a concrete status code and is classified separately.
+        return False
     return isinstance(exc, TimeoutError | OSError | urllib.error.URLError)
 
 
 def _is_retryable_http_code(status_code: int) -> bool:
     return status_code in _RETRYABLE_HTTP_CODES or 500 <= status_code <= 599
+
+
+def _http_status_code_from_exception(exc: Exception) -> int | None:
+    if not isinstance(exc, urllib.error.HTTPError):
+        return None
+
+    code = exc.code
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return code
 
 
 def _next_backoff(current_delay: float, multiplier: float, max_delay: float) -> float:

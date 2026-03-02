@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -189,6 +190,84 @@ def test_send_webhook_non_retryable_status_fails_fast() -> None:
     assert result.status_code == 400
     assert attempts["count"] == 1
     assert slept == []
+
+
+def test_send_webhook_http_error_400_fails_without_retry() -> None:
+    sink = WebhookSinkConfig(
+        name="ops",
+        url="https://notify.example.com/hooks",
+        max_attempts=4,
+        backoff_initial_sec=0.2,
+        backoff_multiplier=2.0,
+        backoff_max_sec=1.0,
+    )
+    event = NotificationEvent(event_name="task_failed", payload={"task_id": 4})
+
+    attempts = {"count": 0}
+    slept: list[float] = []
+
+    def http_400_transport(_request: WebhookRequest) -> int:
+        attempts["count"] += 1
+        raise urllib.error.HTTPError(
+            url="https://notify.example.com/hooks",
+            code=400,
+            msg="Bad Request",
+            hdrs=None,
+            fp=None,
+        )
+
+    result = send_webhook(
+        sink,
+        event,
+        transport=http_400_transport,
+        sleep_func=lambda delay: slept.append(delay),
+    )
+
+    assert result.ok is False
+    assert result.attempts == 1
+    assert result.status_code == 400
+    assert attempts["count"] == 1
+    assert slept == []
+
+
+def test_send_webhook_http_error_503_retries_by_status_code() -> None:
+    sink = WebhookSinkConfig(
+        name="ops",
+        url="https://notify.example.com/hooks",
+        max_attempts=4,
+        backoff_initial_sec=0.1,
+        backoff_multiplier=2.0,
+        backoff_max_sec=0.2,
+    )
+    event = NotificationEvent(event_name="task_done", payload={"task_id": 4})
+
+    attempts = {"count": 0}
+    slept: list[float] = []
+
+    def flaky_http_503_transport(_request: WebhookRequest) -> int:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise urllib.error.HTTPError(
+                url="https://notify.example.com/hooks",
+                code=503,
+                msg="Service Unavailable",
+                hdrs=None,
+                fp=None,
+            )
+        return 204
+
+    result = send_webhook(
+        sink,
+        event,
+        transport=flaky_http_503_transport,
+        sleep_func=lambda delay: slept.append(delay),
+    )
+
+    assert result.ok is True
+    assert result.attempts == 3
+    assert result.status_code == 204
+    assert attempts["count"] == 3
+    assert slept == [0.1, 0.2]
 
 
 def test_send_webhook_invalid_transport_status_is_failure() -> None:
