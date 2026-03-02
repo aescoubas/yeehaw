@@ -1046,6 +1046,13 @@ class Orchestrator:
             target_branch=target_branch,
         )
         if pre_merge_policy_error:
+            self._finalize_merge_attempt(
+                merge_attempt_id,
+                status="failed",
+                source_sha_after=source_sha_before,
+                target_sha_after=target_sha_before,
+                error_detail=pre_merge_policy_error,
+            )
             return pre_merge_policy_error
 
         rebase_error = self._rebase_branch_onto_target(

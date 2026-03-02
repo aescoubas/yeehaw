@@ -1082,6 +1082,14 @@ def test_process_signal_done_policy_violation_blocks_pre_merge(
     alerts = store.list_alerts()
     assert any("pre_merge" in alert["message"] for alert in alerts)
 
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    assert attempts[0]["error_detail"] == task["last_failure"]
+    assert attempts[0]["completed_at"] is not None
+
 
 def test_process_signal_failed_queues_retry(
     orchestrator_store: tuple[Store, Path],
