@@ -357,6 +357,25 @@ Failure/retry behavior:
 - Task is re-queued until `max_attempts` is exhausted (default `4`).
 - Exhaustion emits an alert.
 
+## Extension Model and Compatibility
+
+Yeehaw's extension model is intentionally optional and keeps the orchestration core
+lean. Extensions consume lifecycle hook events to add telemetry or notifications;
+they do not replace core scheduling or task-state authority.
+
+- Default behavior is unchanged when no extensions are configured.
+- Core operation does not require external services (no mandatory broker, webhook,
+  or hosted control plane).
+- Hook payload and response contracts are versioned (`schema_version`) and documented
+  in `ARCHITECTURE/12-extensions.md`.
+- Compatibility guarantees for a major schema version:
+  - existing event names are stable,
+  - required fields keep the same meaning and type,
+  - new fields/events are additive,
+  - breaking changes require a new major schema version.
+- Extension timeout/failure is fail-open and does not change task outcomes by
+  default.
+
 ## Worktrees, Branches, and Logs
 
 Per-task branch name:
