@@ -22,6 +22,7 @@ from yeehaw.context.loader import load_project_memory_pack
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.hooks import HookDefinition, HookRequest, HookRunResult, load_hooks, run_hooks
 from yeehaw.notify import NotificationDispatcher, load_notification_config
+from yeehaw.orchestrator.merge_resolver import TrivialConflictAutoResolver, TrivialConflictResolution
 from yeehaw.policy.checks import (
     collect_builtin_policy_input,
     evaluate_builtin_policy_checks,
@@ -792,6 +793,66 @@ class Orchestrator:
             self.store.create_alert("warn", message)
             return False
         return feature_flags.pr_automation
+
+    def _trivial_conflict_resolver_enabled(self) -> bool:
+        """Return True when runtime feature flag enables trivial conflict auto-resolution."""
+        config_path = self.runtime_root / "config" / "runtime.json"
+        try:
+            feature_flags = load_feature_flags(config_path)
+        except ValueError as exc:
+            message = f"Invalid runtime config; skipping trivial conflict resolver: {exc}"
+            self.store.log_event("task_conflict_auto_resolver_skipped", message)
+            self.store.create_alert("warn", message)
+            return False
+        return feature_flags.trivial_conflict_resolver
+
+    def _run_trivial_conflict_resolver(
+        self,
+        *,
+        worktree_path: Path,
+        conflict_type: str,
+        conflict_files: list[str],
+        task_id: int,
+        source_branch: str,
+        target_branch: str,
+    ) -> TrivialConflictResolution | None:
+        """Attempt optional trivial conflict auto-resolution and log one outcome event."""
+        if not self._trivial_conflict_resolver_enabled():
+            return None
+
+        outcome = TrivialConflictAutoResolver(worktree_path).resolve(
+            conflict_type=conflict_type,
+            conflict_files=conflict_files,
+        )
+        conflict_class = outcome.conflict_class or "unknown"
+        if outcome.attempted and outcome.resolved:
+            self.store.log_event(
+                "task_conflict_auto_resolver_succeeded",
+                (
+                    f"Auto-resolved {conflict_class} while rebasing "
+                    f"{source_branch} onto {target_branch}"
+                ),
+                task_id=task_id,
+            )
+        elif outcome.attempted:
+            self.store.log_event(
+                "task_conflict_auto_resolver_failed",
+                (
+                    f"Failed to auto-resolve {conflict_class} while rebasing "
+                    f"{source_branch} onto {target_branch}: {outcome.reason}"
+                ),
+                task_id=task_id,
+            )
+        else:
+            self.store.log_event(
+                "task_conflict_auto_resolver_skipped",
+                (
+                    f"Skipped trivial resolver while rebasing {source_branch} onto {target_branch}: "
+                    f"{outcome.reason}"
+                ),
+                task_id=task_id,
+            )
+        return outcome
 
     def _completed_roadmap_phase_summaries(
         self,
@@ -1676,26 +1737,55 @@ class Orchestrator:
                 detail = self._git_command_error(rebase_result, fallback="unknown rebase error")
                 conflict_type = self._classify_conflict(detail)
                 conflict_files = self._git_conflicted_files(rebase_worktree)
-                conflict_detail = self._format_conflict_detail(
-                    detail=detail,
+                resolver_outcome = self._run_trivial_conflict_resolver(
+                    worktree_path=rebase_worktree,
                     conflict_type=conflict_type,
-                    files=conflict_files,
+                    conflict_files=conflict_files,
+                    task_id=task_id,
+                    source_branch=source_branch,
+                    target_branch=target_branch,
                 )
-                subprocess.run(
-                    ["git", "rebase", "--abort"],
-                    cwd=rebase_worktree,
-                    capture_output=True,
-                    text=True,
-                )
-                return RebaseResult(
-                    error=(
-                        f"Failed to rebase {source_branch} onto {target_branch}: {conflict_detail}. "
-                        "Task will be retried against latest integration branch."
-                    ),
-                    source_sha_after=source_before,
-                    conflict_type=conflict_type,
-                    conflict_files=tuple(conflict_files),
-                )
+                if resolver_outcome is not None:
+                    if resolver_outcome.attempted and resolver_outcome.resolved:
+                        continue_env = dict(os.environ)
+                        continue_env.setdefault("GIT_EDITOR", "true")
+                        rebase_result = subprocess.run(
+                            ["git", "rebase", "--continue"],
+                            cwd=rebase_worktree,
+                            capture_output=True,
+                            text=True,
+                            env=continue_env,
+                        )
+                        if rebase_result.returncode != 0:
+                            detail = self._git_command_error(
+                                rebase_result,
+                                fallback="unknown rebase error",
+                            )
+                            conflict_type = self._classify_conflict(detail)
+                            conflict_files = self._git_conflicted_files(rebase_worktree)
+                    elif resolver_outcome.attempted:
+                        detail = f"{detail}; trivial resolver failed: {resolver_outcome.reason}"
+                if rebase_result.returncode != 0:
+                    conflict_detail = self._format_conflict_detail(
+                        detail=detail,
+                        conflict_type=conflict_type,
+                        files=conflict_files,
+                    )
+                    subprocess.run(
+                        ["git", "rebase", "--abort"],
+                        cwd=rebase_worktree,
+                        capture_output=True,
+                        text=True,
+                    )
+                    return RebaseResult(
+                        error=(
+                            f"Failed to rebase {source_branch} onto {target_branch}: {conflict_detail}. "
+                            "Task will be retried against latest integration branch."
+                        ),
+                        source_sha_after=source_before,
+                        conflict_type=conflict_type,
+                        conflict_files=tuple(conflict_files),
+                    )
 
             rebased_head = subprocess.run(
                 ["git", "rev-parse", "HEAD"],

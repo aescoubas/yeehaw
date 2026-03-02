@@ -8,6 +8,7 @@ FEATURE_FLAG_NAMES: tuple[str, ...] = (
     "hooks",
     "policies",
     "conflict_scheduler",
+    "trivial_conflict_resolver",
     "budgets",
     "notifications",
     "pr_automation",
@@ -22,6 +23,7 @@ class FeatureFlags:
     hooks: bool = False
     policies: bool = False
     conflict_scheduler: bool = False
+    trivial_conflict_resolver: bool = False
     budgets: bool = False
     notifications: bool = False
     pr_automation: bool = False

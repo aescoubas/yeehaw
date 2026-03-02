@@ -13,6 +13,7 @@ import pytest
 
 import yeehaw.orchestrator.engine as engine
 from yeehaw.orchestrator.engine import Orchestrator
+from yeehaw.orchestrator.merge_resolver import TrivialConflictResolution
 from yeehaw.store.store import Store
 
 
@@ -60,6 +61,58 @@ def _init_git_repo(repo_root: Path) -> None:
     (repo_root / "README.md").write_text("seed\n")
     subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "seed"], cwd=repo_root, check=True, capture_output=True)
+
+
+def _seed_import_order_rebase_conflict_task(store: Store, repo_root: Path) -> tuple[int, str, str]:
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    source_branch = "yeehaw/task-1.1-task-1"
+    target_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", target_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    store.set_roadmap_integration_branch(roadmap_id, target_branch)
+    store._conn.execute("UPDATE tasks SET branch_name = ? WHERE id = ?", (source_branch, task_id))
+    store._conn.commit()
+
+    subprocess.run(["git", "checkout", target_branch], cwd=repo_root, check=True, capture_output=True)
+    (repo_root / "imports.py").write_text("import os\nimport sys\nimport json\n")
+    subprocess.run(["git", "add", "imports.py"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base imports"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", "-b", source_branch], cwd=repo_root, check=True, capture_output=True)
+    (repo_root / "imports.py").write_text("import json\nimport os\nimport sys\n")
+    subprocess.run(["git", "add", "imports.py"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "task import reorder"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", target_branch], cwd=repo_root, check=True, capture_output=True)
+    (repo_root / "imports.py").write_text("import sys\nimport json\nimport os\n")
+    subprocess.run(["git", "add", "imports.py"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "integration import reorder"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(["git", "checkout", "--detach"], cwd=repo_root, check=True, capture_output=True)
+    return task_id, source_branch, target_branch
 
 
 def _write_default_policy(repo_root: Path, payload: dict[str, Any]) -> None:
@@ -2084,3 +2137,103 @@ def test_merge_done_task_branch_reports_rebase_conflict(orchestrator_store: tupl
     assert attempts[0]["conflict_type"] == "content_conflict"
     assert attempts[0]["conflict_files"] == ["conflict.txt"]
     assert "Failed to rebase" in str(attempts[0]["error_detail"] or "")
+
+
+def test_merge_done_task_branch_does_not_auto_resolve_import_order_when_feature_disabled(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+    task_id, source_branch, target_branch = _seed_import_order_rebase_conflict_task(store, repo_root)
+
+    orchestrator = Orchestrator(store, repo_root)
+    task = store.get_task(task_id)
+    assert task is not None
+
+    error = orchestrator._merge_done_task_branch(task)
+
+    assert error is not None
+    assert "Failed to rebase" in error
+    assert "imports.py" in error
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    assert attempts[0]["conflict_files"] == ["imports.py"]
+
+
+def test_merge_done_task_branch_auto_resolves_import_order_conflict_when_enabled(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+    task_id, source_branch, target_branch = _seed_import_order_rebase_conflict_task(store, repo_root)
+    runtime_config = repo_root / ".yeehaw" / "config" / "runtime.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(json.dumps({"features": {"trivial_conflict_resolver": True}}))
+
+    orchestrator = Orchestrator(store, repo_root)
+    task = store.get_task(task_id)
+    assert task is not None
+
+    error = orchestrator._merge_done_task_branch(task)
+
+    assert error is None
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "succeeded"
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    events = store.list_events(limit=20)
+    kinds = [event["kind"] for event in events]
+    assert "task_conflict_auto_resolver_succeeded" in kinds
+    assert "task_rebased" in kinds
+    assert "task_merged" in kinds
+
+
+def test_merge_done_task_branch_resolver_failure_falls_back_to_retry_error(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+    task_id, source_branch, target_branch = _seed_import_order_rebase_conflict_task(store, repo_root)
+    runtime_config = repo_root / ".yeehaw" / "config" / "runtime.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(json.dumps({"features": {"trivial_conflict_resolver": True}}))
+
+    class _FailingResolver:
+        def __init__(self, _worktree_path: Path) -> None:
+            pass
+
+        def resolve(
+            self,
+            *,
+            conflict_type: str,
+            conflict_files: list[str],
+        ) -> TrivialConflictResolution:
+            _ = conflict_type, conflict_files
+            return TrivialConflictResolution(
+                attempted=True,
+                resolved=False,
+                reason="simulated resolver failure",
+                conflict_class="import_order_only",
+            )
+
+    monkeypatch.setattr(engine, "TrivialConflictAutoResolver", _FailingResolver)
+    orchestrator = Orchestrator(store, repo_root)
+    task = store.get_task(task_id)
+    assert task is not None
+
+    error = orchestrator._merge_done_task_branch(task)
+
+    assert error is not None
+    assert "Failed to rebase" in error
+    assert "simulated resolver failure" in error
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=5)
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "failed"
+    assert attempts[0]["source_branch"] == source_branch
+    assert attempts[0]["target_branch"] == target_branch
+    assert "simulated resolver failure" in str(attempts[0]["error_detail"] or "")
