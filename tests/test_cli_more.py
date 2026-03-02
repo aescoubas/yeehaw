@@ -630,7 +630,10 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
 
     args = Namespace(project=None, as_json=True)
     cli_status.handle_status(args, db_path)
-    assert '"task_number": "1.1"' in capsys.readouterr().out
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["task_number"] == "1.1"
+    assert payload[0]["budget"]["has_budget"] is False
+    assert payload[0]["reconcile"]["state"] == "none"
 
     store = Store(db_path)
     try:
@@ -647,7 +650,9 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     assert "Branch" in out
     assert "Attempts" in out
     assert "Tokens" in out
+    assert "Budget" in out
     assert "Hold" in out
+    assert "Reconcile" in out
     assert "Merge" in out
     assert "n/a" in out
     assert "Total:" in out
@@ -886,6 +891,106 @@ def test_handle_status_shows_tokens_for_in_progress_task(
     assert "Tokens" in out
     assert "27,315" in row
     assert "1/4" in row
+
+
+def test_handle_status_budget_indicator_and_json_fields(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(
+            roadmap_id,
+            phase_id,
+            "1.1",
+            "Budgeted task",
+            "desc",
+            max_tokens=1000,
+        )
+        store.assign_task(task_id, "codex", "yeehaw/task-1.1-budget", "/tmp/w", "/tmp/s")
+    finally:
+        store.close()
+
+    logs_dir = db_path.parent / "logs" / f"task-{task_id}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "attempt-01-codex.log").write_text(
+        "progress\n"
+        "tokens used\n"
+        "900\n",
+    )
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+    assert "Budget" in out
+    row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
+    assert "warn 90% tok" in row
+
+    cli_status.handle_status(Namespace(project=None, as_json=True), db_path)
+    payload = json.loads(capsys.readouterr().out)
+    task = next(item for item in payload if item["id"] == task_id)
+    budget = task["budget"]
+    assert budget["has_budget"] is True
+    assert budget["max_tokens"] == 1000
+    assert budget["max_runtime_min"] is None
+    assert budget["tokens_used"] == 900
+    assert budget["pressure_level"] == "warn"
+    assert budget["pressure_source"] == "tokens"
+
+
+def test_handle_status_reconcile_indicator_and_json_fields(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        source_task_id = store.create_task(roadmap_id, phase_id, "1.1", "Primary task", "desc")
+        store.fail_task(source_task_id, "first failure")
+        reconcile_task_id = store.create_linked_reconcile_task(
+            failed_task_id=source_task_id,
+            failure_threshold=4,
+            observed_attempts=4,
+            failure_messages=["first failure"],
+        )
+        assert reconcile_task_id is not None
+        store.queue_task(reconcile_task_id)
+        reconcile_task = store.get_task(reconcile_task_id)
+        assert reconcile_task is not None
+        reconcile_number = str(reconcile_task["task_number"])
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+    assert "Reconcile" in out
+    source_row = next(line for line in out.splitlines() if line.startswith(f"{source_task_id:<6}"))
+    reconcile_row = next(
+        line for line in out.splitlines() if line.startswith(f"{reconcile_task_id:<6}")
+    )
+    assert f"active->{reconcile_number}:queued" in source_row
+    assert "task<-1.1" in reconcile_row
+
+    cli_status.handle_status(Namespace(project=None, as_json=True), db_path)
+    payload = json.loads(capsys.readouterr().out)
+    source_task = next(item for item in payload if item["id"] == source_task_id)
+    reconcile_task_payload = next(item for item in payload if item["id"] == reconcile_task_id)
+    assert source_task["reconcile"]["state"] == "source_active"
+    assert source_task["reconcile"]["linked_tasks"] == [
+        {
+            "task_id": reconcile_task_id,
+            "task_number": reconcile_number,
+            "status": "queued",
+        }
+    ]
+    assert reconcile_task_payload["reconcile"]["state"] == "task"
+    assert reconcile_task_payload["reconcile"]["is_reconcile_task"] is True
+    assert reconcile_task_payload["reconcile"]["source_task_id"] == source_task_id
+    assert reconcile_task_payload["reconcile"]["source_task_number"] == "1.1"
 
 
 def test_parse_tokens_used_supports_total_tokens_line() -> None:

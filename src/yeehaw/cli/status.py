@@ -5,6 +5,7 @@ from __future__ import annotations
 import json as json_module
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ TITLE_WIDTH = 35
 BRANCH_WIDTH = 8
 ATTEMPTS_WIDTH = 8
 TOKENS_WIDTH = 12
+BUDGET_WIDTH = 24
+RECONCILE_WIDTH = 24
 HOLD_WIDTH = 38
 MERGE_DIAGNOSTIC_WIDTH = 44
 BRANCH_NA = "n/a"
@@ -22,10 +25,24 @@ BRANCH_DIVERGED = "diverged"
 BRANCH_MERGED = "merged"
 MAIN_BRANCH = "main"
 TOKENS_NA = "n/a"
+BUDGET_NA = "n/a"
+BUDGET_PRESSURE_WARN_THRESHOLD = 0.8
+RECONCILE_NA = "n/a"
+RECONCILE_STATE_NONE = "none"
+RECONCILE_STATE_TASK = "task"
+RECONCILE_STATE_SOURCE_ACTIVE = "source_active"
+RECONCILE_STATE_SOURCE_CLOSED = "source_closed"
+RECONCILE_ACTIVE_STATUSES = frozenset({"queued", "in-progress", "paused"})
 MERGE_DIAGNOSTIC_NA = "n/a"
 HOLD_REASON_OVERLAP_CONFLICT = "conflict_in_progress_overlap"
 TOKEN_SCAN_WINDOW_LINES = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+RECONCILE_SOURCE_TASK_ID_RE = re.compile(
+    r"\*\*Reconcile Source Task ID:\*\*\s*([0-9]+)"
+)
+RECONCILE_SOURCE_TASK_NUMBER_RE = re.compile(
+    r"\*\*Reconcile Source Task:\*\*\s*([Pp]?[0-9]+\.[0-9]+)\b"
+)
 TOTAL_TOKEN_PATTERNS = (
     re.compile(r"\btokens?\s+used\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
     re.compile(r"\btotal\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
@@ -229,6 +246,197 @@ def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path) -> None:
         task["tokens_used"] = _resolve_tokens_used(task, db_path)
 
 
+def _parse_started_at(value: Any) -> datetime | None:
+    """Parse persisted task started_at timestamps."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _resolve_runtime_used_minutes(task: dict[str, Any]) -> float | None:
+    """Resolve elapsed runtime minutes for in-progress tasks."""
+    if task.get("status") != "in-progress":
+        return None
+    started_at = _parse_started_at(task.get("started_at"))
+    if started_at is None:
+        return None
+    elapsed = (datetime.now(timezone.utc) - started_at.astimezone(timezone.utc)).total_seconds() / 60.0
+    if elapsed < 0:
+        return 0.0
+    return elapsed
+
+
+def _resolve_budget_metadata(task: dict[str, Any]) -> dict[str, Any]:
+    """Resolve machine-readable budget pressure metadata for one task."""
+    max_tokens = task.get("max_tokens")
+    max_runtime_min = task.get("max_runtime_min")
+    normalized_max_tokens = (
+        int(max_tokens)
+        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0
+        else None
+    )
+    normalized_max_runtime_min = (
+        int(max_runtime_min)
+        if (
+            isinstance(max_runtime_min, int)
+            and not isinstance(max_runtime_min, bool)
+            and max_runtime_min > 0
+        )
+        else None
+    )
+    has_budget = normalized_max_tokens is not None or normalized_max_runtime_min is not None
+
+    tokens_used = task.get("tokens_used")
+    normalized_tokens_used = (
+        int(tokens_used)
+        if isinstance(tokens_used, int) and not isinstance(tokens_used, bool) and tokens_used >= 0
+        else None
+    )
+    runtime_used_min = _resolve_runtime_used_minutes(task)
+
+    token_ratio = (
+        normalized_tokens_used / normalized_max_tokens
+        if normalized_tokens_used is not None and normalized_max_tokens is not None
+        else None
+    )
+    runtime_ratio = (
+        runtime_used_min / normalized_max_runtime_min
+        if runtime_used_min is not None and normalized_max_runtime_min is not None
+        else None
+    )
+
+    pressure_ratio: float | None = None
+    pressure_source = "none"
+    pressure_level = "none"
+    ratio_candidates: list[tuple[str, float]] = []
+    if token_ratio is not None:
+        ratio_candidates.append(("tokens", token_ratio))
+    if runtime_ratio is not None:
+        ratio_candidates.append(("runtime", runtime_ratio))
+
+    if has_budget:
+        if not ratio_candidates:
+            pressure_level = "configured"
+        else:
+            pressure_source, pressure_ratio = max(ratio_candidates, key=lambda item: item[1])
+            if pressure_ratio >= 1.0:
+                pressure_level = "exceeded"
+            elif pressure_ratio >= BUDGET_PRESSURE_WARN_THRESHOLD:
+                pressure_level = "warn"
+            else:
+                pressure_level = "ok"
+
+    return {
+        "has_budget": has_budget,
+        "max_tokens": normalized_max_tokens,
+        "max_runtime_min": normalized_max_runtime_min,
+        "tokens_used": normalized_tokens_used,
+        "runtime_used_min": (
+            round(runtime_used_min, 2)
+            if isinstance(runtime_used_min, float)
+            else None
+        ),
+        "token_ratio": round(token_ratio, 4) if isinstance(token_ratio, float) else None,
+        "runtime_ratio": round(runtime_ratio, 4) if isinstance(runtime_ratio, float) else None,
+        "pressure_level": pressure_level,
+        "pressure_source": pressure_source,
+        "pressure_ratio": round(pressure_ratio, 4) if isinstance(pressure_ratio, float) else None,
+    }
+
+
+def _annotate_budget_metadata(tasks: list[dict[str, Any]]) -> None:
+    """Attach budget metadata for status rendering."""
+    for task in tasks:
+        task["budget"] = _resolve_budget_metadata(task)
+
+
+def _parse_reconcile_source(task: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse reconcile source metadata from auto-generated reconcile descriptions."""
+    description = task.get("description")
+    if not isinstance(description, str):
+        return None
+    if "**Reconcile Source Task ID:**" not in description:
+        return None
+
+    source_task_id: int | None = None
+    source_task_number: str | None = None
+
+    source_id_match = RECONCILE_SOURCE_TASK_ID_RE.search(description)
+    if source_id_match is not None:
+        source_task_id = int(source_id_match.group(1))
+
+    source_number_match = RECONCILE_SOURCE_TASK_NUMBER_RE.search(description)
+    if source_number_match is not None:
+        raw_number = source_number_match.group(1).strip()
+        if raw_number:
+            source_task_number = raw_number[1:] if raw_number[0] in {"P", "p"} else raw_number
+
+    return {
+        "source_task_id": source_task_id,
+        "source_task_number": source_task_number,
+    }
+
+
+def _annotate_reconcile_metadata(tasks: list[dict[str, Any]]) -> None:
+    """Attach reconcile workflow metadata for status rendering."""
+    reconcile_source_by_task_id: dict[int, dict[str, Any] | None] = {}
+    linked_reconcile_tasks: dict[int, list[dict[str, Any]]] = {}
+
+    for task in tasks:
+        task_id = int(task["id"])
+        reconcile_source = _parse_reconcile_source(task)
+        reconcile_source_by_task_id[task_id] = reconcile_source
+        if reconcile_source is None:
+            continue
+
+        source_task_id = reconcile_source.get("source_task_id")
+        if not isinstance(source_task_id, int):
+            continue
+        linked_reconcile_tasks.setdefault(source_task_id, []).append(
+            {
+                "task_id": task_id,
+                "task_number": str(task.get("task_number") or ""),
+                "status": str(task.get("status") or ""),
+            }
+        )
+
+    for source_task_id in linked_reconcile_tasks:
+        linked_reconcile_tasks[source_task_id].sort(key=lambda linked: int(linked["task_id"]))
+
+    for task in tasks:
+        task_id = int(task["id"])
+        reconcile_source = reconcile_source_by_task_id.get(task_id)
+        linked = linked_reconcile_tasks.get(task_id, [])
+        state = RECONCILE_STATE_NONE
+
+        if reconcile_source is not None:
+            state = RECONCILE_STATE_TASK
+        elif linked:
+            if any(
+                str(linked_task.get("status") or "") in RECONCILE_ACTIVE_STATUSES
+                for linked_task in linked
+            ):
+                state = RECONCILE_STATE_SOURCE_ACTIVE
+            else:
+                state = RECONCILE_STATE_SOURCE_CLOSED
+
+        task["reconcile"] = {
+            "state": state,
+            "is_reconcile_task": reconcile_source is not None,
+            "source_task_id": reconcile_source.get("source_task_id") if reconcile_source else None,
+            "source_task_number": (
+                reconcile_source.get("source_task_number") if reconcile_source else None
+            ),
+            "linked_tasks": linked,
+        }
+
+
 def _normalize_conflict_blockers(conflicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize overlap conflict rows to stable JSON-friendly metadata."""
     blockers: list[dict[str, Any]] = []
@@ -286,6 +494,80 @@ def _format_hold(task: dict[str, Any]) -> str:
     if len(blockers) > 1:
         summary += f" +{len(blockers) - 1} more"
     return summary
+
+
+def _format_budget(task: dict[str, Any]) -> str:
+    """Format budget pressure metadata for fixed-width status table rendering."""
+    budget = task.get("budget")
+    if not isinstance(budget, dict):
+        return BUDGET_NA
+
+    pressure_level = str(budget.get("pressure_level") or "none")
+    if pressure_level == "none":
+        return BUDGET_NA
+
+    if pressure_level == "configured":
+        parts: list[str] = []
+        max_tokens = budget.get("max_tokens")
+        if isinstance(max_tokens, int):
+            parts.append(f"tok<={max_tokens:,}")
+        max_runtime = budget.get("max_runtime_min")
+        if isinstance(max_runtime, int):
+            parts.append(f"run<={max_runtime}m")
+        return " ".join(parts) if parts else "set"
+
+    ratio = budget.get("pressure_ratio")
+    if not isinstance(ratio, (int, float)):
+        return pressure_level
+
+    pct = int(round(float(ratio) * 100))
+    level_display = {
+        "ok": "ok",
+        "warn": "warn",
+        "exceeded": "over",
+    }.get(pressure_level, pressure_level)
+    source_display = {
+        "tokens": "tok",
+        "runtime": "run",
+        "mixed": "mix",
+    }.get(str(budget.get("pressure_source") or ""), "")
+    if source_display:
+        return f"{level_display} {pct}% {source_display}"
+    return f"{level_display} {pct}%"
+
+
+def _format_reconcile(task: dict[str, Any]) -> str:
+    """Format reconcile metadata for fixed-width status table rendering."""
+    reconcile = task.get("reconcile")
+    if not isinstance(reconcile, dict):
+        return RECONCILE_NA
+
+    state = str(reconcile.get("state") or RECONCILE_STATE_NONE)
+    if state == RECONCILE_STATE_TASK:
+        source_task_number = reconcile.get("source_task_number")
+        if isinstance(source_task_number, str) and source_task_number:
+            return f"task<-{source_task_number}"
+        source_task_id = reconcile.get("source_task_id")
+        if isinstance(source_task_id, int):
+            return f"task<-#{source_task_id}"
+        return "task<-unknown"
+
+    linked = reconcile.get("linked_tasks")
+    if not isinstance(linked, list) or not linked:
+        return RECONCILE_NA
+
+    active_linked = [
+        linked_task
+        for linked_task in linked
+        if str(linked_task.get("status") or "") in RECONCILE_ACTIVE_STATUSES
+    ]
+    selected = active_linked if active_linked else linked
+    first = selected[0]
+    linked_number = str(first.get("task_number") or first.get("task_id") or "unknown")
+    linked_status = str(first.get("status") or "unknown")
+    label = "active->" if active_linked else "done->"
+    suffix = f"+{len(selected) - 1}" if len(selected) > 1 else ""
+    return f"{label}{linked_number}:{linked_status}{suffix}"
 
 
 def _summarize_merge_diagnostic(attempt: dict[str, Any]) -> str | None:
@@ -364,7 +646,9 @@ def handle_status(args: Any, db_path: Path) -> None:
         )
         _annotate_branch_states(tasks, db_path)
         _annotate_token_usage(tasks, db_path)
+        _annotate_budget_metadata(tasks)
         _annotate_hold_metadata(tasks, store)
+        _annotate_reconcile_metadata(tasks)
         _annotate_merge_diagnostics(tasks, store)
 
         if args.as_json:
@@ -379,7 +663,9 @@ def handle_status(args: Any, db_path: Path) -> None:
             f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} "
             f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}} "
             f"{'Attempts':<{ATTEMPTS_WIDTH}} {'Tokens':<{TOKENS_WIDTH}} "
+            f"{'Budget':<{BUDGET_WIDTH}} "
             f"{'Hold':<{HOLD_WIDTH}} "
+            f"{'Reconcile':<{RECONCILE_WIDTH}} "
             f"{'Merge':<{MERGE_DIAGNOSTIC_WIDTH}}"
         )
         print(header)
@@ -395,7 +681,9 @@ def handle_status(args: Any, db_path: Path) -> None:
                 if isinstance(tokens_used, int)
                 else TOKENS_NA
             )
+            budget_display = _truncate_for_column(_format_budget(task), BUDGET_WIDTH)
             hold_display = _truncate_for_column(_format_hold(task), HOLD_WIDTH)
+            reconcile_display = _truncate_for_column(_format_reconcile(task), RECONCILE_WIDTH)
             merge_diagnostic = task.get("merge_diagnostic")
             merge_display = (
                 _truncate_for_column(str(merge_diagnostic), MERGE_DIAGNOSTIC_WIDTH)
@@ -406,7 +694,9 @@ def handle_status(args: Any, db_path: Path) -> None:
                 f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
                 f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}} "
                 f"{attempts_display:<{ATTEMPTS_WIDTH}} {tokens_display:<{TOKENS_WIDTH}} "
+                f"{budget_display:<{BUDGET_WIDTH}} "
                 f"{hold_display:<{HOLD_WIDTH}} "
+                f"{reconcile_display:<{RECONCILE_WIDTH}} "
                 f"{merge_display:<{MERGE_DIAGNOSTIC_WIDTH}}"
             )
 

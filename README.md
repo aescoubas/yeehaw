@@ -237,14 +237,37 @@ Columns:
   - `merged`: no branch-only commits remain
 - `Attempts`: attempt counter shown as `<attempts>/<max_attempts>`.
 - `Tokens`: parsed token usage from latest in-progress log (if detectable), else `n/a`.
+- `Budget`: budget pressure indicator:
+  - `n/a`: no budget configured
+  - `tok<=...` / `run<=...`: budget configured but no live usage ratio available
+  - `ok|warn|over <pct>% tok|run`: live pressure against token/runtime budget
 - `Hold`: queued-task hold reason (for overlap conflicts, shows the blocking task and target path).
+- `Reconcile`: reconcile workflow indicator:
+  - `n/a`: no reconcile linkage
+  - `task<-<task_number>`: this row is an auto-generated reconcile task
+  - `active->...`: this source task has active linked reconcile work
+  - `done->...`: this source task has only non-active linked reconcile work
 - `Merge`: latest merge/rebase diagnostic summary (non-success states only), else `n/a`.
 
-In `--json` mode, each task includes a `hold` field:
-- `null` when no known hold metadata is present.
-- for overlap conflict holds:
-  - `reason`: `conflict_in_progress_overlap`
-  - `blocking_tasks`: list of `{task_id, task_number, title, target_paths}` blockers
+In `--json` mode, each task includes these status-augmentation fields:
+- `hold`:
+  - `null` when no known hold metadata is present.
+  - for overlap conflict holds:
+    - `reason`: `conflict_in_progress_overlap`
+    - `blocking_tasks`: list of `{task_id, task_number, title, target_paths}` blockers
+- `budget`:
+  - `has_budget`: whether token/runtime limits are configured
+  - `max_tokens`, `max_runtime_min`: configured limits (or `null`)
+  - `tokens_used`, `runtime_used_min`: observed usage snapshots when available
+  - `token_ratio`, `runtime_ratio`: observed usage ratio per budget dimension
+  - `pressure_level`: one of `none`, `configured`, `ok`, `warn`, `exceeded`
+  - `pressure_source`: one of `none`, `tokens`, `runtime`
+  - `pressure_ratio`: selected ratio used for pressure classification (or `null`)
+- `reconcile`:
+  - `state`: one of `none`, `task`, `source_active`, `source_closed`
+  - `is_reconcile_task`: true when the row is an auto-generated reconcile task
+  - `source_task_id`, `source_task_number`: parsed source task reference for reconcile tasks
+  - `linked_tasks`: reconcile task references linked to this source task (`{task_id, task_number, status}`)
 
 ### `attach`
 
