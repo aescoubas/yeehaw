@@ -17,3 +17,13 @@ def runtime_root() -> Path:
 def default_db_path() -> Path:
     """Return default SQLite database path under runtime root."""
     return runtime_root() / "yeehaw.db"
+
+
+def config_root() -> Path:
+    """Return runtime configuration directory under runtime root."""
+    return runtime_root() / "config"
+
+
+def runtime_config_path() -> Path:
+    """Return runtime configuration file path for global flags."""
+    return config_root() / "runtime.json"
