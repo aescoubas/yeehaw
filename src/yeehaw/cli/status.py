@@ -14,6 +14,7 @@ TITLE_WIDTH = 35
 BRANCH_WIDTH = 8
 ATTEMPTS_WIDTH = 8
 TOKENS_WIDTH = 12
+HOLD_WIDTH = 38
 MERGE_DIAGNOSTIC_WIDTH = 44
 BRANCH_NA = "n/a"
 BRANCH_AHEAD = "ahead"
@@ -22,6 +23,7 @@ BRANCH_MERGED = "merged"
 MAIN_BRANCH = "main"
 TOKENS_NA = "n/a"
 MERGE_DIAGNOSTIC_NA = "n/a"
+HOLD_REASON_OVERLAP_CONFLICT = "conflict_in_progress_overlap"
 TOKEN_SCAN_WINDOW_LINES = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TOTAL_TOKEN_PATTERNS = (
@@ -227,6 +229,65 @@ def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path) -> None:
         task["tokens_used"] = _resolve_tokens_used(task, db_path)
 
 
+def _normalize_conflict_blockers(conflicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize overlap conflict rows to stable JSON-friendly metadata."""
+    blockers: list[dict[str, Any]] = []
+    for conflict in conflicts:
+        blockers.append(
+            {
+                "task_id": int(conflict["task_id"]),
+                "task_number": str(conflict["task_number"]),
+                "title": str(conflict["title"]),
+                "target_paths": [str(path) for path in conflict.get("target_paths", [])],
+            }
+        )
+    return blockers
+
+
+def _resolve_hold_metadata(task: dict[str, Any], store: Store) -> dict[str, Any] | None:
+    """Resolve scheduler hold metadata for one queued task."""
+    if task.get("status") != "queued":
+        return None
+    conflicts = store.list_in_progress_overlap_conflicts(int(task["id"]))
+    if not conflicts:
+        return None
+    return {
+        "reason": HOLD_REASON_OVERLAP_CONFLICT,
+        "blocking_tasks": _normalize_conflict_blockers(conflicts),
+    }
+
+
+def _annotate_hold_metadata(tasks: list[dict[str, Any]], store: Store) -> None:
+    """Attach hold metadata for queued tasks."""
+    for task in tasks:
+        task["hold"] = _resolve_hold_metadata(task, store)
+
+
+def _format_hold(task: dict[str, Any]) -> str:
+    """Format hold metadata for fixed-width status table rendering."""
+    hold = task.get("hold")
+    if not isinstance(hold, dict):
+        return ""
+    reason = hold.get("reason")
+    if reason != HOLD_REASON_OVERLAP_CONFLICT:
+        return str(reason or "")
+    blockers = hold.get("blocking_tasks")
+    if not isinstance(blockers, list) or not blockers:
+        return "conflict with in-progress task"
+    first = blockers[0]
+    task_number = str(first.get("task_number") or "unknown")
+    target_paths = first.get("target_paths")
+    path = ""
+    if isinstance(target_paths, list) and target_paths:
+        path = str(target_paths[0])
+    summary = f"conflict with {task_number}"
+    if path:
+        summary += f" ({path})"
+    if len(blockers) > 1:
+        summary += f" +{len(blockers) - 1} more"
+    return summary
+
+
 def _summarize_merge_diagnostic(attempt: dict[str, Any]) -> str | None:
     """Render concise summary for one task merge attempt."""
     status = str(attempt.get("status") or "").strip().lower()
@@ -303,6 +364,7 @@ def handle_status(args: Any, db_path: Path) -> None:
         )
         _annotate_branch_states(tasks, db_path)
         _annotate_token_usage(tasks, db_path)
+        _annotate_hold_metadata(tasks, store)
         _annotate_merge_diagnostics(tasks, store)
 
         if args.as_json:
@@ -317,6 +379,7 @@ def handle_status(args: Any, db_path: Path) -> None:
             f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} "
             f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}} "
             f"{'Attempts':<{ATTEMPTS_WIDTH}} {'Tokens':<{TOKENS_WIDTH}} "
+            f"{'Hold':<{HOLD_WIDTH}} "
             f"{'Merge':<{MERGE_DIAGNOSTIC_WIDTH}}"
         )
         print(header)
@@ -332,6 +395,7 @@ def handle_status(args: Any, db_path: Path) -> None:
                 if isinstance(tokens_used, int)
                 else TOKENS_NA
             )
+            hold_display = _truncate_for_column(_format_hold(task), HOLD_WIDTH)
             merge_diagnostic = task.get("merge_diagnostic")
             merge_display = (
                 _truncate_for_column(str(merge_diagnostic), MERGE_DIAGNOSTIC_WIDTH)
@@ -342,6 +406,7 @@ def handle_status(args: Any, db_path: Path) -> None:
                 f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
                 f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}} "
                 f"{attempts_display:<{ATTEMPTS_WIDTH}} {tokens_display:<{TOKENS_WIDTH}} "
+                f"{hold_display:<{HOLD_WIDTH}} "
                 f"{merge_display:<{MERGE_DIAGNOSTIC_WIDTH}}"
             )
 

@@ -237,7 +237,14 @@ Columns:
   - `merged`: no branch-only commits remain
 - `Attempts`: attempt counter shown as `<attempts>/<max_attempts>`.
 - `Tokens`: parsed token usage from latest in-progress log (if detectable), else `n/a`.
+- `Hold`: queued-task hold reason (for overlap conflicts, shows the blocking task and target path).
 - `Merge`: latest merge/rebase diagnostic summary (non-success states only), else `n/a`.
+
+In `--json` mode, each task includes a `hold` field:
+- `null` when no known hold metadata is present.
+- for overlap conflict holds:
+  - `reason`: `conflict_in_progress_overlap`
+  - `blocking_tasks`: list of `{task_id, task_number, title, target_paths}` blockers
 
 ### `attach`
 

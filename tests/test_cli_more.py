@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from pathlib import Path
 import subprocess
@@ -488,6 +489,7 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     assert "Branch" in out
     assert "Attempts" in out
     assert "Tokens" in out
+    assert "Hold" in out
     assert "Merge" in out
     assert "n/a" in out
     assert "Total:" in out
@@ -503,6 +505,80 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     cli_status.handle_alerts(Namespace(ack=None), db_path)
     out = capsys.readouterr().out
     assert "No alerts" in out
+
+
+def test_handle_status_shows_overlap_conflict_hold_reason(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        active_task = store.create_task(roadmap_id, phase_id, "1.1", "Active task", "desc")
+        queued_task = store.create_task(roadmap_id, phase_id, "1.2", "Queued task", "desc")
+        store.set_task_file_targets(active_task, ["src/conflict.py"])
+        store.set_task_file_targets(queued_task, ["src/conflict.py"])
+        store.assign_task(
+            active_task,
+            "codex",
+            "yeehaw/task-1.1-active-task",
+            "/tmp/w1",
+            "/tmp/s1",
+        )
+        store.queue_task(queued_task)
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+    assert "Hold" in out
+
+    queued_row = next(line for line in out.splitlines() if line.startswith(f"{queued_task:<6}"))
+    assert "conflict with 1.1" in queued_row
+    assert "src/conflict.py" in queued_row
+
+
+def test_handle_status_json_includes_overlap_conflict_hold_metadata(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        active_task = store.create_task(roadmap_id, phase_id, "1.1", "Active task", "desc")
+        queued_task = store.create_task(roadmap_id, phase_id, "1.2", "Queued task", "desc")
+        store.set_task_file_targets(active_task, ["src/conflict.py"])
+        store.set_task_file_targets(queued_task, ["src/conflict.py"])
+        store.assign_task(
+            active_task,
+            "codex",
+            "yeehaw/task-1.1-active-task",
+            "/tmp/w1",
+            "/tmp/s1",
+        )
+        store.queue_task(queued_task)
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=True), db_path)
+    payload = json.loads(capsys.readouterr().out)
+    queued = next(task for task in payload if task["id"] == queued_task)
+    active = next(task for task in payload if task["id"] == active_task)
+
+    assert active["hold"] is None
+    assert queued["hold"]["reason"] == "conflict_in_progress_overlap"
+    assert queued["hold"]["blocking_tasks"] == [
+        {
+            "task_id": active_task,
+            "task_number": "1.1",
+            "title": "Active task",
+            "target_paths": ["src/conflict.py"],
+        }
+    ]
 
 
 def test_handle_status_sorts_tasks_by_id(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
