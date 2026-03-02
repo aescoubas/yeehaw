@@ -62,6 +62,12 @@ def _init_git_repo(repo_root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "seed"], cwd=repo_root, check=True, capture_output=True)
 
 
+def _write_default_policy(repo_root: Path, payload: dict[str, Any]) -> None:
+    policy_path = repo_root / ".yeehaw" / "policies" / "default.json"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(json.dumps(payload))
+
+
 def _hook_definition_for_events(
     repo_root: Path,
     *,
@@ -764,6 +770,185 @@ def test_process_signal_done_with_merge_failure_queues_retry(
     assert task is not None
     assert task["status"] == "queued"
     assert task["last_failure"] == "Failed to merge task branch"
+
+
+def test_process_signal_done_policy_violation_blocks_done_accept(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    source_branch = "yeehaw/task-1.1-task-1"
+    target_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", target_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    store.set_roadmap_integration_branch(roadmap_id, target_branch)
+
+    subprocess.run(
+        ["git", "checkout", "-b", source_branch, f"refs/heads/{target_branch}"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "src").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "task.py").write_text("print('task')\n")
+    subprocess.run(["git", "add", "src/task.py"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "non compliant message"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "--detach"], cwd=repo_root, check=True, capture_output=True)
+
+    _write_default_policy(
+        repo_root,
+        {
+            "quality": {
+                "required_commit_message_regex": r"^\[task-\d+\.\d+\]\s+.+",
+            },
+        },
+    )
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{task_id}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    store.assign_task(
+        task_id,
+        agent="codex",
+        branch=source_branch,
+        worktree=str(repo_root),
+        signal_dir=str(signal_dir),
+    )
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(json.dumps({"task_id": task_id, "status": "done", "summary": "ok"}))
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_merge_done_task_branch",
+        lambda _task: (_ for _ in ()).throw(AssertionError("merge should not be attempted")),
+    )
+    orchestrator._process_signal_file(signal_file)
+
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["status"] == "queued"
+    assert "Task policy violation at done_accept" in str(task["last_failure"] or "")
+    assert "policy.required_commit_message_regex" in str(task["last_failure"] or "")
+
+    events = store.list_events(limit=20)
+    policy_events = [event for event in events if event["kind"] == "task_policy_violation"]
+    assert policy_events
+    assert "done_accept" in policy_events[0]["message"]
+    assert "source=yeehaw/task-1.1-task-1" in policy_events[0]["message"]
+
+    alerts = store.list_alerts()
+    assert any("done_accept" in alert["message"] for alert in alerts)
+
+
+def test_process_signal_done_policy_violation_blocks_pre_merge(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    source_branch = "yeehaw/task-1.1-task-1"
+    target_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", target_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    store.set_roadmap_integration_branch(roadmap_id, target_branch)
+
+    subprocess.run(
+        ["git", "checkout", "-b", source_branch, f"refs/heads/{target_branch}"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "secrets").mkdir(parents=True, exist_ok=True)
+    (repo_root / "secrets" / "token.txt").write_text("top-secret\n")
+    subprocess.run(
+        ["git", "add", "secrets/token.txt"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "allowed commit format"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "--detach"], cwd=repo_root, check=True, capture_output=True)
+
+    _write_default_policy(
+        repo_root,
+        {
+            "quality": {
+                "required_commit_message_regex": r"^allowed commit format$",
+            },
+            "safety": {
+                "blocked_paths": ["secrets/*"],
+            },
+        },
+    )
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{task_id}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    store.assign_task(
+        task_id,
+        agent="codex",
+        branch=source_branch,
+        worktree=str(repo_root),
+        signal_dir=str(signal_dir),
+    )
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(json.dumps({"task_id": task_id, "status": "done", "summary": "ok"}))
+
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda _repo_root, _worktree: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
+    orchestrator._process_signal_file(signal_file)
+
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["status"] == "queued"
+    assert "Task policy violation at pre_merge" in str(task["last_failure"] or "")
+    assert "policy.forbidden_path_pattern" in str(task["last_failure"] or "")
+
+    events = store.list_events(limit=20)
+    policy_events = [event for event in events if event["kind"] == "task_policy_violation"]
+    assert policy_events
+    assert any("pre_merge" in event["message"] for event in policy_events)
+    assert any("target=yeehaw/roadmap-" in event["message"] for event in policy_events)
+
+    alerts = store.list_alerts()
+    assert any("pre_merge" in alert["message"] for alert in alerts)
 
 
 def test_process_signal_failed_queues_retry(

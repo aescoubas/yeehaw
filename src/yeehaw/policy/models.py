@@ -9,8 +9,22 @@ from typing import Any
 POLICY_SCHEMA_VERSION = 1
 
 _ROOT_KEYS = frozenset({"schema_version", "quality", "safety"})
-_QUALITY_KEYS = frozenset({"required_checks", "max_files_changed", "max_diff_lines"})
-_SAFETY_KEYS = frozenset({"blocked_commands", "blocked_paths", "allow_network"})
+_QUALITY_KEYS = frozenset(
+    {
+        "required_checks",
+        "required_commit_message_regex",
+        "max_files_changed",
+        "max_diff_lines",
+    }
+)
+_SAFETY_KEYS = frozenset(
+    {
+        "blocked_commands",
+        "blocked_paths",
+        "allowed_path_prefixes",
+        "allow_network",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +32,7 @@ class QualityPolicy:
     """Quality-oriented constraints."""
 
     required_checks: tuple[str, ...] = ()
+    required_commit_message_regex: str | None = None
     max_files_changed: int | None = None
     max_diff_lines: int | None = None
 
@@ -28,6 +43,7 @@ class SafetyPolicy:
 
     blocked_commands: tuple[str, ...] = ()
     blocked_paths: tuple[str, ...] = ()
+    allowed_path_prefixes: tuple[str, ...] = ()
     allow_network: bool = True
 
 
@@ -82,6 +98,12 @@ def parse_policy_pack(payload: Any, *, source: Path | str = "<policy>") -> Polic
             field_path="quality.required_checks",
             source=source,
         ),
+        required_commit_message_regex=_read_optional_non_empty_str(
+            quality_raw,
+            key="required_commit_message_regex",
+            field_path="quality.required_commit_message_regex",
+            source=source,
+        ),
         max_files_changed=_read_int_or_none(
             quality_raw,
             key="max_files_changed",
@@ -111,6 +133,12 @@ def parse_policy_pack(payload: Any, *, source: Path | str = "<policy>") -> Polic
             field_path="safety.blocked_paths",
             source=source,
         ),
+        allowed_path_prefixes=_read_str_list(
+            safety_raw,
+            key="allowed_path_prefixes",
+            field_path="safety.allowed_path_prefixes",
+            source=source,
+        ),
         allow_network=_read_bool(
             safety_raw,
             key="allow_network",
@@ -135,6 +163,7 @@ def policy_pack_to_payload(policy_pack: PolicyPack) -> dict[str, Any]:
     quality["required_checks"] = list(policy_pack.quality.required_checks)
     safety["blocked_commands"] = list(policy_pack.safety.blocked_commands)
     safety["blocked_paths"] = list(policy_pack.safety.blocked_paths)
+    safety["allowed_path_prefixes"] = list(policy_pack.safety.allowed_path_prefixes)
     return payload
 
 
@@ -183,6 +212,27 @@ def _read_int_or_none(
     if raw_value < minimum:
         raise _policy_error(source, f"'{field_path}' must be >= {minimum}")
     return raw_value
+
+
+def _read_optional_non_empty_str(
+    mapping: dict[str, Any],
+    *,
+    key: str,
+    field_path: str,
+    source: Path | str,
+) -> str | None:
+    raw_value = mapping.get(key)
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise _policy_error(
+            source,
+            f"'{field_path}' must be a non-empty string or null (got {_json_type_name(raw_value)})",
+        )
+    stripped = raw_value.strip()
+    if not stripped:
+        raise _policy_error(source, f"'{field_path}' must be a non-empty string or null")
+    return stripped
 
 
 def _read_bool(

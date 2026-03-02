@@ -8,6 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from yeehaw.policy.checks import (
+    BuiltInPolicyInput,
+    evaluate_builtin_policy_checks,
+    has_active_builtin_checks,
+)
 from yeehaw.policy.engine import PolicyEvaluationInput, evaluate_policy
 from yeehaw.policy.loader import load_policy_pack
 from yeehaw.policy.models import PolicyPack, QualityPolicy, SafetyPolicy
@@ -29,6 +34,7 @@ def test_load_policy_pack_merges_default_and_project_override(tmp_path: Path) ->
             {
                 "quality": {
                     "required_checks": ["pytest -q", "ruff check ."],
+                    "required_commit_message_regex": "^\\[task-\\d+\\.\\d+\\] .+",
                     "max_files_changed": 12,
                     "max_diff_lines": 1000,
                 },
@@ -49,6 +55,7 @@ def test_load_policy_pack_merges_default_and_project_override(tmp_path: Path) ->
                 },
                 "safety": {
                     "blocked_paths": ["secrets/*", "*.pem"],
+                    "allowed_path_prefixes": ["src/", "tests/"],
                 },
             }
         )
@@ -57,10 +64,12 @@ def test_load_policy_pack_merges_default_and_project_override(tmp_path: Path) ->
     policy_pack = load_policy_pack("demo-project", runtime_root=tmp_path)
 
     assert policy_pack.quality.required_checks == ("pytest -q", "ruff check .")
+    assert policy_pack.quality.required_commit_message_regex == "^\\[task-\\d+\\.\\d+\\] .+"
     assert policy_pack.quality.max_files_changed == 3
     assert policy_pack.quality.max_diff_lines == 1000
     assert policy_pack.safety.blocked_commands == ("git reset --hard",)
     assert policy_pack.safety.blocked_paths == ("secrets/*", "*.pem")
+    assert policy_pack.safety.allowed_path_prefixes == ("src/", "tests/")
     assert policy_pack.safety.allow_network is True
 
 
@@ -183,3 +192,64 @@ def test_evaluate_policy_allows_input_when_no_constraints_fail() -> None:
 
     assert result.allowed is True
     assert result.violations == ()
+
+
+def test_evaluate_builtin_policy_done_accept_detects_commit_and_file_count_violations() -> None:
+    policy_pack = PolicyPack(
+        quality=QualityPolicy(
+            required_commit_message_regex=r"^\[task-\d+\.\d+\]\s+.+",
+            max_files_changed=1,
+        ),
+    )
+    policy_input = BuiltInPolicyInput(
+        changed_files=("src/main.py", "src/other.py"),
+        commit_messages=("fix lint",),
+    )
+
+    result = evaluate_builtin_policy_checks(
+        policy_pack,
+        policy_input,
+        stage="done_accept",
+    )
+
+    assert result.allowed is False
+    violation_codes = {violation.code for violation in result.violations}
+    assert {
+        "policy.required_commit_message_regex",
+        "policy.max_changed_files",
+    }.issubset(violation_codes)
+
+
+def test_evaluate_builtin_policy_pre_merge_detects_path_violations() -> None:
+    policy_pack = PolicyPack(
+        safety=SafetyPolicy(
+            blocked_paths=("secrets/*",),
+            allowed_path_prefixes=("src/", "tests/"),
+        ),
+    )
+    policy_input = BuiltInPolicyInput(
+        changed_files=("src/main.py", "docs/readme.md", "secrets/token.txt"),
+    )
+
+    result = evaluate_builtin_policy_checks(
+        policy_pack,
+        policy_input,
+        stage="pre_merge",
+    )
+
+    assert result.allowed is False
+    violation_codes = {violation.code for violation in result.violations}
+    assert {
+        "policy.allowed_path_prefixes",
+        "policy.forbidden_path_pattern",
+    }.issubset(violation_codes)
+
+
+def test_has_active_builtin_checks_is_stage_aware() -> None:
+    policy_pack = PolicyPack(
+        quality=QualityPolicy(required_commit_message_regex=r"^ok$"),
+        safety=SafetyPolicy(allowed_path_prefixes=("src/",)),
+    )
+
+    assert has_active_builtin_checks(policy_pack, stage="done_accept") is True
+    assert has_active_builtin_checks(policy_pack, stage="pre_merge") is True

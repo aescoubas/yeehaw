@@ -18,6 +18,12 @@ from yeehaw.agent.profiles import resolve_profile
 from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_launch_config
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
 from yeehaw.hooks import HookDefinition, HookRequest, HookRunResult, load_hooks, run_hooks
+from yeehaw.policy.checks import (
+    collect_builtin_policy_input,
+    evaluate_builtin_policy_checks,
+    has_active_builtin_checks,
+)
+from yeehaw.policy.loader import load_policy_pack
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
 from yeehaw.tmux.session import (
@@ -141,30 +147,44 @@ class Orchestrator:
                 self._emit_on_fail(failed_task, reason=cleanliness_error, stage="done_validation")
                 self._maybe_retry(task)
             else:
-                self._emit_hook_event(
-                    "pre_merge",
-                    task=task,
-                    context={"signal_status": "done"},
+                done_policy_error = self._enforce_builtin_policy_checks(
+                    task,
+                    stage="done_accept",
                 )
-                merge_error = self._merge_done_task_branch(task)
-                self._emit_hook_event(
-                    "post_merge",
-                    task=task,
-                    context={
-                        "result": "failed" if merge_error else "merged",
-                        "error": merge_error,
-                    },
-                )
-                if merge_error:
-                    self.store.fail_task(task["id"], merge_error)
+                if done_policy_error:
+                    self.store.fail_task(task["id"], done_policy_error)
                     failed_task = self.store.get_task(int(task["id"])) or task
-                    self._emit_on_fail(failed_task, reason=merge_error, stage="merge")
+                    self._emit_on_fail(
+                        failed_task,
+                        reason=done_policy_error,
+                        stage="done_accept",
+                    )
                     self._maybe_retry(task)
                 else:
-                    # Phase verify commands are phase-level gates and should run only
-                    # once all tasks in the phase report done.
-                    self.store.complete_task(task["id"], "done")
-                    self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
+                    self._emit_hook_event(
+                        "pre_merge",
+                        task=task,
+                        context={"signal_status": "done"},
+                    )
+                    merge_error = self._merge_done_task_branch(task)
+                    self._emit_hook_event(
+                        "post_merge",
+                        task=task,
+                        context={
+                            "result": "failed" if merge_error else "merged",
+                            "error": merge_error,
+                        },
+                    )
+                    if merge_error:
+                        self.store.fail_task(task["id"], merge_error)
+                        failed_task = self.store.get_task(int(task["id"])) or task
+                        self._emit_on_fail(failed_task, reason=merge_error, stage="merge")
+                        self._maybe_retry(task)
+                    else:
+                        # Phase verify commands are phase-level gates and should run only
+                        # once all tasks in the phase report done.
+                        self.store.complete_task(task["id"], "done")
+                        self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
 
         elif data["status"] == "failed":
             failure_reason = data.get("summary", "Unknown failure")
@@ -791,6 +811,15 @@ class Orchestrator:
             )
             return None
 
+        pre_merge_policy_error = self._enforce_builtin_policy_checks(
+            task,
+            stage="pre_merge",
+            source_branch=source_branch,
+            target_branch=target_branch,
+        )
+        if pre_merge_policy_error:
+            return pre_merge_policy_error
+
         rebase_error = self._rebase_branch_onto_target(
             repo_root=repo_root,
             source_branch=source_branch,
@@ -1216,6 +1245,124 @@ class Orchestrator:
             if candidate.exists():
                 return candidate
         return self._task_repo_root(task)
+
+    def _enforce_builtin_policy_checks(
+        self,
+        task: dict[str, Any],
+        *,
+        stage: str,
+        source_branch: str | None = None,
+        target_branch: str | None = None,
+    ) -> str | None:
+        """Evaluate built-in policy checks and return a failure reason when blocked."""
+        project_name = task.get("project_name")
+        if not isinstance(project_name, str) or not project_name.strip():
+            return None
+
+        try:
+            policy_pack = load_policy_pack(project_name, runtime_root=self.runtime_root)
+        except ValueError as exc:
+            return self._record_policy_violation(
+                task,
+                stage=stage,
+                source_branch=source_branch,
+                target_branch=target_branch,
+                detail=f"Unable to load project policy configuration: {exc}",
+            )
+
+        if not has_active_builtin_checks(policy_pack, stage=stage):
+            return None
+
+        resolved_source_branch = source_branch
+        if not isinstance(resolved_source_branch, str) or not resolved_source_branch:
+            candidate_source = task.get("branch_name")
+            if isinstance(candidate_source, str) and candidate_source:
+                resolved_source_branch = candidate_source
+
+        if not isinstance(resolved_source_branch, str) or not resolved_source_branch:
+            return self._record_policy_violation(
+                task,
+                stage=stage,
+                source_branch=source_branch,
+                target_branch=target_branch,
+                detail="Task branch is missing, unable to evaluate policy checks",
+            )
+
+        resolved_target_branch = target_branch
+        if not isinstance(resolved_target_branch, str) or not resolved_target_branch:
+            resolved_target_branch = self._resolve_merge_target_branch(task)
+
+        repo_root = self._task_repo_root(task)
+        try:
+            policy_input = collect_builtin_policy_input(
+                repo_root=repo_root,
+                source_branch=resolved_source_branch,
+                target_branch=resolved_target_branch,
+            )
+        except ValueError as exc:
+            return self._record_policy_violation(
+                task,
+                stage=stage,
+                source_branch=resolved_source_branch,
+                target_branch=resolved_target_branch,
+                detail=f"Unable to evaluate policy checks: {exc}",
+            )
+
+        result = evaluate_builtin_policy_checks(
+            policy_pack,
+            policy_input,
+            stage=stage,
+        )
+        if result.allowed:
+            return None
+
+        violation_text = "; ".join(
+            f"{violation.code}: {violation.message}"
+            for violation in result.violations[:3]
+        )
+        if len(result.violations) > 3:
+            violation_text = f"{violation_text}; ... ({len(result.violations)} total violations)"
+
+        return self._record_policy_violation(
+            task,
+            stage=stage,
+            source_branch=resolved_source_branch,
+            target_branch=resolved_target_branch,
+            detail=violation_text,
+        )
+
+    def _record_policy_violation(
+        self,
+        task: dict[str, Any],
+        *,
+        stage: str,
+        source_branch: str | None,
+        target_branch: str | None,
+        detail: str,
+    ) -> str:
+        """Persist policy violation diagnostics and return failure reason."""
+        source = source_branch or "<unknown>"
+        target = target_branch or "<unknown>"
+        message = (
+            f"Task policy violation at {stage} "
+            f"(source={source}, target={target}): {detail}"
+        )
+
+        task_id = self._as_int(task.get("id"))
+        project_id = self._as_int(task.get("project_id"))
+        self.store.log_event(
+            "task_policy_violation",
+            message,
+            project_id=project_id,
+            task_id=task_id,
+        )
+        self.store.create_alert(
+            "warn",
+            message,
+            project_id=project_id,
+            task_id=task_id,
+        )
+        return message
 
     def _validate_done_signal_worktree(self, task: dict[str, Any]) -> str | None:
         """Ensure done signals only pass when task worktree has no pending changes."""
