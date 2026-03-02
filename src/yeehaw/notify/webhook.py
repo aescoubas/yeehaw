@@ -61,6 +61,15 @@ def send_webhook(
                 error=str(exc),
             )
 
+        if isinstance(status_code, bool) or not isinstance(status_code, int):
+            return SinkDeliveryResult.failure(
+                sink_name=sink.name,
+                sink_type=sink.sink_type,
+                event_name=event.event_name,
+                attempts=attempt,
+                error=f"Webhook transport returned invalid HTTP status code: {status_code!r}",
+            )
+
         if 200 <= status_code < 300:
             return SinkDeliveryResult.success(
                 sink_name=sink.name,

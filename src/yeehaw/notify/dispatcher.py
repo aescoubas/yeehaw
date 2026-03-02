@@ -17,12 +17,14 @@ class NotificationDispatcher:
 
     def __init__(
         self,
-        config: NotificationConfig | Sequence[WebhookSinkConfig],
+        config: NotificationConfig | Sequence[WebhookSinkConfig] | None = None,
         *,
         max_workers: int = 4,
         webhook_sender: WebhookSender | None = None,
     ) -> None:
-        if isinstance(config, NotificationConfig):
+        if config is None:
+            self._config = NotificationConfig()
+        elif isinstance(config, NotificationConfig):
             self._config = config
         else:
             self._config = NotificationConfig(sinks=tuple(config))

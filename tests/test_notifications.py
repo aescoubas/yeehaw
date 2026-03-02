@@ -49,6 +49,23 @@ def test_parse_notification_config_webhook_sink() -> None:
     assert sink.max_attempts == 4
 
 
+def test_parse_notification_config_accepts_tuple_event_filters() -> None:
+    config = parse_notification_config(
+        {
+            "sinks": [
+                {
+                    "type": "webhook",
+                    "name": "ops",
+                    "url": "https://notify.example.com/hooks",
+                    "events": ("task_done", "task_failed"),
+                }
+            ]
+        }
+    )
+
+    assert config.sinks[0].events == ("task_done", "task_failed")
+
+
 def test_parse_notification_config_rejects_unknown_sink_type() -> None:
     with pytest.raises(ValueError, match="unsupported sink type"):
         parse_notification_config(
@@ -174,6 +191,22 @@ def test_send_webhook_non_retryable_status_fails_fast() -> None:
     assert slept == []
 
 
+def test_send_webhook_invalid_transport_status_is_failure() -> None:
+    sink = WebhookSinkConfig(
+        name="ops",
+        url="https://notify.example.com/hooks",
+        max_attempts=2,
+    )
+    event = NotificationEvent(event_name="task_done", payload={"task_id": 4})
+
+    result = send_webhook(sink, event, transport=lambda _request: "204")  # type: ignore[return-value]
+
+    assert result.ok is False
+    assert result.attempts == 1
+    assert result.error is not None
+    assert "invalid HTTP status code" in result.error
+
+
 def test_dispatcher_fail_open_with_background_dispatch() -> None:
     slow_sink = WebhookSinkConfig(name="slow", url="https://notify.example.com/slow")
     failing_sink = WebhookSinkConfig(name="fail", url="https://notify.example.com/fail")
@@ -224,3 +257,17 @@ def test_dispatcher_filters_unsubscribed_events() -> None:
         dispatcher.close()
 
     assert dispatched == ()
+
+
+def test_dispatcher_dispatch_after_close_returns_failed_future() -> None:
+    sink = WebhookSinkConfig(name="ops", url="https://notify.example.com/hooks")
+    dispatcher = NotificationDispatcher(NotificationConfig(sinks=(sink,)))
+    dispatcher.close()
+
+    futures = dispatcher.dispatch("task_done", {"task_id": 9})
+    assert len(futures) == 1
+
+    result = futures[0].result(timeout=0.2)
+    assert result.ok is False
+    assert result.attempts == 0
+    assert "dispatcher unavailable" in (result.error or "").lower()

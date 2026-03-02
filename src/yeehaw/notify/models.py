@@ -168,7 +168,12 @@ def load_notification_config(config_path: Path) -> NotificationConfig:
         return NotificationConfig()
 
     try:
-        payload = json.loads(config_path.read_text())
+        raw_text = config_path.read_text()
+    except OSError as exc:
+        raise ValueError(f"Unable to read notification config {config_path}: {exc}") from exc
+
+    try:
+        payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in notification config {config_path}: {exc}") from exc
 
@@ -306,8 +311,8 @@ def _read_event_names(payload: dict[str, Any], location: str) -> tuple[str, ...]
     items: list[str]
     if isinstance(raw_events, str):
         items = [raw_events]
-    elif isinstance(raw_events, list):
-        items = raw_events
+    elif isinstance(raw_events, list | tuple):
+        items = list(raw_events)
     else:
         raise ValueError(f"{location}.events must be a string or array of strings")
 
