@@ -255,6 +255,8 @@ In `--json` mode, each task includes these status-augmentation fields:
   - for overlap conflict holds:
     - `reason`: `conflict_in_progress_overlap`
     - `blocking_tasks`: list of `{task_id, task_number, title, target_paths}` blockers
+- `merge_diagnostic`: latest merge/rebase summary string, or `null` when unavailable.
+- `latest_merge_attempt`: newest merge-attempt record object, or `null`.
 - `budget`:
   - `has_budget`: whether token/runtime limits are configured
   - `max_tokens`, `max_runtime_min`: configured limits (or `null`)

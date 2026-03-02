@@ -570,6 +570,14 @@ def _format_reconcile(task: dict[str, Any]) -> str:
     return f"{label}{linked_number}:{linked_status}{suffix}"
 
 
+def _format_conflict_file_preview(conflict_files: list[Any]) -> str:
+    """Format conflict file list for compact status output."""
+    preview = ", ".join(str(path) for path in conflict_files[:MERGE_CONFLICT_FILE_PREVIEW])
+    if len(conflict_files) > MERGE_CONFLICT_FILE_PREVIEW:
+        preview = f"{preview}, +{len(conflict_files) - MERGE_CONFLICT_FILE_PREVIEW} more"
+    return preview
+
+
 def _summarize_merge_diagnostic(attempt: dict[str, Any]) -> str | None:
     """Render concise summary for one task merge attempt."""
     status = str(attempt.get("status") or "").strip().lower()
@@ -583,16 +591,19 @@ def _summarize_merge_diagnostic(attempt: dict[str, Any]) -> str | None:
         clean_detail = MERGE_DIAGNOSTIC_WHITESPACE_RE.sub(" ", detail.strip())
         return f"{status}: {clean_detail}"
 
+    conflict_files = attempt.get("conflict_files")
+    has_conflict_files = isinstance(conflict_files, list) and bool(conflict_files)
+    conflict_files_preview = _format_conflict_file_preview(conflict_files) if has_conflict_files else ""
+
     conflict_type = attempt.get("conflict_type")
     if isinstance(conflict_type, str) and conflict_type.strip():
-        return f"{status}: {conflict_type.strip()}"
+        conflict_summary = conflict_type.strip()
+        if has_conflict_files:
+            return f"{status}: {conflict_summary} ({conflict_files_preview})"
+        return f"{status}: {conflict_summary}"
 
-    conflict_files = attempt.get("conflict_files")
-    if isinstance(conflict_files, list) and conflict_files:
-        preview = ", ".join(str(path) for path in conflict_files[:MERGE_CONFLICT_FILE_PREVIEW])
-        if len(conflict_files) > MERGE_CONFLICT_FILE_PREVIEW:
-            preview = f"{preview}, +{len(conflict_files) - MERGE_CONFLICT_FILE_PREVIEW} more"
-        return f"{status}: files {preview}"
+    if has_conflict_files:
+        return f"{status}: files {conflict_files_preview}"
 
     source_branch = str(attempt.get("source_branch") or "").strip()
     target_branch = str(attempt.get("target_branch") or "").strip()

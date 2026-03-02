@@ -1053,6 +1053,23 @@ def test_handle_status_shows_latest_merge_diagnostic_summary(
     assert "failed: Failed to rebase due to conflict" in row
 
 
+def test_summarize_merge_diagnostic_includes_conflict_file_preview() -> None:
+    summary = cli_status._summarize_merge_diagnostic(
+        {
+            "status": "failed",
+            "conflict_type": "content conflict",
+            "conflict_files": [
+                "src/a.py",
+                "src/b.py",
+                "src/c.py",
+                "src/d.py",
+            ],
+            "error_detail": None,
+        }
+    )
+    assert summary == "failed: content conflict (src/a.py, src/b.py, src/c.py, +1 more)"
+
+
 def test_handle_scheduler_show_config_and_no_changes(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1480,6 +1497,48 @@ def test_handle_logs_merge_history(
     assert "files: src/a.py, src/b.py" in out
     assert "detail: Failed to rebase due to conflict" in out
     assert "Attempt 1: succeeded" in out
+
+
+def test_handle_logs_merge_history_respects_history_limit(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ids = _seed_project_with_task(db_path, task_status="failed")
+    store = Store(db_path)
+    try:
+        for attempt_number in (1, 2, 3):
+            attempt_id = store.create_task_merge_attempt(
+                task_id=ids["task_id"],
+                attempt_number=attempt_number,
+                status="running",
+                source_branch="yeehaw/task-1.1-demo",
+                target_branch="yeehaw/roadmap-1",
+            )
+            store.update_task_merge_attempt(
+                attempt_id,
+                status="failed",
+                error_detail=f"detail {attempt_number}",
+            )
+    finally:
+        store.close()
+
+    cli_logs.handle_logs(
+        Namespace(
+            task_id=ids["task_id"],
+            attempt=None,
+            tail=10,
+            follow=False,
+            merge_history=True,
+            history_limit=1,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Attempt 3: failed" in out
+    assert "detail: detail 3" in out
+    assert "Attempt 2: failed" not in out
+    assert "detail: detail 2" not in out
+    assert "Attempt 1: failed" not in out
 
 
 def test_handle_logs_merge_history_not_found(
