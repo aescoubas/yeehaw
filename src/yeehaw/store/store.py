@@ -73,6 +73,17 @@ class Store:
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _validate_budget_value(field: str, value: int | None) -> int | None:
+        """Validate optional positive integer budget metadata."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer >= 1")
+        if value < 1:
+            raise ValueError(f"{field} must be >= 1")
+        return value
+
     def create_project(self, name: str, repo_root: str) -> int:
         """Insert a project and return its id."""
         cur = self._conn.execute(
@@ -376,12 +387,28 @@ class Store:
         title: str,
         description: str,
         file_targets: list[str] | None = None,
+        max_tokens: int | None = None,
+        max_runtime_min: int | None = None,
     ) -> int:
         """Insert task and return id."""
+        validated_max_tokens = self._validate_budget_value("max_tokens", max_tokens)
+        validated_max_runtime_min = self._validate_budget_value(
+            "max_runtime_min",
+            max_runtime_min,
+        )
         cur = self._conn.execute(
-            "INSERT INTO tasks (roadmap_id, phase_id, task_number, title, description) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (roadmap_id, phase_id, number, title, description),
+            "INSERT INTO tasks "
+            "(roadmap_id, phase_id, task_number, title, description, max_tokens, max_runtime_min) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                roadmap_id,
+                phase_id,
+                number,
+                title,
+                description,
+                validated_max_tokens,
+                validated_max_runtime_min,
+            ),
         )
         task_id = int(cur.lastrowid)
         if file_targets:
@@ -406,6 +433,41 @@ class Store:
             (task_id,),
         ).fetchall()
         return [str(row["target_path"]) for row in rows]
+
+    def get_task_budget(self, task_id: int) -> dict[str, int | None] | None:
+        """Return persisted task budget metadata."""
+        row = self._conn.execute(
+            "SELECT max_tokens, max_runtime_min FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "max_tokens": int(row["max_tokens"]) if row["max_tokens"] is not None else None,
+            "max_runtime_min": (
+                int(row["max_runtime_min"]) if row["max_runtime_min"] is not None else None
+            ),
+        }
+
+    def set_task_budget(
+        self,
+        task_id: int,
+        *,
+        max_tokens: int | None,
+        max_runtime_min: int | None,
+    ) -> bool:
+        """Replace task budget metadata, allowing values to be cleared with None."""
+        validated_max_tokens = self._validate_budget_value("max_tokens", max_tokens)
+        validated_max_runtime_min = self._validate_budget_value(
+            "max_runtime_min",
+            max_runtime_min,
+        )
+        cur = self._conn.execute(
+            "UPDATE tasks SET max_tokens = ?, max_runtime_min = ?, updated_at = ? WHERE id = ?",
+            (validated_max_tokens, validated_max_runtime_min, self._now(), task_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         """Get task plus project metadata."""

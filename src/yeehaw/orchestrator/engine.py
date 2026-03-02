@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -39,6 +40,36 @@ INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
 MERGE_WORKTREE_DIR = "merge-worktrees"
 REBASE_WORKTREE_DIR = "rebase-worktrees"
 HOOK_SCHEMA_VERSION = 1
+TOKEN_SCAN_WINDOW_LINES = 400
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+TOTAL_TOKEN_PATTERNS = (
+    re.compile(r"\btokens?\s+used\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\btotal\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\btokens?\s+total\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\btoken\s+usage\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r'"totalTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"totalTokens"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"total_tokens"\s*:\s*([0-9][0-9,_]*)'),
+)
+INPUT_TOKEN_PATTERNS = (
+    re.compile(r"\binput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\bprompt\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r'"inputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"promptTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"input_tokens"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"prompt_tokens"\s*:\s*([0-9][0-9,_]*)'),
+)
+OUTPUT_TOKEN_PATTERNS = (
+    re.compile(r"\boutput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\bcompletion\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r"\bcandidate(?:s)?\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
+    re.compile(r'"outputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"completionTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"candidatesTokenCount"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"output_tokens"\s*:\s*([0-9][0-9,_]*)'),
+    re.compile(r'"completion_tokens"\s*:\s*([0-9][0-9,_]*)'),
+)
+TOKEN_LINE_RE = re.compile(r"^\s*([0-9][0-9,]*)\s*$")
 
 
 @dataclass(frozen=True)
@@ -124,8 +155,31 @@ class Orchestrator:
                     self._handle_crash(task)
                 continue
 
+            runtime_violation = self._runtime_budget_violation(task)
+            if runtime_violation is not None:
+                max_runtime_min, elapsed_seconds = runtime_violation
+                self._handle_runtime_budget_exceeded(
+                    task,
+                    session,
+                    max_runtime_min=max_runtime_min,
+                    elapsed_seconds=elapsed_seconds,
+                )
+                continue
+
             if self._is_timed_out(task):
                 self._handle_timeout(task, session)
+                continue
+
+            token_violation = self._token_budget_violation(task)
+            if token_violation is not None:
+                max_tokens, observed_tokens = token_violation
+                self._handle_token_budget_exceeded(
+                    task,
+                    session,
+                    max_tokens=max_tokens,
+                    observed_tokens=observed_tokens,
+                )
+                continue
 
     def _process_signal_file(self, signal_path: Path) -> None:
         """Read signal file and transition task state accordingly."""
@@ -565,12 +619,55 @@ class Orchestrator:
         return result.returncode == 0
 
     def _is_timed_out(self, task: dict[str, Any]) -> bool:
-        started_at = task.get("started_at")
-        if not started_at:
+        elapsed = self._elapsed_runtime_seconds(task)
+        if elapsed is None:
             return False
-        started = datetime.fromisoformat(started_at)
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         return elapsed > self.config["task_timeout_min"] * 60
+
+    def _runtime_budget_violation(self, task: dict[str, Any]) -> tuple[int, float] | None:
+        """Return runtime budget breach details when configured and exceeded."""
+        max_runtime_min = self._as_int(task.get("max_runtime_min"))
+        if max_runtime_min is None or max_runtime_min < 1:
+            return None
+        elapsed_seconds = self._elapsed_runtime_seconds(task)
+        if elapsed_seconds is None:
+            return None
+        if elapsed_seconds <= max_runtime_min * 60:
+            return None
+        return (max_runtime_min, elapsed_seconds)
+
+    def _token_budget_violation(self, task: dict[str, Any]) -> tuple[int, int] | None:
+        """Return token budget breach details when configured and exceeded."""
+        max_tokens = self._as_int(task.get("max_tokens"))
+        if max_tokens is None or max_tokens < 1:
+            return None
+        latest_log = self._latest_task_log_path(int(task["id"]))
+        if latest_log is None:
+            return None
+        try:
+            content = latest_log.read_text(errors="replace")
+        except OSError:
+            return None
+        observed_tokens = self._parse_tokens_used(content)
+        if observed_tokens is None:
+            return None
+        if observed_tokens <= max_tokens:
+            return None
+        return (max_tokens, observed_tokens)
+
+    def _elapsed_runtime_seconds(self, task: dict[str, Any]) -> float | None:
+        """Return elapsed runtime seconds for a started task."""
+        started_at = task.get("started_at")
+        if not isinstance(started_at, str) or not started_at:
+            return None
+        try:
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            return None
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        return max(0.0, elapsed)
 
     def _handle_timeout(self, task: dict[str, Any], session: str) -> None:
         pane_text = ""
@@ -591,6 +688,83 @@ class Orchestrator:
         self._emit_on_fail(failed_task, reason=failure_msg, stage="timeout")
         self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
+        if task.get("worktree_path"):
+            cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
+
+    def _handle_runtime_budget_exceeded(
+        self,
+        task: dict[str, Any],
+        session: str,
+        *,
+        max_runtime_min: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """Fail a task immediately when its runtime budget is exceeded."""
+        pane_text = ""
+        try:
+            pane_text = capture_pane(session)
+        except OSError:
+            pane_text = ""
+        kill_session(session)
+
+        elapsed_minutes = elapsed_seconds / 60.0
+        failure_msg = (
+            f"Runtime budget exceeded: elapsed {elapsed_minutes:.1f} min > limit {max_runtime_min} min"
+        )
+        latest_log = self._latest_task_log_path(task["id"])
+        if latest_log is not None:
+            failure_msg = f"{failure_msg}. Check log: {latest_log}"
+        if pane_text.strip():
+            snapshot_path = self._write_pane_snapshot(task["id"], pane_text, "runtime-budget")
+            failure_msg = f"{failure_msg}. Pane snapshot: {snapshot_path}"
+
+        self.store.fail_task(task["id"], failure_msg)
+        failed_task = self.store.get_task(int(task["id"])) or task
+        self._emit_on_fail(failed_task, reason=failure_msg, stage="runtime_budget")
+        self.store.log_event("task_budget_exceeded", failure_msg, task_id=task["id"])
+        self.store.create_alert(
+            "error",
+            f"Task {task['id']} runtime budget breached. {failure_msg}",
+            task_id=task["id"],
+        )
+        if task.get("worktree_path"):
+            cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
+
+    def _handle_token_budget_exceeded(
+        self,
+        task: dict[str, Any],
+        session: str,
+        *,
+        max_tokens: int,
+        observed_tokens: int,
+    ) -> None:
+        """Fail a task immediately when its token budget is exceeded."""
+        pane_text = ""
+        try:
+            pane_text = capture_pane(session)
+        except OSError:
+            pane_text = ""
+        kill_session(session)
+
+        failure_msg = (
+            f"Token budget exceeded: used {observed_tokens:,} tokens > limit {max_tokens:,} tokens"
+        )
+        latest_log = self._latest_task_log_path(task["id"])
+        if latest_log is not None:
+            failure_msg = f"{failure_msg}. Check log: {latest_log}"
+        if pane_text.strip():
+            snapshot_path = self._write_pane_snapshot(task["id"], pane_text, "token-budget")
+            failure_msg = f"{failure_msg}. Pane snapshot: {snapshot_path}"
+
+        self.store.fail_task(task["id"], failure_msg)
+        failed_task = self.store.get_task(int(task["id"])) or task
+        self._emit_on_fail(failed_task, reason=failure_msg, stage="token_budget")
+        self.store.log_event("task_budget_exceeded", failure_msg, task_id=task["id"])
+        self.store.create_alert(
+            "error",
+            f"Task {task['id']} token budget breached. {failure_msg}",
+            task_id=task["id"],
+        )
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
@@ -1221,6 +1395,54 @@ class Orchestrator:
         snapshot_path = logs_root / f"{kind}-pane-{timestamp}.txt"
         snapshot_path.write_text(pane_text)
         return snapshot_path
+
+    @staticmethod
+    def _parse_tokens_used(text: str) -> int | None:
+        """Parse token usage from task log output."""
+        clean = ANSI_ESCAPE_RE.sub("", text)
+        lines = clean.splitlines()[-TOKEN_SCAN_WINDOW_LINES:]
+        tail = "\n".join(lines)
+
+        total = Orchestrator._last_pattern_value(tail, TOTAL_TOKEN_PATTERNS)
+        if total is not None:
+            return total
+
+        for idx in range(len(lines) - 1, -1, -1):
+            line = lines[idx]
+            if "tokens used" not in line.lower():
+                continue
+            for next_idx in range(idx + 1, min(idx + 4, len(lines))):
+                match = TOKEN_LINE_RE.match(lines[next_idx])
+                if match is None:
+                    continue
+                parsed = Orchestrator._parse_int_token(match.group(1))
+                if parsed is not None:
+                    return parsed
+
+        input_tokens = Orchestrator._last_pattern_value(tail, INPUT_TOKEN_PATTERNS)
+        output_tokens = Orchestrator._last_pattern_value(tail, OUTPUT_TOKEN_PATTERNS)
+        if input_tokens is not None and output_tokens is not None:
+            return input_tokens + output_tokens
+        return None
+
+    @staticmethod
+    def _parse_int_token(value: str) -> int | None:
+        normalized = value.replace(",", "").replace("_", "").strip()
+        if not normalized.isdigit():
+            return None
+        return int(normalized)
+
+    @staticmethod
+    def _last_pattern_value(text: str, patterns: tuple[re.Pattern[str], ...]) -> int | None:
+        best: tuple[int, int] | None = None
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                parsed = Orchestrator._parse_int_token(match.group(1))
+                if parsed is None:
+                    continue
+                if best is None or match.start() > best[0]:
+                    best = (match.start(), parsed)
+        return None if best is None else best[1]
 
     def _task_repo_root(self, task: dict[str, Any]) -> Path:
         """Resolve git repo root for a task from project metadata."""

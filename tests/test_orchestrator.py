@@ -1381,6 +1381,117 @@ def test_handle_timeout_records_log_hints(
     assert "Pane snapshot:" in (updated["last_failure"] or "")
 
 
+def test_monitor_active_runtime_budget_breach_fails_task_with_alert(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="claude",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    store._conn.execute(
+        "UPDATE tasks SET started_at = ?, max_runtime_min = ? WHERE id = ?",
+        (
+            (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(),
+            5,
+            ids["task_id"],
+        ),
+    )
+    store._conn.commit()
+
+    log_dir = repo_root / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "attempt-01-claude.log").write_text("agent output")
+
+    monkeypatch.setattr(engine, "has_session", lambda _session: True)
+    monkeypatch.setattr(engine, "capture_pane", lambda _session: "")
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator.signal_watcher, "get_ready_signals", lambda: [])
+    monkeypatch.setattr(orchestrator.signal_watcher, "poll_signals", lambda: [])
+    orchestrator._monitor_active(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+    assert "Runtime budget exceeded" in str(task["last_failure"] or "")
+    assert "limit 5 min" in str(task["last_failure"] or "")
+    assert "Check log:" in str(task["last_failure"] or "")
+
+    alerts = store.list_alerts()
+    assert any("runtime budget breached" in str(alert["message"]).lower() for alert in alerts)
+    events = store.list_events(limit=10)
+    assert any(
+        event["kind"] == "task_budget_exceeded" and "Runtime budget exceeded" in event["message"]
+        for event in events
+    )
+
+
+def test_monitor_active_token_budget_breach_fails_task_with_alert(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="claude",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    assert store.set_task_budget(ids["task_id"], max_tokens=1000, max_runtime_min=None) is True
+
+    log_dir = repo_root / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "attempt-01-claude.log").write_text("Total tokens: 1,500\n")
+
+    monkeypatch.setattr(engine, "has_session", lambda _session: True)
+    monkeypatch.setattr(engine, "capture_pane", lambda _session: "")
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator.signal_watcher, "get_ready_signals", lambda: [])
+    monkeypatch.setattr(orchestrator.signal_watcher, "poll_signals", lambda: [])
+    orchestrator._monitor_active(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+    assert "Token budget exceeded" in str(task["last_failure"] or "")
+    assert "1,500" in str(task["last_failure"] or "")
+    assert "1,000" in str(task["last_failure"] or "")
+    assert "Check log:" in str(task["last_failure"] or "")
+
+    alerts = store.list_alerts()
+    assert any("token budget breached" in str(alert["message"]).lower() for alert in alerts)
+    events = store.list_events(limit=10)
+    assert any(
+        event["kind"] == "task_budget_exceeded" and "Token budget exceeded" in event["message"]
+        for event in events
+    )
+
+
 def test_merge_done_task_branch_rebases_then_merges(orchestrator_store: tuple[Store, Path]) -> None:
     store, repo_root = orchestrator_store
     _init_git_repo(repo_root)

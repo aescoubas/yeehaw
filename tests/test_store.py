@@ -117,6 +117,57 @@ def test_pause_and_resume_task(store: Store) -> None:
     assert paused_again["status"] == "paused"
 
 
+def test_task_budget_metadata_round_trip(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(
+        roadmap_id,
+        phase_id,
+        "1.1",
+        "Build",
+        "desc",
+        max_tokens=1500,
+        max_runtime_min=20,
+    )
+
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["max_tokens"] == 1500
+    assert task["max_runtime_min"] == 20
+
+    budget = store.get_task_budget(task_id)
+    assert budget == {"max_tokens": 1500, "max_runtime_min": 20}
+
+    assert store.set_task_budget(task_id, max_tokens=2500, max_runtime_min=35) is True
+    updated_budget = store.get_task_budget(task_id)
+    assert updated_budget == {"max_tokens": 2500, "max_runtime_min": 35}
+
+    assert store.set_task_budget(task_id, max_tokens=None, max_runtime_min=None) is True
+    cleared_budget = store.get_task_budget(task_id)
+    assert cleared_budget == {"max_tokens": None, "max_runtime_min": None}
+
+
+def test_task_budget_validation(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        store.create_task(
+            roadmap_id,
+            phase_id,
+            "1.1",
+            "Build",
+            "desc",
+            max_tokens=0,
+        )
+
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+    with pytest.raises(ValueError, match="max_runtime_min"):
+        store.set_task_budget(task_id, max_tokens=500, max_runtime_min=0)
+
+
 def test_create_roadmap_supersedes_previous_for_same_project(store: Store) -> None:
     project_id = store.create_project("proj-a", "/tmp/repo-a")
     roadmap_1 = store.create_roadmap(project_id, "# Roadmap 1")

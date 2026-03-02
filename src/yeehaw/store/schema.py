@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     signal_dir      TEXT,
     attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER NOT NULL DEFAULT 4,
+    max_tokens      INTEGER
+                    CHECK (max_tokens IS NULL OR max_tokens > 0),
+    max_runtime_min INTEGER
+                    CHECK (max_runtime_min IS NULL OR max_runtime_min > 0),
     last_failure    TEXT,
     started_at      TEXT,
     completed_at    TEXT,
@@ -243,6 +247,10 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
                 signal_dir      TEXT,
                 attempts        INTEGER NOT NULL DEFAULT 0,
                 max_attempts    INTEGER NOT NULL DEFAULT 4,
+                max_tokens      INTEGER
+                                CHECK (max_tokens IS NULL OR max_tokens > 0),
+                max_runtime_min INTEGER
+                                CHECK (max_runtime_min IS NULL OR max_runtime_min > 0),
                 last_failure    TEXT,
                 started_at      TEXT,
                 completed_at    TEXT,
@@ -256,7 +264,8 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
             INSERT INTO tasks (
                 id, roadmap_id, phase_id, task_number, title, description, status,
                 assigned_agent, branch_name, worktree_path, signal_dir,
-                attempts, max_attempts, last_failure, started_at, completed_at, created_at, updated_at
+                attempts, max_attempts, max_tokens, max_runtime_min,
+                last_failure, started_at, completed_at, created_at, updated_at
             )
             SELECT id,
                    roadmap_id,
@@ -275,6 +284,8 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
                    signal_dir,
                    attempts,
                    max_attempts,
+                   NULL,
+                   NULL,
                    last_failure,
                    started_at,
                    completed_at,
@@ -287,6 +298,23 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
         conn.commit()
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_tasks_add_budget_columns(conn: sqlite3.Connection) -> None:
+    """Add per-task budget metadata columns when missing."""
+    if not _table_exists(conn, "tasks"):
+        return
+
+    columns = _column_names(conn, "tasks")
+    changed = False
+    if "max_tokens" not in columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN max_tokens INTEGER")
+        changed = True
+    if "max_runtime_min" not in columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN max_runtime_min INTEGER")
+        changed = True
+    if changed:
+        conn.commit()
 
 
 def _migrate_scheduler_default_max_per_project(conn: sqlite3.Connection) -> None:
@@ -515,5 +543,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA_DDL)
     _migrate_roadmaps_add_integration_branch(conn)
     _migrate_tasks_add_paused_status(conn)
+    _migrate_tasks_add_budget_columns(conn)
     _migrate_scheduler_default_max_per_project(conn)
     return conn
