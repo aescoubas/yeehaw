@@ -292,6 +292,33 @@ def main(argv: list[str] | None = None) -> None:
     workers_sub = workers_parser.add_subparsers(dest="workers_command", required=True)
     workers_sub.add_parser("show", help="Show effective worker launch configuration")
 
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Manage project memory packs",
+    )
+    context_sub = context_parser.add_subparsers(dest="context_command", required=True)
+
+    context_show = context_sub.add_parser("show", help="Show project memory pack")
+    context_show.add_argument("--project", required=True, help="Project name")
+
+    context_set = context_sub.add_parser("set", help="Set project memory pack content")
+    context_set.add_argument("--project", required=True, help="Project name")
+    context_set_source = context_set.add_mutually_exclusive_group(required=True)
+    context_set_source.add_argument(
+        "--text",
+        help="Inline markdown payload for the memory pack",
+    )
+    context_set_source.add_argument(
+        "--file",
+        help="Path to markdown file to load",
+    )
+
+    context_edit = context_sub.add_parser("edit", help="Edit project memory pack in $EDITOR")
+    context_edit.add_argument("--project", required=True, help="Project name")
+
+    context_validate = context_sub.add_parser("validate", help="Validate project memory pack")
+    context_validate.add_argument("--project", required=True, help="Project name")
+
     policy_parser = subparsers.add_parser(
         "policy",
         help="Validate and explain built-in policy checks",
@@ -381,6 +408,11 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.workers import handle_workers
 
         handle_workers(args, _get_db_path())
+
+    elif args.command == "context":
+        from yeehaw.cli.context import handle_context
+
+        handle_context(args, _get_db_path())
 
     elif args.command == "policy":
         from yeehaw.cli.policy import handle_policy

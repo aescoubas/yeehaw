@@ -12,6 +12,7 @@ import pytest
 
 import yeehaw.cli.main as cli_main
 import yeehaw.cli.attach as cli_attach
+import yeehaw.cli.context as cli_context
 import yeehaw.cli.config as cli_config
 import yeehaw.cli.daemon as cli_daemon
 import yeehaw.cli.logs as cli_logs
@@ -23,6 +24,7 @@ import yeehaw.cli.scheduler as cli_scheduler
 import yeehaw.cli.status as cli_status
 import yeehaw.cli.stop as cli_stop
 import yeehaw.cli.workers as cli_workers
+from yeehaw.context import MEMORY_PACK_MAX_BYTES
 from yeehaw.policy.checks import BuiltInPolicyInput
 from yeehaw.policy.models import PolicyPack, QualityPolicy, SafetyPolicy
 from yeehaw.store.store import Store
@@ -72,6 +74,21 @@ def _seed_project_with_task(db_path: Path, task_status: str = "pending") -> dict
         store.close()
 
 
+def _valid_memory_pack_markdown(extra_line: str = "") -> str:
+    return (
+        "# Demo Project Memory Pack\n"
+        "\n"
+        "## Conventions\n"
+        "- Keep public APIs explicit.\n"
+        "\n"
+        "## Architecture Constraints\n"
+        "- Avoid global mutable state.\n"
+        "\n"
+        "## Coding Standards\n"
+        f"- Type hint all function signatures.{extra_line}\n"
+    )
+
+
 def test_cli_main_dispatches_remaining_commands(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -99,6 +116,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.daemon.handle_daemon", _capture("daemon"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.config.handle_config", _capture("config"))
+    monkeypatch.setattr("yeehaw.cli.context.handle_context", _capture("context"))
     monkeypatch.setattr("yeehaw.cli.policy.handle_policy", _capture("policy"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
     monkeypatch.setattr("yeehaw.cli.workers.handle_workers", _capture("workers"))
@@ -117,6 +135,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["daemon", "status"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["config", "show"])
+    cli_main.main(["context", "show", "--project", "p"])
     cli_main.main(["policy", "lint", "--project", "p"])
     cli_main.main(["alerts"])
     cli_main.main(["workers", "show"])
@@ -135,11 +154,96 @@ def test_cli_main_dispatches_remaining_commands(
         "daemon",
         "scheduler",
         "config",
+        "context",
         "policy",
         "alerts",
         "workers",
     ]
     assert all(db == runtime_root / "yeehaw.db" for _, db in calls)
+
+
+def test_handle_context_show_set_and_validate(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        store.create_project("proj-a", "/tmp/repo-a")
+    finally:
+        store.close()
+
+    cli_context.handle_context(
+        Namespace(context_command="show", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "No memory pack configured for project 'proj-a'." in out
+    assert "Default path:" in out
+
+    cli_context.handle_context(
+        Namespace(
+            context_command="set",
+            project="proj-a",
+            text=_valid_memory_pack_markdown(),
+            file=None,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Saved memory pack for project 'proj-a'" in out
+    assert "Size:" in out
+
+    cli_context.handle_context(
+        Namespace(context_command="show", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Memory pack for project 'proj-a':" in out
+    assert "## Conventions" in out
+    assert "## Architecture Constraints" in out
+    assert "## Coding Standards" in out
+
+    cli_context.handle_context(
+        Namespace(context_command="validate", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Context pack is valid for project 'proj-a'." in out
+
+
+def test_handle_context_validation_errors(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        store.create_project("proj-a", "/tmp/repo-a")
+    finally:
+        store.close()
+
+    cli_context.handle_context(
+        Namespace(
+            context_command="set",
+            project="proj-a",
+            text="# Demo\n\n## Conventions\n- Keep it tidy.\n",
+            file=None,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "missing required sections" in out
+
+    pack_path = db_path.parent / "context" / "projects" / "proj-a.md"
+    pack_path.parent.mkdir(parents=True, exist_ok=True)
+    pack_path.write_text("x" * (MEMORY_PACK_MAX_BYTES + 1))
+
+    cli_context.handle_context(
+        Namespace(context_command="validate", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Context validation failed for project 'proj-a':" in out
+    assert "file exceeds max size" in out
 
 
 def test_handle_config_show_and_set(

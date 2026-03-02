@@ -97,7 +97,7 @@ uv run yeehaw logs 11 --follow
 Top-level:
 
 ```bash
-uv run yeehaw {init,project,roadmap,plan,run,daemon,status,attach,stop,logs,scheduler,config,alerts,workers,policy}
+uv run yeehaw {init,project,roadmap,plan,run,daemon,status,attach,stop,logs,scheduler,config,alerts,workers,context,policy}
 ```
 
 ### `init`
@@ -336,6 +336,24 @@ Show resolved worker launch configuration:
 ```bash
 uv run yeehaw workers show
 ```
+
+### `context`
+
+Manage per-project memory packs under your runtime root (`~/.yeehaw/context/projects/` by default):
+
+```bash
+uv run yeehaw context show --project demo
+uv run yeehaw context set --project demo --file ./memory-pack.md
+uv run yeehaw context set --project demo --text "# Demo\n\n## Conventions\n..."
+uv run yeehaw context edit --project demo
+uv run yeehaw context validate --project demo
+```
+
+Validation constraints:
+- Max size: `12,000` bytes.
+- Max lines: `240`.
+- Max headings: `24`.
+- Required headings: `Conventions`, `Architecture Constraints`, `Coding Standards`.
 
 ### `policy`
 
