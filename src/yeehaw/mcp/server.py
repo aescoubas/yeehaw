@@ -190,6 +190,7 @@ def create_roadmap(project_name: str, markdown: str) -> dict[str, Any]:
 
     try:
         store.apply_roadmap_dependencies(roadmap_id, roadmap)
+        store.apply_roadmap_file_targets(roadmap_id, roadmap)
     except ValueError as exc:
         store.delete_roadmap(roadmap_id)
         return {"error": str(exc)}

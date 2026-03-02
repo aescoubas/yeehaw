@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from yeehaw.roadmap.dependencies import parse_task_dependencies
 
@@ -15,6 +16,7 @@ class Task:
     number: str
     title: str
     description: str
+    file_targets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -41,6 +43,10 @@ _RE_VERIFY = re.compile(r"^\*\*Verify:\*\*\s+`(.+)`$")
 _RE_TASK = re.compile(r"^###\s+(?:Task\s+)?([Pp]?\d+\.\d+):\s+(.+)$")
 _RE_TASK_STATUS_SUFFIX = re.compile(r"\s+\[(?:x|X| )\]\s*$")
 _RE_TASK_COMPONENTS = re.compile(r"^[Pp]?(\d+)\.(\d+)$")
+_RE_FILES_HEADER = re.compile(r"^\*\*Files:\*\*\s*$", re.IGNORECASE)
+_RE_METADATA_HEADER = re.compile(r"^\*\*[^*]+:\*\*\s*")
+_RE_BULLET_LINE = re.compile(r"^[-*]\s+(.*)$")
+_RE_CODE_SPAN = re.compile(r"`([^`]+)`")
 
 
 def parse_roadmap(text: str) -> Roadmap:
@@ -55,6 +61,7 @@ def parse_roadmap(text: str) -> Roadmap:
         nonlocal current_task, task_lines
         if current_task is not None:
             current_task.description = "\n".join(task_lines).strip()
+            current_task.file_targets = parse_task_file_targets(current_task.description)
             task_lines = []
 
     for line in lines:
@@ -92,6 +99,7 @@ def parse_roadmap(text: str) -> Roadmap:
                 number=normalized_task_num,
                 title=title,
                 description="",
+                file_targets=[],
             )
             task_lines = []
             if current_phase is not None:
@@ -163,6 +171,42 @@ def validate_roadmap(roadmap: Roadmap) -> list[str]:
     return errors
 
 
+def parse_task_file_targets(description: str) -> list[str]:
+    """Extract normalized `**Files:**` metadata entries from task description text."""
+    targets: list[str] = []
+    seen: set[str] = set()
+    in_files_block = False
+
+    for raw_line in description.splitlines():
+        stripped = raw_line.strip()
+        if _RE_FILES_HEADER.match(stripped):
+            in_files_block = True
+            continue
+
+        if not in_files_block:
+            continue
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            break
+
+        if _RE_METADATA_HEADER.match(stripped):
+            in_files_block = _RE_FILES_HEADER.match(stripped) is not None
+            continue
+
+        bullet = _RE_BULLET_LINE.match(stripped)
+        if bullet is None:
+            continue
+
+        target = _normalize_file_target(_extract_file_target_candidate(bullet.group(1)))
+        if target is None or target in seen:
+            continue
+        targets.append(target)
+        seen.add(target)
+
+    return targets
+
+
 def _validate_dependency_cycles(graph: dict[str, list[str]]) -> list[str]:
     """Detect dependency cycles and return validation errors."""
     temp_mark: set[str] = set()
@@ -213,3 +257,33 @@ def _parse_task_components(task_number: str) -> tuple[int, int] | None:
     if not match:
         return None
     return int(match.group(1)), int(match.group(2))
+
+
+def _extract_file_target_candidate(raw_item: str) -> str:
+    """Extract path-like token from one Files-list bullet item."""
+    code_match = _RE_CODE_SPAN.search(raw_item)
+    if code_match:
+        return code_match.group(1).strip()
+
+    candidate = raw_item.strip()
+    for separator in (" — ", " – ", " - "):
+        if separator in candidate:
+            return candidate.split(separator, 1)[0].strip()
+    return candidate
+
+
+def _normalize_file_target(raw_target: str) -> str | None:
+    """Normalize file target text into stable slash-delimited path tokens."""
+    value = raw_target.strip().strip("`").strip().strip("\"'")
+    if not value:
+        return None
+
+    value = value.replace("\\", "/")
+    parts = [part for part in value.split("/") if part and part != "."]
+    if not parts:
+        return None
+
+    normalized = PurePosixPath(*parts).as_posix().strip()
+    if not normalized or normalized == ".":
+        return None
+    return normalized

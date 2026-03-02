@@ -210,6 +210,27 @@ def test_delete_roadmap_removes_dependencies(store: Store) -> None:
     assert store.delete_roadmap(roadmap_id) is False
 
 
+def test_set_and_list_task_file_targets(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    store.set_task_file_targets(
+        task_id,
+        [
+            "./src/yeehaw/store/store.py",
+            "src//yeehaw//store//store.py",
+            ".\\tests\\test_store.py",
+        ],
+    )
+
+    assert store.list_task_file_targets(task_id) == [
+        "src/yeehaw/store/store.py",
+        "tests/test_store.py",
+    ]
+
+
 def test_edit_roadmap_in_place_inserts_task_for_executing_phase(store: Store) -> None:
     project_id = store.create_project("proj-a", "/tmp/repo-a")
     raw = """
@@ -301,9 +322,14 @@ def test_apply_roadmap_dependencies_and_satisfaction(store: Store) -> None:
 ## Phase 1: Foundation
 ### Task 1.1: Setup
 **Depends on:** none
+**Files:**
+- `src/setup.py` - setup wiring
 Do setup
 ### Task 1.2: Build
 **Depends on:** 1.1
+**Files:**
+- `src/build.py` - build logic
+- src\\common.py
 Do build
 """.strip()
     roadmap = parse_roadmap(raw)
@@ -313,12 +339,18 @@ Do build
     task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Build", roadmap.phases[0].tasks[1].description)
 
     store.apply_roadmap_dependencies(roadmap_id, roadmap)
+    store.apply_roadmap_file_targets(roadmap_id, roadmap)
 
     dep_count = store._conn.execute(
         "SELECT COUNT(*) FROM task_dependencies WHERE blocked_task_id = ? AND blocker_task_id = ?",
         (task_12, task_11),
     ).fetchone()[0]
     assert dep_count == 1
+    assert store.list_task_file_targets(task_11) == ["src/setup.py"]
+    assert store.list_task_file_targets(task_12) == [
+        "src/build.py",
+        "src/common.py",
+    ]
 
     assert store.are_task_dependencies_satisfied(task_12) is False
     store.complete_task(task_11, "done")

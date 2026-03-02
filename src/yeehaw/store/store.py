@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from yeehaw.roadmap.dependencies import parse_task_dependencies
@@ -244,6 +244,7 @@ class Store:
                     stats[key] += value
 
             self._replace_roadmap_dependencies(roadmap_id, roadmap)
+            self._replace_roadmap_file_targets(roadmap_id, roadmap)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -272,6 +273,16 @@ class Store:
         self._conn.execute("BEGIN")
         try:
             self._replace_roadmap_dependencies(roadmap_id, roadmap)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def apply_roadmap_file_targets(self, roadmap_id: int, roadmap: "Roadmap") -> None:
+        """Apply parsed task file targets for one roadmap."""
+        self._conn.execute("BEGIN")
+        try:
+            self._replace_roadmap_file_targets(roadmap_id, roadmap)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -328,6 +339,7 @@ class Store:
         number: str,
         title: str,
         description: str,
+        file_targets: list[str] | None = None,
     ) -> int:
         """Insert task and return id."""
         cur = self._conn.execute(
@@ -335,8 +347,29 @@ class Store:
             "VALUES (?, ?, ?, ?, ?)",
             (roadmap_id, phase_id, number, title, description),
         )
+        task_id = int(cur.lastrowid)
+        if file_targets:
+            self._replace_task_file_targets(task_id, file_targets)
         self._conn.commit()
-        return int(cur.lastrowid)
+        return task_id
+
+    def set_task_file_targets(self, task_id: int, file_targets: list[str]) -> None:
+        """Replace persisted file targets for one task."""
+        self._conn.execute("BEGIN")
+        try:
+            self._replace_task_file_targets(task_id, file_targets)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def list_task_file_targets(self, task_id: int) -> list[str]:
+        """List normalized file targets for one task."""
+        rows = self._conn.execute(
+            "SELECT target_path FROM task_file_targets WHERE task_id = ? ORDER BY target_path",
+            (task_id,),
+        ).fetchall()
+        return [str(row["target_path"]) for row in rows]
 
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         """Get task plus project metadata."""
@@ -883,6 +916,50 @@ class Store:
                 edges,
             )
 
+    def _replace_roadmap_file_targets(self, roadmap_id: int, roadmap: "Roadmap") -> None:
+        """Replace file target rows for one roadmap based on parsed task metadata."""
+        task_rows = self._conn.execute(
+            "SELECT id, task_number FROM tasks WHERE roadmap_id = ?",
+            (roadmap_id,),
+        ).fetchall()
+        task_id_by_number = {
+            str(row["task_number"]).strip(): int(row["id"])
+            for row in task_rows
+        }
+
+        target_rows: list[tuple[int, str]] = []
+        for phase in roadmap.phases:
+            for task in phase.tasks:
+                task_number = task.number.strip()
+                task_id = task_id_by_number.get(task_number)
+                if task_id is None:
+                    raise ValueError(f"Cannot map file targets: missing task {task_number}")
+                for target in self._normalize_file_targets(task.file_targets):
+                    target_rows.append((task_id, target))
+
+        task_ids = [int(row["id"]) for row in task_rows]
+        if task_ids:
+            placeholders = ", ".join("?" for _ in task_ids)
+            self._conn.execute(
+                f"DELETE FROM task_file_targets WHERE task_id IN ({placeholders})",
+                task_ids,
+            )
+        if target_rows:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO task_file_targets (task_id, target_path) VALUES (?, ?)",
+                target_rows,
+            )
+
+    def _replace_task_file_targets(self, task_id: int, file_targets: list[str]) -> None:
+        """Replace file targets for one task within the current transaction."""
+        normalized = self._normalize_file_targets(file_targets)
+        self._conn.execute("DELETE FROM task_file_targets WHERE task_id = ?", (task_id,))
+        if normalized:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO task_file_targets (task_id, target_path) VALUES (?, ?)",
+                [(task_id, target) for target in normalized],
+            )
+
     @staticmethod
     def _find_dependency_cycle(graph: dict[str, list[str]]) -> list[str]:
         """Return one cycle path when graph contains a dependency cycle."""
@@ -944,6 +1021,36 @@ class Store:
         """Return a compact identity fingerprint for a task body."""
         return (title.strip(), description.strip())
 
+    @staticmethod
+    def _normalize_file_targets(file_targets: list[str]) -> list[str]:
+        """Normalize file target values into stable slash-delimited paths."""
+        normalized_targets: list[str] = []
+        seen: set[str] = set()
+        for raw_target in file_targets:
+            target = Store._normalize_file_target(raw_target)
+            if target is None or target in seen:
+                continue
+            normalized_targets.append(target)
+            seen.add(target)
+        return normalized_targets
+
+    @staticmethod
+    def _normalize_file_target(raw_target: str) -> str | None:
+        """Normalize one file target string."""
+        value = str(raw_target).strip().strip("`").strip().strip("\"'")
+        if not value:
+            return None
+
+        value = value.replace("\\", "/")
+        parts = [part for part in value.split("/") if part and part != "."]
+        if not parts:
+            return None
+
+        normalized = PurePosixPath(*parts).as_posix().strip()
+        if not normalized or normalized == ".":
+            return None
+        return normalized
+
     def _clear_task_relationships(self, task_ids: list[int]) -> None:
         """Detach task-linked rows that must survive task deletion."""
         if not task_ids:
@@ -959,6 +1066,10 @@ class Store:
         )
         self._conn.execute(
             f"DELETE FROM git_worktrees WHERE task_id IN ({placeholders})",
+            task_ids,
+        )
+        self._conn.execute(
+            f"DELETE FROM task_file_targets WHERE task_id IN ({placeholders})",
             task_ids,
         )
         self._conn.execute(

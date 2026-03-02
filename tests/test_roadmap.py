@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from yeehaw.roadmap.parser import parse_roadmap, validate_roadmap
+from yeehaw.roadmap.parser import parse_roadmap, parse_task_file_targets, validate_roadmap
 
 
 def test_parse_roadmap_happy_path() -> None:
@@ -94,9 +94,29 @@ Implement envelope types and response helpers.
     task = roadmap.phases[0].tasks[0]
     assert task.number == "0.1"
     assert task.title == "httputil — envelope types and response helpers"
+    assert task.file_targets == ["httputil/envelope.go"]
     assert "**Depends on:** none" in task.description
     assert "- [ ] Envelope serializes correctly" in task.description
     assert validate_roadmap(roadmap) == []
+
+
+def test_parse_task_file_targets_normalizes_and_deduplicates() -> None:
+    description = """
+**Depends on:** none
+**Files:**
+- `./src/yeehaw/store/store.py` — update persistence
+- .\\tests\\test_store.py - add coverage
+- src//yeehaw//store//store.py
+- `src/yeehaw/store/schema.py`
+**Description:**
+Implement store changes.
+""".strip()
+
+    assert parse_task_file_targets(description) == [
+        "src/yeehaw/store/store.py",
+        "tests/test_store.py",
+        "src/yeehaw/store/schema.py",
+    ]
 
 
 def test_validate_roadmap_rejects_unknown_dependency() -> None:

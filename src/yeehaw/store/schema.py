@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
     UNIQUE (blocked_task_id, blocker_task_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_file_targets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    target_path TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (task_id, target_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_file_targets_task_id
+    ON task_file_targets(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_file_targets_target_path
+    ON task_file_targets(target_path);
+
 CREATE TABLE IF NOT EXISTS git_worktrees (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     INTEGER NOT NULL REFERENCES tasks(id),
