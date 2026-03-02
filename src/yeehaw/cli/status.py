@@ -353,7 +353,10 @@ def _resolve_budget_metadata(task: dict[str, Any]) -> dict[str, Any]:
 def _annotate_budget_metadata(tasks: list[dict[str, Any]]) -> None:
     """Attach budget metadata for status rendering."""
     for task in tasks:
-        task["budget"] = _resolve_budget_metadata(task)
+        budget = _resolve_budget_metadata(task)
+        task["budget"] = budget
+        task["budget_state"] = str(budget.get("pressure_level") or "none")
+        task["budget_source"] = str(budget.get("pressure_source") or "none")
 
 
 def _parse_reconcile_source(task: dict[str, Any]) -> dict[str, Any] | None:
@@ -435,6 +438,7 @@ def _annotate_reconcile_metadata(tasks: list[dict[str, Any]]) -> None:
             ),
             "linked_tasks": linked,
         }
+        task["reconcile_state"] = state
 
 
 def _normalize_conflict_blockers(conflicts: list[dict[str, Any]]) -> list[dict[str, Any]]:

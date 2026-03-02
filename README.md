@@ -256,6 +256,9 @@ Columns:
 - `Merge`: latest merge/rebase diagnostic summary (non-success states only), else `n/a`.
 
 In `--json` mode, each task includes these status-augmentation fields:
+- `budget_state`: convenience mirror of `budget.pressure_level` (`none|configured|ok|warn|exceeded`).
+- `budget_source`: convenience mirror of `budget.pressure_source` (`none|tokens|runtime`).
+- `reconcile_state`: convenience mirror of `reconcile.state` (`none|task|source_active|source_closed`).
 - `hold`:
   - `null` when no known hold metadata is present.
   - for overlap conflict holds:

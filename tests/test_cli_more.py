@@ -1436,6 +1436,8 @@ def test_handle_status_budget_indicator_and_json_fields(
     cli_status.handle_status(Namespace(project=None, as_json=True), db_path)
     payload = json.loads(capsys.readouterr().out)
     task = next(item for item in payload if item["id"] == task_id)
+    assert task["budget_state"] == "warn"
+    assert task["budget_source"] == "tokens"
     budget = task["budget"]
     assert budget["has_budget"] is True
     assert budget["max_tokens"] == 1000
@@ -1484,6 +1486,8 @@ def test_handle_status_reconcile_indicator_and_json_fields(
     payload = json.loads(capsys.readouterr().out)
     source_task = next(item for item in payload if item["id"] == source_task_id)
     reconcile_task_payload = next(item for item in payload if item["id"] == reconcile_task_id)
+    assert source_task["reconcile_state"] == "source_active"
+    assert reconcile_task_payload["reconcile_state"] == "task"
     assert source_task["reconcile"]["state"] == "source_active"
     assert source_task["reconcile"]["linked_tasks"] == [
         {
