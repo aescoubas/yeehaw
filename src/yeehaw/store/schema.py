@@ -97,6 +97,27 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS hook_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER,
+    roadmap_id  INTEGER,
+    phase_id    INTEGER,
+    task_id     INTEGER,
+    event_name  TEXT    NOT NULL,
+    event_id    TEXT    NOT NULL,
+    hook_name   TEXT    NOT NULL,
+    status      TEXT    NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+    summary     TEXT,
+    error       TEXT,
+    returncode  INTEGER,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_runs_event ON hook_runs(event_name, id DESC);
+CREATE INDEX IF NOT EXISTS idx_hook_runs_task ON hook_runs(task_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hook_runs_event_hook ON hook_runs(event_id, hook_name);
+
 CREATE TABLE IF NOT EXISTS scheduler_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     max_global_tasks    INTEGER NOT NULL DEFAULT 5,

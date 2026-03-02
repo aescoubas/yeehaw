@@ -6,6 +6,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -59,6 +60,21 @@ def _init_git_repo(repo_root: Path) -> None:
     (repo_root / "README.md").write_text("seed\n")
     subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "seed"], cwd=repo_root, check=True, capture_output=True)
+
+
+def _hook_definition_for_events(
+    repo_root: Path,
+    *,
+    name: str,
+    events: tuple[str, ...],
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        entrypoint=repo_root / f"{name}.sh",
+        events=events,
+        source="runtime",
+        metadata_path=repo_root / f"{name}.json",
+    )
 
 
 def test_dispatch_queued_launches_task(
@@ -427,6 +443,178 @@ def test_dispatch_queued_creates_integration_branch_and_uses_as_base(
     assert roadmap is not None
     assert roadmap["integration_branch"] == f"yeehaw/roadmap-{roadmap_id}"
     assert captured["base_ref"] == f"yeehaw/roadmap-{roadmap_id}"
+
+
+def test_hook_events_execute_in_lifecycle_order(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    def fake_prepare_worktree(
+        _repo_root: Path,
+        _runtime_root: Path,
+        _branch: str,
+        base_ref: str = "HEAD",
+    ) -> Path:
+        _ = base_ref
+        worktree = repo_root / "worktree"
+        worktree.mkdir(parents=True, exist_ok=True)
+        return worktree
+
+    monkeypatch.setattr(engine, "prepare_worktree", fake_prepare_worktree)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    hooks = [
+        _hook_definition_for_events(
+            repo_root,
+            name="observer",
+            events=(
+                "pre_dispatch",
+                "post_dispatch",
+                "pre_merge",
+                "post_merge",
+                "on_phase_complete",
+                "on_roadmap_complete",
+            ),
+        ),
+    ]
+    observed_events: list[str] = []
+
+    def fake_run_hooks(
+        subscribed_hooks: list[SimpleNamespace],
+        request: Any,
+        **_kwargs: Any,
+    ) -> list[SimpleNamespace]:
+        observed_events.append(request.event_name)
+        results: list[SimpleNamespace] = []
+        for hook in subscribed_hooks:
+            results.append(
+                SimpleNamespace(
+                    hook=hook,
+                    request=request,
+                    response=SimpleNamespace(
+                        schema_version=request.schema_version,
+                        event_id=request.event_id,
+                        extension=hook.name,
+                        status="ok",
+                        summary=f"{request.event_name} handled",
+                        actions=(),
+                        metrics={},
+                    ),
+                    error=None,
+                    returncode=0,
+                    duration_ms=8,
+                    stdout="",
+                    stderr="",
+                )
+            )
+        return results
+
+    monkeypatch.setattr(engine, "load_hooks", lambda runtime_root: hooks)
+    monkeypatch.setattr(engine, "run_hooks", fake_run_hooks)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_ensure_integration_branch", lambda _task: "yeehaw/roadmap-1")
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    signal_dir = Path(str(task["signal_dir"]))
+    signal_file = signal_dir / "signal.json"
+    signal_file.write_text(json.dumps({"task_id": ids["task_id"], "status": "done", "summary": "ok"}))
+
+    monkeypatch.setattr(orchestrator, "_validate_done_signal_worktree", lambda _task: None)
+    monkeypatch.setattr(orchestrator, "_merge_done_task_branch", lambda _task: None)
+    orchestrator._process_signal_file(signal_file)
+
+    assert observed_events == [
+        "pre_dispatch",
+        "post_dispatch",
+        "pre_merge",
+        "post_merge",
+        "on_phase_complete",
+        "on_roadmap_complete",
+    ]
+
+    hook_event_rows = store._conn.execute(
+        "SELECT event_name FROM hook_runs ORDER BY id ASC",
+    ).fetchall()
+    assert [str(row[0]) for row in hook_event_rows] == observed_events
+
+    persisted_rows = store._conn.execute(
+        "SELECT status, duration_ms, summary FROM hook_runs ORDER BY id ASC",
+    ).fetchall()
+    assert all(str(row[0]) == "ok" for row in persisted_rows)
+    assert all(int(row[1]) == 8 for row in persisted_rows)
+    assert all(str(row[2]).endswith("handled") for row in persisted_rows)
+
+
+def test_hook_failure_persists_diagnostics_and_remains_fail_open(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(engine, "launch_agent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    hooks = [
+        _hook_definition_for_events(repo_root, name="failing-hook", events=("pre_dispatch",)),
+    ]
+
+    def fake_run_hooks(
+        subscribed_hooks: list[SimpleNamespace],
+        request: Any,
+        **_kwargs: Any,
+    ) -> list[SimpleNamespace]:
+        hook = subscribed_hooks[0]
+        error = RuntimeError(
+            f"Hook '{hook.name}' exited with code 1 for event '{request.event_name}'",
+        )
+        return [
+            SimpleNamespace(
+                hook=hook,
+                request=request,
+                response=None,
+                error=error,
+                returncode=1,
+                duration_ms=17,
+                stdout="",
+                stderr="boom",
+            )
+        ]
+
+    monkeypatch.setattr(engine, "load_hooks", lambda runtime_root: hooks)
+    monkeypatch.setattr(engine, "run_hooks", fake_run_hooks)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator, "_ensure_integration_branch", lambda _task: "yeehaw/roadmap-1")
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "in-progress"
+
+    hook_runs = store.list_hook_runs(limit=10)
+    assert len(hook_runs) == 1
+    assert hook_runs[0]["event_name"] == "pre_dispatch"
+    assert hook_runs[0]["hook_name"] == "failing-hook"
+    assert hook_runs[0]["status"] == "failed"
+    assert hook_runs[0]["duration_ms"] == 17
+    assert "exited with code 1" in str(hook_runs[0]["summary"] or "")
+
+    events = store.list_events(limit=10)
+    assert any(event["kind"] == "hook_invocation_failed" for event in events)
+
+    alerts = store.list_alerts()
+    assert any("failing-hook" in alert["message"] for alert in alerts)
 
 
 def test_process_signal_done_completes_task(

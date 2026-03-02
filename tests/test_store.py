@@ -332,3 +332,54 @@ def test_set_roadmap_integration_branch_persists(store: Store) -> None:
     roadmap = store.get_roadmap(roadmap_id)
     assert roadmap is not None
     assert roadmap["integration_branch"] == "yeehaw/roadmap-123"
+
+
+def test_hook_run_persistence_and_filters(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    first_id = store.create_hook_run(
+        project_id=project_id,
+        roadmap_id=roadmap_id,
+        phase_id=phase_id,
+        task_id=task_id,
+        event_name="pre_dispatch",
+        event_id="event-1",
+        hook_name="notify",
+        status="ok",
+        duration_ms=12,
+        summary="queued for dispatch",
+    )
+    second_id = store.create_hook_run(
+        project_id=project_id,
+        roadmap_id=roadmap_id,
+        phase_id=phase_id,
+        task_id=task_id,
+        event_name="on_fail",
+        event_id="event-2",
+        hook_name="notify",
+        status="failed",
+        duration_ms=44,
+        summary="merge conflict",
+        error="Hook process exited with 1",
+        returncode=1,
+    )
+
+    first = store.get_hook_run(first_id)
+    assert first is not None
+    assert first["status"] == "ok"
+    assert first["duration_ms"] == 12
+    assert first["summary"] == "queued for dispatch"
+
+    all_runs = store.list_hook_runs(limit=10, task_id=task_id)
+    assert [row["id"] for row in all_runs] == [second_id, first_id]
+
+    failure_runs = store.list_hook_runs(limit=10, event_name="on_fail")
+    assert len(failure_runs) == 1
+    assert failure_runs[0]["id"] == second_id
+    assert failure_runs[0]["status"] == "failed"
+    assert failure_runs[0]["duration_ms"] == 44
+    assert failure_runs[0]["summary"] == "merge conflict"
+    assert failure_runs[0]["returncode"] == 1

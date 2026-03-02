@@ -10,11 +10,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from yeehaw.agent.launcher import build_task_prompt, write_launcher
 from yeehaw.agent.profiles import resolve_profile
 from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_launch_config
 from yeehaw.git.worktree import branch_name, cleanup_worktree, prepare_worktree
+from yeehaw.hooks import HookDefinition, HookRequest, HookRunResult, load_hooks, run_hooks
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
 from yeehaw.tmux.session import (
@@ -29,6 +31,7 @@ MAIN_BRANCH = "main"
 INTEGRATION_BRANCH_PREFIX = "yeehaw/roadmap-"
 MERGE_WORKTREE_DIR = "merge-worktrees"
 REBASE_WORKTREE_DIR = "rebase-worktrees"
+HOOK_SCHEMA_VERSION = 1
 
 
 class Orchestrator:
@@ -50,6 +53,7 @@ class Orchestrator:
         self.running = False
         self._stop_event = threading.Event()
         self._poll_counter = 0
+        self._hooks_by_event = self._load_hooks_by_event()
 
     def run(self, project_id: int | None = None) -> None:
         """Start orchestrator loop until stopped."""
@@ -122,11 +126,28 @@ class Orchestrator:
             cleanliness_error = self._validate_done_signal_worktree(task)
             if cleanliness_error:
                 self.store.fail_task(task["id"], cleanliness_error)
+                failed_task = self.store.get_task(int(task["id"])) or task
+                self._emit_on_fail(failed_task, reason=cleanliness_error, stage="done_validation")
                 self._maybe_retry(task)
             else:
+                self._emit_hook_event(
+                    "pre_merge",
+                    task=task,
+                    context={"signal_status": "done"},
+                )
                 merge_error = self._merge_done_task_branch(task)
+                self._emit_hook_event(
+                    "post_merge",
+                    task=task,
+                    context={
+                        "result": "failed" if merge_error else "merged",
+                        "error": merge_error,
+                    },
+                )
                 if merge_error:
                     self.store.fail_task(task["id"], merge_error)
+                    failed_task = self.store.get_task(int(task["id"])) or task
+                    self._emit_on_fail(failed_task, reason=merge_error, stage="merge")
                     self._maybe_retry(task)
                 else:
                     # Phase verify commands are phase-level gates and should run only
@@ -135,7 +156,10 @@ class Orchestrator:
                     self.store.log_event("task_done", data.get("summary", ""), task_id=task["id"])
 
         elif data["status"] == "failed":
-            self.store.fail_task(task["id"], data.get("summary", "Unknown failure"))
+            failure_reason = data.get("summary", "Unknown failure")
+            self.store.fail_task(task["id"], failure_reason)
+            failed_task = self.store.get_task(int(task["id"])) or task
+            self._emit_on_fail(failed_task, reason=failure_reason, stage="signal_failed")
             self._maybe_retry(task)
 
         elif data["status"] == "blocked":
@@ -166,9 +190,30 @@ class Orchestrator:
                 continue
             if not self.store.are_task_dependencies_satisfied(int(task["id"])):
                 continue
-            self._launch_task(task)
+            self._emit_hook_event(
+                "pre_dispatch",
+                task=task,
+                context={
+                    "global_active": self.store.count_active_tasks(),
+                    "project_active": project_active,
+                    "max_global_tasks": self.config["max_global_tasks"],
+                    "max_per_project": self.config["max_per_project"],
+                },
+            )
+            launch_error = self._launch_task(task)
+            refreshed = self.store.get_task(int(task["id"])) or task
+            self._emit_hook_event(
+                "post_dispatch",
+                task=refreshed,
+                context={
+                    "result": "failed" if launch_error else "launched",
+                    "error": launch_error,
+                },
+            )
+            if launch_error is not None:
+                self._emit_on_fail(refreshed, reason=launch_error, stage="dispatch")
 
-    def _launch_task(self, task: dict[str, Any]) -> None:
+    def _launch_task(self, task: dict[str, Any]) -> str | None:
         try:
             task_repo_root = self._task_repo_root(task)
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
@@ -253,6 +298,7 @@ class Orchestrator:
                 f"Agent: {profile.name}, log: {log_path}, prompt: {prompt_path}",
                 task_id=task["id"],
             )
+            return None
 
         except (subprocess.CalledProcessError, OSError, ValueError) as exc:
             self.store.fail_task(task["id"], str(exc))
@@ -261,6 +307,213 @@ class Orchestrator:
                 f"Failed to launch task {task['id']}: {exc}",
                 task_id=task["id"],
             )
+            return str(exc)
+
+    def _load_hooks_by_event(self) -> dict[str, tuple[HookDefinition, ...]]:
+        """Load configured hooks and group them by subscribed event."""
+        try:
+            hooks = load_hooks(runtime_root=self.runtime_root)
+        except ValueError as exc:
+            message = f"Failed to load hooks: {exc}"
+            self.store.log_event("hook_configuration_error", message)
+            self.store.create_alert("warn", message)
+            return {}
+
+        grouped: dict[str, list[HookDefinition]] = {}
+        for hook in hooks:
+            for event_name in hook.events:
+                grouped.setdefault(event_name, []).append(hook)
+        return {
+            event_name: tuple(subscribers)
+            for event_name, subscribers in grouped.items()
+        }
+
+    def _emit_hook_event(
+        self,
+        event_name: str,
+        *,
+        task: dict[str, Any] | None = None,
+        project_id: int | None = None,
+        roadmap_id: int | None = None,
+        phase_id: int | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one lifecycle hook event and persist hook run telemetry."""
+        hooks = self._hooks_by_event.get(event_name, ())
+        if not hooks:
+            return
+
+        resolved_project_id = project_id
+        resolved_roadmap_id = roadmap_id
+        resolved_phase_id = phase_id
+        resolved_task_id: int | None = None
+        if task is not None:
+            if resolved_project_id is None:
+                resolved_project_id = self._as_int(task.get("project_id"))
+            if resolved_roadmap_id is None:
+                resolved_roadmap_id = self._as_int(task.get("roadmap_id"))
+            if resolved_phase_id is None:
+                resolved_phase_id = self._as_int(task.get("phase_id"))
+            resolved_task_id = self._as_int(task.get("id"))
+
+        project_payload: dict[str, Any] | None = None
+        if resolved_project_id is not None:
+            project_payload = {"id": resolved_project_id}
+            if task is not None:
+                project_name = task.get("project_name")
+                if isinstance(project_name, str) and project_name:
+                    project_payload["name"] = project_name
+                project_repo_root = task.get("project_repo_root")
+                if isinstance(project_repo_root, str) and project_repo_root:
+                    project_payload["repo_root"] = project_repo_root
+
+        roadmap_payload: dict[str, Any] | None = None
+        if resolved_roadmap_id is not None:
+            roadmap_payload = {"id": resolved_roadmap_id}
+            if task is not None:
+                roadmap_status = task.get("roadmap_status")
+                if isinstance(roadmap_status, str) and roadmap_status:
+                    roadmap_payload["status"] = roadmap_status
+                integration_branch = task.get("roadmap_integration_branch")
+                if isinstance(integration_branch, str) and integration_branch:
+                    roadmap_payload["integration_branch"] = integration_branch
+
+        task_payload: dict[str, Any] | None = None
+        attempt_payload: dict[str, Any] | None = None
+        if task is not None and resolved_task_id is not None:
+            task_payload = {
+                "id": resolved_task_id,
+                "task_number": task.get("task_number"),
+                "title": task.get("title"),
+                "status": task.get("status"),
+                "assigned_agent": task.get("assigned_agent"),
+                "branch_name": task.get("branch_name"),
+            }
+            current_attempt = self._as_int(task.get("attempts")) or 0
+            max_attempts = self._as_int(task.get("max_attempts")) or 0
+            attempt_payload = {
+                "current": current_attempt,
+                "max": max_attempts,
+                "timeout_minutes": int(self.config["task_timeout_min"]),
+            }
+
+        request = HookRequest(
+            schema_version=HOOK_SCHEMA_VERSION,
+            event_name=event_name,
+            event_id=str(uuid4()),
+            emitted_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            source={"component": "orchestrator"},
+            context=dict(context or {}),
+            project=project_payload,
+            roadmap=roadmap_payload,
+            task=task_payload,
+            attempt=attempt_payload,
+        )
+
+        try:
+            results = run_hooks(hooks, request)
+        except Exception as exc:
+            failure_message = f"Hook invocation failed for event '{event_name}': {exc}"
+            self.store.log_event(
+                "hook_invocation_failed",
+                failure_message,
+                project_id=resolved_project_id,
+                task_id=resolved_task_id,
+            )
+            self.store.create_alert(
+                "warn",
+                failure_message,
+                project_id=resolved_project_id,
+                task_id=resolved_task_id,
+            )
+            return
+
+        for result in results:
+            status, summary, error = self._hook_result_fields(result)
+            self.store.create_hook_run(
+                project_id=resolved_project_id,
+                roadmap_id=resolved_roadmap_id,
+                phase_id=resolved_phase_id,
+                task_id=resolved_task_id,
+                event_name=event_name,
+                event_id=request.event_id,
+                hook_name=result.hook.name,
+                status=status,
+                duration_ms=result.duration_ms,
+                summary=summary,
+                error=error,
+                returncode=result.returncode,
+            )
+            if result.error is None and status != "error":
+                continue
+
+            failure_message = self._hook_failure_message(result)
+            self.store.log_event(
+                "hook_invocation_failed",
+                failure_message,
+                project_id=resolved_project_id,
+                task_id=resolved_task_id,
+            )
+            self.store.create_alert(
+                "warn",
+                failure_message,
+                project_id=resolved_project_id,
+                task_id=resolved_task_id,
+            )
+
+    def _emit_on_fail(self, task: dict[str, Any], *, reason: str, stage: str) -> None:
+        """Emit standardized failure hook event payload."""
+        self._emit_hook_event(
+            "on_fail",
+            task=task,
+            context={"stage": stage, "reason": reason},
+        )
+
+    @staticmethod
+    def _hook_result_fields(result: HookRunResult) -> tuple[str, str | None, str | None]:
+        """Normalize hook runner output for persisted telemetry rows."""
+        if result.response is not None:
+            summary = result.response.summary
+            if summary is None and result.response.status == "error":
+                summary = f"Hook '{result.hook.name}' returned error status"
+            return (result.response.status, summary, None)
+
+        error = str(result.error) if result.error is not None else None
+        return ("failed", error, error)
+
+    @staticmethod
+    def _hook_failure_message(result: HookRunResult) -> str:
+        """Format a concise operational diagnostic for failed hook invocations."""
+        prefix = f"Hook '{result.hook.name}' failed for event '{result.request.event_name}'"
+        if result.error is not None:
+            return f"{prefix}: {result.error}"
+        if result.response is not None and result.response.summary:
+            return f"{prefix}: {result.response.summary}"
+        return f"{prefix}: status={result.response.status if result.response else 'unknown'}"
+
+    @staticmethod
+    def _as_int(value: Any) -> int | None:
+        """Best-effort conversion to int for optional metadata fields."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    def _phase_task_context(self, phase_id: int) -> dict[str, Any] | None:
+        """Return one joined task row to anchor phase/roadmap hook payloads."""
+        phase_tasks = self.store.list_tasks_by_phase(phase_id)
+        if not phase_tasks:
+            return None
+        first_task_id = self._as_int(phase_tasks[0].get("id"))
+        if first_task_id is None:
+            return None
+        return self.store.get_task(first_task_id)
 
     def _run_verification(self, task: dict[str, Any]) -> bool:
         """Run phase verify command if configured."""
@@ -301,6 +554,8 @@ class Orchestrator:
             snapshot_path = self._write_pane_snapshot(task["id"], pane_text, "timeout")
             failure_msg = f"{failure_msg}. Pane snapshot: {snapshot_path}"
         self.store.fail_task(task["id"], failure_msg)
+        failed_task = self.store.get_task(int(task["id"])) or task
+        self._emit_on_fail(failed_task, reason=failure_msg, stage="timeout")
         self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
@@ -312,6 +567,8 @@ class Orchestrator:
         if latest_log is not None:
             failure_msg = f"{failure_msg}. Check log: {latest_log}"
         self.store.fail_task(task["id"], failure_msg)
+        failed_task = self.store.get_task(int(task["id"])) or task
+        self._emit_on_fail(failed_task, reason=failure_msg, stage="session_lost")
         self.store.log_event("session_lost", failure_msg, task_id=task["id"])
         self._maybe_retry(task)
         if task.get("worktree_path"):
@@ -353,6 +610,19 @@ class Orchestrator:
                 status = "completed"
             self.store.update_phase_status(phase_id, status)
             if status == "completed":
+                completed_phase = self.store.get_phase(phase_id)
+                if completed_phase is not None:
+                    self._emit_hook_event(
+                        "on_phase_complete",
+                        task=self._phase_task_context(phase_id),
+                        roadmap_id=int(completed_phase["roadmap_id"]),
+                        phase_id=phase_id,
+                        context={
+                            "phase_number": int(completed_phase["phase_number"]),
+                            "phase_title": str(completed_phase["title"]),
+                            "status": "completed",
+                        },
+                    )
                 self._queue_next_phase(phase_id)
 
     def _queue_next_phase(self, completed_phase_id: int) -> None:
@@ -376,6 +646,13 @@ class Orchestrator:
             self.store.log_event(
                 "roadmap_completed",
                 f"Roadmap {phase['roadmap_id']} finished",
+            )
+            self._emit_hook_event(
+                "on_roadmap_complete",
+                task=self._phase_task_context(completed_phase_id),
+                roadmap_id=int(phase["roadmap_id"]),
+                phase_id=completed_phase_id,
+                context={"roadmap_id": int(phase["roadmap_id"])},
             )
 
     def _ensure_integration_branch(self, task: dict[str, Any]) -> str:

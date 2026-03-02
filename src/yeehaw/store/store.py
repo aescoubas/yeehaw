@@ -509,6 +509,97 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def create_hook_run(
+        self,
+        *,
+        event_name: str,
+        event_id: str,
+        hook_name: str,
+        status: str,
+        duration_ms: int,
+        summary: str | None = None,
+        error: str | None = None,
+        returncode: int | None = None,
+        project_id: int | None = None,
+        roadmap_id: int | None = None,
+        phase_id: int | None = None,
+        task_id: int | None = None,
+    ) -> int:
+        """Persist telemetry for a single hook invocation."""
+        if duration_ms < 0:
+            raise ValueError("duration_ms must be >= 0")
+        cur = self._conn.execute(
+            """
+            INSERT INTO hook_runs (
+                project_id,
+                roadmap_id,
+                phase_id,
+                task_id,
+                event_name,
+                event_id,
+                hook_name,
+                status,
+                duration_ms,
+                summary,
+                error,
+                returncode
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                roadmap_id,
+                phase_id,
+                task_id,
+                event_name,
+                event_id,
+                hook_name,
+                status,
+                duration_ms,
+                summary,
+                error,
+                returncode,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_hook_run(self, hook_run_id: int) -> dict[str, Any] | None:
+        """Return one hook run row by id."""
+        row = self._conn.execute(
+            "SELECT * FROM hook_runs WHERE id = ?",
+            (hook_run_id,),
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    def list_hook_runs(
+        self,
+        *,
+        limit: int = 50,
+        event_name: str | None = None,
+        hook_name: str | None = None,
+        task_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List hook run telemetry newest-first with optional filters."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        query = "SELECT * FROM hook_runs WHERE 1 = 1"
+        params: list[Any] = []
+        if event_name is not None:
+            query += " AND event_name = ?"
+            params.append(event_name)
+        if hook_name is not None:
+            query += " AND hook_name = ?"
+            params.append(hook_name)
+        if task_id is not None:
+            query += " AND task_id = ?"
+            params.append(task_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def create_alert(
         self,
         severity: str,
