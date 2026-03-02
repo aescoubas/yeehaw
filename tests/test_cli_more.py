@@ -11,6 +11,7 @@ import pytest
 
 import yeehaw.cli.main as cli_main
 import yeehaw.cli.attach as cli_attach
+import yeehaw.cli.config as cli_config
 import yeehaw.cli.daemon as cli_daemon
 import yeehaw.cli.logs as cli_logs
 import yeehaw.cli.plan as cli_plan
@@ -93,6 +94,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.logs.handle_logs", _capture("logs"))
     monkeypatch.setattr("yeehaw.cli.daemon.handle_daemon", _capture("daemon"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
+    monkeypatch.setattr("yeehaw.cli.config.handle_config", _capture("config"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
     monkeypatch.setattr("yeehaw.cli.workers.handle_workers", _capture("workers"))
 
@@ -109,6 +111,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["logs", "1"])
     cli_main.main(["daemon", "status"])
     cli_main.main(["scheduler", "show"])
+    cli_main.main(["config", "show"])
     cli_main.main(["alerts"])
     cli_main.main(["workers", "show"])
 
@@ -125,10 +128,72 @@ def test_cli_main_dispatches_remaining_commands(
         "logs",
         "daemon",
         "scheduler",
+        "config",
         "alerts",
         "workers",
     ]
     assert all(db == runtime_root / "yeehaw.db" for _, db in calls)
+
+
+def test_handle_config_show_and_set(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("YEEHAW_HOME", str(db_path.parent))
+
+    cli_config.handle_config(Namespace(config_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "Runtime Configuration:" in out
+    assert "Feature Flags:" in out
+    assert "hooks: false" in out
+    assert "pr_automation: false" in out
+    assert "memory_packs: false" in out
+
+    cli_config.handle_config(Namespace(config_command="set", key="hooks", value="true"), db_path)
+    out = capsys.readouterr().out
+    assert "Updated features.hooks = true" in out
+
+    cli_config.handle_config(Namespace(config_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "hooks: true" in out
+    assert "policies: false" in out
+
+
+def test_handle_config_set_validation_errors(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("YEEHAW_HOME", str(db_path.parent))
+
+    cli_config.handle_config(
+        Namespace(config_command="set", key="hooks", value="not-a-bool"),
+        db_path,
+    )
+    assert "invalid value 'not-a-bool'" in capsys.readouterr().out
+
+    cli_config.handle_config(
+        Namespace(config_command="set", key="unknown_flag", value="true"),
+        db_path,
+    )
+    assert "unsupported feature flag 'unknown_flag'" in capsys.readouterr().out
+
+
+def test_handle_config_show_errors_on_invalid_runtime_config(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("YEEHAW_HOME", str(db_path.parent))
+    runtime_config = db_path.parent / "config" / "runtime.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text('{"features":{"hooks":"yes"}}')
+
+    cli_config.handle_config(Namespace(config_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "Error: Invalid runtime config" in out
+    assert "features.hooks must be a boolean" in out
 
 
 def test_handle_roadmap_create_branches(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

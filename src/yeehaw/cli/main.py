@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from yeehaw.config.models import FEATURE_FLAG_NAMES
 from yeehaw.runtime import default_db_path
 
 
@@ -246,6 +247,28 @@ def main(argv: list[str] | None = None) -> None:
     config_parser.add_argument("--tick", type=int, help="Tick interval in seconds")
     config_parser.add_argument("--timeout", type=int, help="Task timeout in minutes")
 
+    runtime_config_parser = subparsers.add_parser(
+        "config",
+        help="Show and update runtime feature flags",
+    )
+    runtime_config_sub = runtime_config_parser.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    runtime_config_sub.add_parser("show", help="Show effective runtime feature flags")
+
+    set_config = runtime_config_sub.add_parser("set", help="Set a runtime feature flag")
+    set_config.add_argument(
+        "key",
+        choices=FEATURE_FLAG_NAMES,
+        help="Feature flag name",
+    )
+    set_config.add_argument(
+        "value",
+        choices=("true", "false"),
+        help="Feature flag value",
+    )
+
     alerts_parser = subparsers.add_parser("alerts", help="Show alerts")
     alerts_parser.add_argument(
         "--ack",
@@ -314,6 +337,11 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.scheduler import handle_scheduler
 
         handle_scheduler(args, _get_db_path())
+
+    elif args.command == "config":
+        from yeehaw.cli.config import handle_config
+
+        handle_config(args, _get_db_path())
 
     elif args.command == "alerts":
         from yeehaw.cli.status import handle_alerts
