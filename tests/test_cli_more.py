@@ -16,6 +16,7 @@ import yeehaw.cli.context as cli_context
 import yeehaw.cli.config as cli_config
 import yeehaw.cli.daemon as cli_daemon
 import yeehaw.cli.logs as cli_logs
+import yeehaw.cli.notify as cli_notify
 import yeehaw.cli.plan as cli_plan
 import yeehaw.cli.policy as cli_policy
 import yeehaw.cli.roadmap as cli_roadmap
@@ -124,6 +125,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.daemon.handle_daemon", _capture("daemon"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.config.handle_config", _capture("config"))
+    monkeypatch.setattr("yeehaw.cli.notify.handle_notify", _capture("notify"))
     monkeypatch.setattr("yeehaw.cli.context.handle_context", _capture("context"))
     monkeypatch.setattr("yeehaw.cli.policy.handle_policy", _capture("policy"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
@@ -144,6 +146,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["daemon", "status"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["config", "show"])
+    cli_main.main(["notify", "show"])
     cli_main.main(["context", "show", "--project", "p"])
     cli_main.main(["policy", "lint", "--project", "p"])
     cli_main.main(["alerts"])
@@ -164,6 +167,7 @@ def test_cli_main_dispatches_remaining_commands(
         "daemon",
         "scheduler",
         "config",
+        "notify",
         "context",
         "policy",
         "alerts",
@@ -315,6 +319,258 @@ def test_handle_config_show_errors_on_invalid_runtime_config(
     out = capsys.readouterr().out
     assert "Error: Invalid runtime config" in out
     assert "features.hooks must be a boolean" in out
+
+
+def test_handle_notify_show_set_and_test_success(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_notify.handle_notify(Namespace(notify_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "Notification Configuration:" in out
+    assert "notifications.json (not found)" in out
+    assert "Sinks: (none)" in out
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="set",
+            name="ops",
+            url="https://notify.example.com/hooks",
+            events=["task_done", "task_failed"],
+            header=["Authorization=Bearer token"],
+            method="POST",
+            enabled=False,
+            disabled=False,
+            timeout_sec=4.0,
+            max_attempts=2,
+            backoff_initial_sec=0.2,
+            backoff_multiplier=2.5,
+            backoff_max_sec=1.0,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Added notification sink 'ops'." in out
+    assert "notifications.json" in out
+
+    notify_config_path = db_path.parent / "config" / "notifications.json"
+    payload = json.loads(notify_config_path.read_text())
+    assert payload["sinks"][0]["name"] == "ops"
+    assert payload["sinks"][0]["events"] == ["task_done", "task_failed"]
+    assert payload["sinks"][0]["headers"]["Authorization"] == "Bearer token"
+
+    cli_notify.handle_notify(Namespace(notify_command="show"), db_path)
+    out = capsys.readouterr().out
+    assert "ops (type=webhook, enabled=true)" in out
+    assert "events: task_done, task_failed" in out
+
+    dispatched: list[tuple[str, dict[str, Any], float | None]] = []
+
+    class FakeDispatcher:
+        def __init__(self, _config: Any) -> None:
+            pass
+
+        def __enter__(self) -> FakeDispatcher:
+            return self
+
+        def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+            return None
+
+        def dispatch_sync(
+            self,
+            event_name: str,
+            payload: dict[str, Any],
+            *,
+            timeout_sec: float | None = None,
+        ) -> tuple[cli_notify.SinkDeliveryResult, ...]:
+            dispatched.append((event_name, payload, timeout_sec))
+            return (
+                cli_notify.SinkDeliveryResult.success(
+                    sink_name="ops",
+                    sink_type="webhook",
+                    event_name=event_name,
+                    attempts=1,
+                    status_code=204,
+                ),
+            )
+
+    monkeypatch.setattr(cli_notify, "NotificationDispatcher", FakeDispatcher)
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="test",
+            event="task_done",
+            reason="CLI smoke test",
+            project_id=1,
+            project_name="proj-a",
+            roadmap_id=2,
+            phase_id=3,
+            task_id=4,
+            task_number="1.1",
+            task_status="done",
+            payload='{"source":"cli"}',
+            dry_run=True,
+            timeout_sec=3.0,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Notification test event: task_done" in out
+    assert '"source": "cli"' in out
+    assert "Matching sinks: 1" in out
+    assert "Dry run enabled; dispatch skipped." in out
+    assert dispatched == []
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="test",
+            event="task_done",
+            reason="CLI smoke test",
+            project_id=1,
+            project_name="proj-a",
+            roadmap_id=2,
+            phase_id=3,
+            task_id=4,
+            task_number="1.1",
+            task_status="done",
+            payload='{"source":"cli"}',
+            dry_run=False,
+            timeout_sec=3.0,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "ops [webhook] ok" in out
+    assert "Delivery summary: 1 succeeded, 0 failed." in out
+    assert len(dispatched) == 1
+    event_name, dispatched_payload, timeout = dispatched[0]
+    assert event_name == "task_done"
+    assert dispatched_payload["reason"] == "CLI smoke test"
+    assert dispatched_payload["source"] == "cli"
+    assert timeout == 3.0
+
+
+def test_handle_notify_failure_paths(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="set",
+            name="ops",
+            url="https://notify.example.com/hooks",
+            events=[],
+            header=["missing-separator"],
+            method="POST",
+            enabled=False,
+            disabled=False,
+            timeout_sec=None,
+            max_attempts=None,
+            backoff_initial_sec=None,
+            backoff_multiplier=None,
+            backoff_max_sec=None,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "invalid header" in out
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="set",
+            name="ops",
+            url="https://notify.example.com/hooks",
+            events=["task_done"],
+            header=[],
+            method="POST",
+            enabled=False,
+            disabled=False,
+            timeout_sec=None,
+            max_attempts=None,
+            backoff_initial_sec=None,
+            backoff_multiplier=None,
+            backoff_max_sec=None,
+        ),
+        db_path,
+    )
+    capsys.readouterr()
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="test",
+            event="task_done",
+            reason="CLI smoke test",
+            project_id=None,
+            project_name=None,
+            roadmap_id=None,
+            phase_id=None,
+            task_id=None,
+            task_number=None,
+            task_status=None,
+            payload="[]",
+            dry_run=False,
+            timeout_sec=3.0,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "--payload must decode to a JSON object" in out
+
+    class FakeDispatcher:
+        def __init__(self, _config: Any) -> None:
+            pass
+
+        def __enter__(self) -> FakeDispatcher:
+            return self
+
+        def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+            return None
+
+        def dispatch_sync(
+            self,
+            event_name: str,
+            payload: dict[str, Any],
+            *,
+            timeout_sec: float | None = None,
+        ) -> tuple[cli_notify.SinkDeliveryResult, ...]:
+            _ = (payload, timeout_sec)
+            return (
+                cli_notify.SinkDeliveryResult.failure(
+                    sink_name="ops",
+                    sink_type="webhook",
+                    event_name=event_name,
+                    attempts=2,
+                    status_code=500,
+                    error="Webhook returned HTTP 500",
+                ),
+            )
+
+    monkeypatch.setattr(cli_notify, "NotificationDispatcher", FakeDispatcher)
+
+    cli_notify.handle_notify(
+        Namespace(
+            notify_command="test",
+            event="task_done",
+            reason="CLI smoke test",
+            project_id=None,
+            project_name=None,
+            roadmap_id=None,
+            phase_id=None,
+            task_id=None,
+            task_number=None,
+            task_status=None,
+            payload=None,
+            dry_run=False,
+            timeout_sec=3.0,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "ops [webhook] failed" in out
+    assert "Webhook returned HTTP 500" in out
+    assert "Delivery summary: 0 succeeded, 1 failed." in out
 
 
 def test_handle_policy_lint_success_and_failure(

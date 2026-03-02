@@ -286,6 +286,98 @@ def main(argv: list[str] | None = None) -> None:
         help="Feature flag value",
     )
 
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help="Manage notification sink configuration and test dispatch",
+    )
+    notify_sub = notify_parser.add_subparsers(dest="notify_command", required=True)
+
+    notify_sub.add_parser("show", help="Show notification sink configuration")
+
+    notify_set = notify_sub.add_parser("set", help="Create or update a webhook sink")
+    notify_set.add_argument("--name", required=True, help="Sink name")
+    notify_set.add_argument("--url", required=True, help="Webhook URL")
+    notify_set.add_argument(
+        "--event",
+        dest="events",
+        action="append",
+        default=[],
+        help="Event name filter; repeatable (default: all events)",
+    )
+    notify_set.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="HTTP header in KEY=VALUE form; repeatable",
+    )
+    notify_set.add_argument(
+        "--method",
+        default="POST",
+        help="HTTP method for webhook requests (default: POST)",
+    )
+    notify_state = notify_set.add_mutually_exclusive_group()
+    notify_state.add_argument(
+        "--enabled",
+        action="store_true",
+        help="Enable sink (default when neither --enabled/--disabled is provided)",
+    )
+    notify_state.add_argument(
+        "--disabled",
+        action="store_true",
+        help="Disable sink",
+    )
+    notify_set.add_argument("--timeout-sec", type=float, help="Sink timeout in seconds")
+    notify_set.add_argument("--max-attempts", type=int, help="Maximum delivery attempts")
+    notify_set.add_argument(
+        "--backoff-initial-sec",
+        type=float,
+        help="Initial backoff delay in seconds",
+    )
+    notify_set.add_argument(
+        "--backoff-multiplier",
+        type=float,
+        help="Backoff multiplier between retries",
+    )
+    notify_set.add_argument(
+        "--backoff-max-sec",
+        type=float,
+        help="Maximum backoff delay in seconds",
+    )
+
+    notify_test = notify_sub.add_parser("test", help="Dispatch a synthetic notification event")
+    notify_test.add_argument(
+        "--event",
+        default="task_done",
+        help="Synthetic event name (default: task_done)",
+    )
+    notify_test.add_argument(
+        "--reason",
+        default="Manual notification test",
+        help="Synthetic reason string (default: Manual notification test)",
+    )
+    notify_test.add_argument("--project-id", type=int, help="Synthetic project ID")
+    notify_test.add_argument("--project-name", help="Synthetic project name")
+    notify_test.add_argument("--roadmap-id", type=int, help="Synthetic roadmap ID")
+    notify_test.add_argument("--phase-id", type=int, help="Synthetic phase ID")
+    notify_test.add_argument("--task-id", type=int, help="Synthetic task ID")
+    notify_test.add_argument("--task-number", help="Synthetic task number")
+    notify_test.add_argument("--task-status", help="Synthetic task status")
+    notify_test.add_argument(
+        "--payload",
+        help="Extra JSON object merged into synthetic payload",
+    )
+    notify_test.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print synthetic payload without sending notification requests",
+    )
+    notify_test.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=10.0,
+        help="Per-sink wait timeout in seconds for test dispatch (default: 10)",
+    )
+
     alerts_parser = subparsers.add_parser("alerts", help="Show alerts")
     alerts_parser.add_argument(
         "--ack",
@@ -404,6 +496,11 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.config import handle_config
 
         handle_config(args, _get_db_path())
+
+    elif args.command == "notify":
+        from yeehaw.cli.notify import handle_notify
+
+        handle_notify(args, _get_db_path())
 
     elif args.command == "alerts":
         from yeehaw.cli.status import handle_alerts
