@@ -435,11 +435,18 @@ class Store:
             source_task_number=source_task_number,
         )
         title = f"Reconcile {source_task_number} after repeated failures"
+        observed_failures: list[str] = []
+        if failure_messages:
+            observed_failures.extend(str(message) for message in failure_messages)
+        last_failure = failed_task.get("last_failure")
+        if isinstance(last_failure, str) and last_failure.strip():
+            observed_failures.append(last_failure)
+
         description = self._build_reconcile_description(
             failed_task=failed_task,
             failure_threshold=failure_threshold,
             observed_attempts=observed_attempts,
-            failure_messages=failure_messages or [],
+            failure_messages=observed_failures,
         )
         file_targets = self.list_task_file_targets(failed_task_id)
         reconcile_task_id = self.create_task(

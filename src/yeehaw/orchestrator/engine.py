@@ -1200,7 +1200,7 @@ class Orchestrator:
             ),
         )
 
-        if self._is_reconcile_task(task):
+        if self._is_reconcile_task(exhausted_task):
             self.store.create_alert(
                 "error",
                 exhausted_reason,
@@ -1210,7 +1210,11 @@ class Orchestrator:
 
         failure_messages = [
             str(message).strip()
-            for message in (task.get("last_failure"), failure_reason)
+            for message in (
+                task.get("last_failure"),
+                exhausted_task.get("last_failure"),
+                failure_reason,
+            )
             if isinstance(message, str) and message.strip()
         ]
         reconcile_task_id = self.store.create_linked_reconcile_task(

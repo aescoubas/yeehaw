@@ -1317,6 +1317,39 @@ def test_process_signal_failed_exhausted_retries_queues_reconcile_task(
     assert "queued reconcile task" in alerts[0]["message"]
 
 
+def test_maybe_retry_uses_latest_failure_for_reconcile_context(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    store._conn.execute(
+        "UPDATE tasks SET attempts = 1, max_attempts = 1, last_failure = ? WHERE id = ?",
+        ("persisted failure context", ids["task_id"]),
+    )
+    store._conn.commit()
+
+    stale_task = store.get_task(ids["task_id"])
+    assert stale_task is not None
+    stale_task = dict(stale_task)
+    stale_task["last_failure"] = None
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._maybe_retry(stale_task, failure_reason=None)
+
+    phase_tasks = store.list_tasks_by_phase(ids["phase_id"])
+    reconcile = next(
+        (
+            candidate
+            for candidate in phase_tasks
+            if str(candidate["title"]).startswith("Reconcile 1.1 after repeated failures")
+        ),
+        None,
+    )
+    assert reconcile is not None
+    assert "Failure 1: persisted failure context" in str(reconcile["description"])
+
+
 def test_notifications_disabled_does_not_initialize_dispatcher(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,
