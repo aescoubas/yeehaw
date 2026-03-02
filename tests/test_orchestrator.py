@@ -375,6 +375,138 @@ def test_dispatch_queued_invalid_worker_config_fails_task(
     assert any("Failed to launch task" in alert["message"] for alert in alerts)
 
 
+def test_dispatch_queued_holds_overlapping_file_targets(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Task 2", "desc")
+    store.set_task_file_targets(task_11, ["src/conflict.py"])
+    store.set_task_file_targets(task_12, ["src/conflict.py"])
+    store.queue_task(task_11)
+    store.queue_task(task_12)
+
+    launched: list[str] = []
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(
+        engine,
+        "launch_agent",
+        lambda session, _working_dir, _command: launched.append(session),
+    )
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
+    orchestrator._dispatch_queued(project_id=None)
+
+    first = store.get_task(task_11)
+    second = store.get_task(task_12)
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "in-progress"
+    assert second["status"] == "queued"
+    assert launched == [f"yeehaw-task-{task_11}"]
+
+
+def test_dispatch_queued_allows_non_overlapping_file_targets(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Task 2", "desc")
+    store.set_task_file_targets(task_11, ["src/a.py"])
+    store.set_task_file_targets(task_12, ["src/b.py"])
+    store.queue_task(task_11)
+    store.queue_task(task_12)
+
+    launched: list[str] = []
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(
+        engine,
+        "launch_agent",
+        lambda session, _working_dir, _command: launched.append(session),
+    )
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
+    orchestrator._dispatch_queued(project_id=None)
+
+    first = store.get_task(task_11)
+    second = store.get_task(task_12)
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "in-progress"
+    assert second["status"] == "in-progress"
+    assert launched == [f"yeehaw-task-{task_11}", f"yeehaw-task-{task_12}"]
+
+
+def test_dispatch_queued_allows_explicit_safe_overlap(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(
+        roadmap_id,
+        phase_id,
+        "1.2",
+        "Task 2",
+        "**Safe to overlap:** yes",
+    )
+    store.set_task_file_targets(task_11, ["src/conflict.py"])
+    store.set_task_file_targets(task_12, ["src/conflict.py"])
+    store.queue_task(task_11)
+    store.queue_task(task_12)
+
+    launched: list[str] = []
+    monkeypatch.setattr(engine, "prepare_worktree", lambda *_args, **_kwargs: repo_root)
+    monkeypatch.setattr(
+        engine,
+        "launch_agent",
+        lambda session, _working_dir, _command: launched.append(session),
+    )
+    monkeypatch.setattr(engine, "pipe_output", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
+    orchestrator._dispatch_queued(project_id=None)
+
+    first = store.get_task(task_11)
+    second = store.get_task(task_12)
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "in-progress"
+    assert second["status"] == "in-progress"
+    assert launched == [f"yeehaw-task-{task_11}", f"yeehaw-task-{task_12}"]
+
+
 def test_dispatch_queued_skips_tasks_with_unsatisfied_dependencies(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,

@@ -221,6 +221,8 @@ class Orchestrator:
                 continue
             if not self.store.are_task_dependencies_satisfied(int(task["id"])):
                 continue
+            if self.store.has_in_progress_overlap_conflict(int(task["id"])):
+                continue
             self._emit_hook_event(
                 "pre_dispatch",
                 task=task,

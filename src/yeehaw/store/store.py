@@ -18,6 +18,19 @@ if TYPE_CHECKING:
 _EDITABLE_TASK_STATUSES = {"pending", "queued"}
 _LOCKED_TASK_STATUSES = {"paused", "in-progress", "done", "failed", "blocked"}
 _RE_TASK_COMPONENTS = re.compile(r"^(\d+)\.(\d+)$")
+_RE_TASK_METADATA_LINE = re.compile(r"^\*\*([^*]+):\*\*\s*(.+)$")
+_OVERLAP_SAFE_METADATA_KEYS = frozenset(
+    {
+        "safe",
+        "overlapsafe",
+        "safetooverlap",
+        "conflictsafe",
+        "parallelsafe",
+        "dispatchsafe",
+        "allowoverlap",
+    }
+)
+_TRUTHY_METADATA_VALUES = frozenset({"1", "true", "yes", "y", "on", "safe", "allow"})
 
 
 class Store:
@@ -527,6 +540,70 @@ class Store:
             (task_id,),
         ).fetchone()
         return int(row[0]) == 0
+
+    def has_in_progress_overlap_conflict(self, task_id: int) -> bool:
+        """Return True when queued task overlaps with non-safe in-progress tasks."""
+        return bool(self.list_in_progress_overlap_conflicts(task_id))
+
+    def list_in_progress_overlap_conflicts(self, task_id: int) -> list[dict[str, Any]]:
+        """List in-progress same-project tasks that overlap on file targets."""
+        task_row = self._conn.execute(
+            "SELECT description FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return []
+        if self._task_is_overlap_safe(str(task_row["description"] or "")):
+            return []
+
+        rows = self._conn.execute(
+            """
+            SELECT
+                active.id AS active_task_id,
+                active.task_number AS active_task_number,
+                active.title AS active_task_title,
+                active.description AS active_task_description,
+                overlap.target_path AS target_path
+            FROM tasks queued
+            JOIN roadmaps queued_roadmap
+                ON queued_roadmap.id = queued.roadmap_id
+            JOIN task_file_targets queued_target
+                ON queued_target.task_id = queued.id
+            JOIN roadmaps active_roadmap
+                ON active_roadmap.project_id = queued_roadmap.project_id
+                AND active_roadmap.status != 'invalid'
+            JOIN tasks active
+                ON active.roadmap_id = active_roadmap.id
+                AND active.status = 'in-progress'
+                AND active.id != queued.id
+            JOIN task_file_targets overlap
+                ON overlap.task_id = active.id
+                AND overlap.target_path = queued_target.target_path
+            WHERE queued.id = ?
+            ORDER BY active.id, overlap.target_path
+            """,
+            (task_id,),
+        ).fetchall()
+
+        conflicts: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            active_id = int(row["active_task_id"])
+            active_description = str(row["active_task_description"] or "")
+            if self._task_is_overlap_safe(active_description):
+                continue
+
+            conflict = conflicts.get(active_id)
+            if conflict is None:
+                conflict = {
+                    "task_id": active_id,
+                    "task_number": str(row["active_task_number"]),
+                    "title": str(row["active_task_title"]),
+                    "target_paths": [],
+                }
+                conflicts[active_id] = conflict
+            conflict["target_paths"].append(str(row["target_path"]))
+
+        return list(conflicts.values())
 
     def count_active_tasks(self, project_id: int | None = None) -> int:
         """Count in-progress tasks, optionally for a project."""
@@ -1183,6 +1260,21 @@ class Store:
         if not normalized or normalized == ".":
             return None
         return normalized
+
+    @staticmethod
+    def _task_is_overlap_safe(description: str) -> bool:
+        """Return True when task metadata explicitly marks overlap as safe."""
+        for raw_line in description.splitlines():
+            match = _RE_TASK_METADATA_LINE.match(raw_line.strip())
+            if match is None:
+                continue
+            key = re.sub(r"[^a-z0-9]+", "", match.group(1).lower())
+            if key not in _OVERLAP_SAFE_METADATA_KEYS:
+                continue
+            value = re.sub(r"[^a-z0-9]+", "", match.group(2).lower())
+            if value in _TRUTHY_METADATA_VALUES:
+                return True
+        return False
 
     def _clear_task_relationships(self, task_ids: list[int]) -> None:
         """Detach task-linked rows that must survive task deletion."""
