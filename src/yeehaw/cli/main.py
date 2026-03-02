@@ -292,6 +292,24 @@ def main(argv: list[str] | None = None) -> None:
     workers_sub = workers_parser.add_subparsers(dest="workers_command", required=True)
     workers_sub.add_parser("show", help="Show effective worker launch configuration")
 
+    policy_parser = subparsers.add_parser(
+        "policy",
+        help="Validate and explain built-in policy checks",
+    )
+    policy_sub = policy_parser.add_subparsers(dest="policy_command", required=True)
+
+    policy_lint = policy_sub.add_parser(
+        "lint",
+        help="Validate policy pack for a project",
+    )
+    policy_lint.add_argument("--project", required=True, help="Project name")
+
+    policy_explain = policy_sub.add_parser(
+        "explain",
+        help="Explain policy check outcomes for a task",
+    )
+    policy_explain.add_argument("--task", required=True, type=int, help="Task ID")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -363,3 +381,8 @@ def main(argv: list[str] | None = None) -> None:
         from yeehaw.cli.workers import handle_workers
 
         handle_workers(args, _get_db_path())
+
+    elif args.command == "policy":
+        from yeehaw.cli.policy import handle_policy
+
+        handle_policy(args, _get_db_path())

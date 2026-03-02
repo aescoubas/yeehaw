@@ -97,7 +97,7 @@ uv run yeehaw logs 11 --follow
 Top-level:
 
 ```bash
-uv run yeehaw {init,project,roadmap,plan,run,daemon,status,attach,stop,logs,scheduler,alerts,workers}
+uv run yeehaw {init,project,roadmap,plan,run,daemon,status,attach,stop,logs,scheduler,config,alerts,workers,policy}
 ```
 
 ### `init`
@@ -310,6 +310,54 @@ Show resolved worker launch configuration:
 
 ```bash
 uv run yeehaw workers show
+```
+
+### `policy`
+
+Validate policy packs before running tasks, and explain policy outcomes for one task:
+
+```bash
+uv run yeehaw policy lint --project demo
+uv run yeehaw policy explain --task 11
+```
+
+`lint` validates the merged policy pack for the project using runtime policy files.
+
+`explain` prints:
+- Task failure context (latest recorded policy violation details, when present).
+- Collected git inputs used by built-in checks (changed files and commit messages).
+- Per-stage check outcomes (`done_accept` and `pre_merge`) as `PASS`, `FAIL`, or `UNKNOWN`.
+
+## Policy Quickstart
+
+Create a baseline policy under your runtime root:
+
+```bash
+mkdir -p ~/.yeehaw/policies/projects
+cat > ~/.yeehaw/policies/default.json <<'JSON'
+{
+  "quality": {
+    "required_commit_message_regex": "^\\[task-\\d+\\.\\d+\\] .+",
+    "max_files_changed": 20
+  },
+  "safety": {
+    "allowed_path_prefixes": ["src/", "tests/"],
+    "blocked_paths": ["secrets/*", "*.pem"]
+  }
+}
+JSON
+```
+
+Validate before dispatching work:
+
+```bash
+uv run yeehaw policy lint --project <name>
+```
+
+If a task is blocked by policy, inspect its outcomes:
+
+```bash
+uv run yeehaw policy explain --task <task_id>
 ```
 
 ## Roadmap Format
@@ -538,6 +586,20 @@ uv run yeehaw status --project <name>
 ```bash
 uv run yeehaw logs <task_id> --merge-history
 uv run yeehaw logs <task_id> --merge-history --history-limit 10
+```
+
+### Task was blocked by policy and you need check-level details
+
+- Validate the effective policy pack for the project:
+
+```bash
+uv run yeehaw policy lint --project <name>
+```
+
+- Explain the exact built-in check outcomes for the blocked task:
+
+```bash
+uv run yeehaw policy explain --task <task_id>
 ```
 
 ## Development

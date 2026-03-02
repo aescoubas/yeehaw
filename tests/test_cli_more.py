@@ -16,12 +16,15 @@ import yeehaw.cli.config as cli_config
 import yeehaw.cli.daemon as cli_daemon
 import yeehaw.cli.logs as cli_logs
 import yeehaw.cli.plan as cli_plan
+import yeehaw.cli.policy as cli_policy
 import yeehaw.cli.roadmap as cli_roadmap
 import yeehaw.cli.run as cli_run
 import yeehaw.cli.scheduler as cli_scheduler
 import yeehaw.cli.status as cli_status
 import yeehaw.cli.stop as cli_stop
 import yeehaw.cli.workers as cli_workers
+from yeehaw.policy.checks import BuiltInPolicyInput
+from yeehaw.policy.models import PolicyPack, QualityPolicy, SafetyPolicy
 from yeehaw.store.store import Store
 
 
@@ -96,6 +99,7 @@ def test_cli_main_dispatches_remaining_commands(
     monkeypatch.setattr("yeehaw.cli.daemon.handle_daemon", _capture("daemon"))
     monkeypatch.setattr("yeehaw.cli.scheduler.handle_scheduler", _capture("scheduler"))
     monkeypatch.setattr("yeehaw.cli.config.handle_config", _capture("config"))
+    monkeypatch.setattr("yeehaw.cli.policy.handle_policy", _capture("policy"))
     monkeypatch.setattr("yeehaw.cli.status.handle_alerts", _capture("alerts"))
     monkeypatch.setattr("yeehaw.cli.workers.handle_workers", _capture("workers"))
 
@@ -113,6 +117,7 @@ def test_cli_main_dispatches_remaining_commands(
     cli_main.main(["daemon", "status"])
     cli_main.main(["scheduler", "show"])
     cli_main.main(["config", "show"])
+    cli_main.main(["policy", "lint", "--project", "p"])
     cli_main.main(["alerts"])
     cli_main.main(["workers", "show"])
 
@@ -130,6 +135,7 @@ def test_cli_main_dispatches_remaining_commands(
         "daemon",
         "scheduler",
         "config",
+        "policy",
         "alerts",
         "workers",
     ]
@@ -195,6 +201,158 @@ def test_handle_config_show_errors_on_invalid_runtime_config(
     out = capsys.readouterr().out
     assert "Error: Invalid runtime config" in out
     assert "features.hooks must be a boolean" in out
+
+
+def test_handle_policy_lint_success_and_failure(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_pack = PolicyPack(
+        quality=QualityPolicy(
+            required_commit_message_regex=r"^\[task-\d+\.\d+\]\s+.+",
+            max_files_changed=2,
+        ),
+        safety=SafetyPolicy(
+            allowed_path_prefixes=("src/", "tests/"),
+            blocked_paths=("docs/*",),
+        ),
+    )
+
+    def fake_load_policy_pack(
+        _project_name: str,
+        *,
+        runtime_root: Path | None = None,
+    ) -> PolicyPack:
+        _ = runtime_root
+        return policy_pack
+
+    monkeypatch.setattr(cli_policy, "load_policy_pack", fake_load_policy_pack)
+
+    cli_policy.handle_policy(
+        Namespace(policy_command="lint", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Policy lint passed for project 'proj-a'." in out
+    assert "policy.required_commit_message_regex" in out
+    assert "policy.max_changed_files" in out
+    assert "policy.allowed_path_prefixes" in out
+    assert "policy.forbidden_path_pattern" in out
+
+    def fake_load_policy_pack_error(
+        _project_name: str,
+        *,
+        runtime_root: Path | None = None,
+    ) -> PolicyPack:
+        _ = runtime_root
+        raise ValueError("Invalid policy config in default.json: boom")
+
+    monkeypatch.setattr(cli_policy, "load_policy_pack", fake_load_policy_pack_error)
+
+    cli_policy.handle_policy(
+        Namespace(policy_command="lint", project="proj-a"),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Policy lint failed for project 'proj-a'" in out
+    assert "default.json: boom" in out
+
+
+def test_handle_policy_explain_paths(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cli_policy.handle_policy(
+        Namespace(policy_command="explain", task=99),
+        db_path,
+    )
+    assert "Error: Task 99 not found." in capsys.readouterr().out
+
+    project_repo_root = tmp_path / "repo"
+    project_repo_root.mkdir(parents=True, exist_ok=True)
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", str(project_repo_root))
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        store.set_roadmap_integration_branch(roadmap_id, "yeehaw/roadmap-1")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+        store.assign_task(
+            task_id,
+            "codex",
+            "yeehaw/task-1.1-demo",
+            str(tmp_path / "worktree"),
+            str(tmp_path / "signal"),
+        )
+        store.fail_task(
+            task_id,
+            "Task policy violation at done_accept (source=yeehaw/task-1.1-demo, target=yeehaw/roadmap-1)",
+        )
+        store.log_event(
+            "task_policy_violation",
+            "Task policy violation at done_accept (source=yeehaw/task-1.1-demo, target=yeehaw/roadmap-1): commit mismatch",
+            project_id=project_id,
+            task_id=task_id,
+        )
+    finally:
+        store.close()
+
+    policy_pack = PolicyPack(
+        quality=QualityPolicy(
+            required_commit_message_regex=r"^\[task-\d+\.\d+\]\s+.+",
+            max_files_changed=1,
+        ),
+        safety=SafetyPolicy(
+            allowed_path_prefixes=("src/",),
+            blocked_paths=("docs/*",),
+        ),
+    )
+
+    def fake_load_policy_pack(
+        _project_name: str,
+        *,
+        runtime_root: Path | None = None,
+    ) -> PolicyPack:
+        _ = runtime_root
+        return policy_pack
+
+    def fake_collect_builtin_policy_input(
+        *,
+        repo_root: Path,
+        source_branch: str,
+        target_branch: str,
+    ) -> BuiltInPolicyInput:
+        assert repo_root == project_repo_root
+        assert source_branch == "yeehaw/task-1.1-demo"
+        assert target_branch == "yeehaw/roadmap-1"
+        return BuiltInPolicyInput(
+            changed_files=("src/main.py", "docs/readme.md"),
+            commit_messages=("fix lint",),
+        )
+
+    monkeypatch.setattr(cli_policy, "load_policy_pack", fake_load_policy_pack)
+    monkeypatch.setattr(
+        cli_policy,
+        "collect_builtin_policy_input",
+        fake_collect_builtin_policy_input,
+    )
+
+    cli_policy.handle_policy(
+        Namespace(policy_command="explain", task=task_id),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert f"Policy explanation for task {task_id}" in out
+    assert "Recorded failure:" in out
+    assert "Latest policy event:" in out
+    assert "policy.required_commit_message_regex: FAIL" in out
+    assert "policy.max_changed_files: FAIL" in out
+    assert "policy.allowed_path_prefixes: FAIL" in out
+    assert "policy.forbidden_path_pattern: FAIL" in out
+    assert "Outcome: blocked" in out
 
 
 def test_handle_roadmap_create_branches(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
