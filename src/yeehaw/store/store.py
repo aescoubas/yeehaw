@@ -416,6 +416,49 @@ class Store:
         self._conn.commit()
         return task_id
 
+    def create_linked_reconcile_task(
+        self,
+        *,
+        failed_task_id: int,
+        failure_threshold: int,
+        observed_attempts: int,
+        failure_messages: list[str] | None = None,
+    ) -> int | None:
+        """Create a queued reconcile follow-up task linked to a failed task."""
+        failed_task = self.get_task(failed_task_id)
+        if failed_task is None:
+            return None
+
+        source_task_number = str(failed_task["task_number"])
+        reconcile_number = self._next_reconcile_task_number(
+            phase_id=int(failed_task["phase_id"]),
+            source_task_number=source_task_number,
+        )
+        title = f"Reconcile {source_task_number} after repeated failures"
+        description = self._build_reconcile_description(
+            failed_task=failed_task,
+            failure_threshold=failure_threshold,
+            observed_attempts=observed_attempts,
+            failure_messages=failure_messages or [],
+        )
+        file_targets = self.list_task_file_targets(failed_task_id)
+        reconcile_task_id = self.create_task(
+            roadmap_id=int(failed_task["roadmap_id"]),
+            phase_id=int(failed_task["phase_id"]),
+            number=reconcile_number,
+            title=title,
+            description=description,
+            file_targets=file_targets,
+        )
+
+        # Reconcile tasks should not recursively spawn more reconcile tasks.
+        self._conn.execute(
+            "UPDATE tasks SET max_attempts = 1, updated_at = ? WHERE id = ?",
+            (self._now(), reconcile_task_id),
+        )
+        self._conn.commit()
+        return reconcile_task_id
+
     def set_task_file_targets(self, task_id: int, file_targets: list[str]) -> None:
         """Replace persisted file targets for one task."""
         self._conn.execute("BEGIN")
@@ -1292,6 +1335,137 @@ class Store:
     def _task_fingerprint(title: str, description: str) -> tuple[str, str]:
         """Return a compact identity fingerprint for a task body."""
         return (title.strip(), description.strip())
+
+    def _next_reconcile_task_number(
+        self,
+        *,
+        phase_id: int,
+        source_task_number: str,
+    ) -> str:
+        """Generate the next stable reconcile task number within a phase."""
+        source_match = _RE_TASK_COMPONENTS.match(source_task_number.strip())
+        if source_match is not None:
+            major = int(source_match.group(1))
+        else:
+            phase = self.get_phase(phase_id)
+            major = int(phase["phase_number"]) if phase is not None else 0
+
+        rows = self._conn.execute(
+            "SELECT task_number FROM tasks WHERE phase_id = ?",
+            (phase_id,),
+        ).fetchall()
+        used_minors: set[int] = set()
+        for row in rows:
+            candidate = str(row["task_number"] or "").strip()
+            match = _RE_TASK_COMPONENTS.match(candidate)
+            if match is None or int(match.group(1)) != major:
+                continue
+            used_minors.add(int(match.group(2)))
+
+        minor = 9000
+        while minor in used_minors:
+            minor += 1
+        return f"{major}.{minor}"
+
+    def _build_reconcile_description(
+        self,
+        *,
+        failed_task: dict[str, Any],
+        failure_threshold: int,
+        observed_attempts: int,
+        failure_messages: list[str],
+    ) -> str:
+        """Build auto-generated reconcile task details."""
+        source_task_id = int(failed_task["id"])
+        source_task_number = str(failed_task["task_number"])
+        source_title = str(failed_task["title"])
+
+        normalized_failures: list[str] = []
+        seen_failures: set[str] = set()
+        for raw_message in failure_messages:
+            message = str(raw_message or "").strip()
+            if not message or message in seen_failures:
+                continue
+            normalized_failures.append(message)
+            seen_failures.add(message)
+
+        upstream = self._dependency_summary(
+            source_task_id,
+            relation="upstream",
+        )
+        downstream = self._dependency_summary(
+            source_task_id,
+            relation="downstream",
+        )
+
+        lines = [
+            "Auto-generated reconcile task for repeated execution failures.",
+            "",
+            f"**Reconcile Source Task ID:** {source_task_id}",
+            f"**Reconcile Source Task:** {source_task_number} - {source_title}",
+            f"**Failure Threshold:** {failure_threshold}",
+            f"**Observed Attempts:** {observed_attempts}",
+            "",
+            "**Failure Context:**",
+        ]
+        if normalized_failures:
+            for idx, message in enumerate(normalized_failures, start=1):
+                lines.append(f"- Failure {idx}: {message}")
+        else:
+            lines.append("- Failure details unavailable")
+
+        lines.extend(
+            [
+                "",
+                "**Dependency Context:**",
+                f"- Upstream blockers: {upstream}",
+                f"- Downstream blocked tasks: {downstream}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _dependency_summary(self, task_id: int, *, relation: str) -> str:
+        """Return concise dependency context for one task."""
+        if relation == "upstream":
+            rows = self._conn.execute(
+                """
+                SELECT blocker.id, blocker.task_number, blocker.title, blocker.status
+                FROM task_dependencies dep
+                JOIN tasks blocker ON blocker.id = dep.blocker_task_id
+                WHERE dep.blocked_task_id = ?
+                """,
+                (task_id,),
+            ).fetchall()
+        elif relation == "downstream":
+            rows = self._conn.execute(
+                """
+                SELECT blocked.id, blocked.task_number, blocked.title, blocked.status
+                FROM task_dependencies dep
+                JOIN tasks blocked ON blocked.id = dep.blocked_task_id
+                WHERE dep.blocker_task_id = ?
+                """,
+                (task_id,),
+            ).fetchall()
+        else:
+            raise ValueError(f"Unknown dependency relation: {relation}")
+
+        if not rows:
+            return "none"
+
+        records = [dict(row) for row in rows]
+        records.sort(
+            key=lambda record: self._task_sort_key(
+                str(record["task_number"]),
+                int(record["id"]),
+            )
+        )
+
+        labels: list[str] = []
+        for record in records:
+            labels.append(
+                f"{record['task_number']} ({record['status']}) {record['title']}",
+            )
+        return "; ".join(labels)
 
     @staticmethod
     def _normalize_file_targets(file_targets: list[str]) -> list[str]:

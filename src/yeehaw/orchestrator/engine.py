@@ -199,7 +199,7 @@ class Orchestrator:
                 self.store.fail_task(task["id"], cleanliness_error)
                 failed_task = self.store.get_task(int(task["id"])) or task
                 self._emit_on_fail(failed_task, reason=cleanliness_error, stage="done_validation")
-                self._maybe_retry(task)
+                self._maybe_retry(task, failure_reason=cleanliness_error)
             else:
                 done_policy_error = self._enforce_builtin_policy_checks(
                     task,
@@ -213,7 +213,7 @@ class Orchestrator:
                         reason=done_policy_error,
                         stage="done_accept",
                     )
-                    self._maybe_retry(task)
+                    self._maybe_retry(task, failure_reason=done_policy_error)
                 else:
                     self._emit_hook_event(
                         "pre_merge",
@@ -233,7 +233,7 @@ class Orchestrator:
                         self.store.fail_task(task["id"], merge_error)
                         failed_task = self.store.get_task(int(task["id"])) or task
                         self._emit_on_fail(failed_task, reason=merge_error, stage="merge")
-                        self._maybe_retry(task)
+                        self._maybe_retry(task, failure_reason=merge_error)
                     else:
                         # Phase verify commands are phase-level gates and should run only
                         # once all tasks in the phase report done.
@@ -245,7 +245,7 @@ class Orchestrator:
             self.store.fail_task(task["id"], failure_reason)
             failed_task = self.store.get_task(int(task["id"])) or task
             self._emit_on_fail(failed_task, reason=failure_reason, stage="signal_failed")
-            self._maybe_retry(task)
+            self._maybe_retry(task, failure_reason=failure_reason)
 
         elif data["status"] == "blocked":
             self.store.complete_task(task["id"], "blocked")
@@ -687,7 +687,7 @@ class Orchestrator:
         failed_task = self.store.get_task(int(task["id"])) or task
         self._emit_on_fail(failed_task, reason=failure_msg, stage="timeout")
         self.store.log_event("task_timeout", failure_msg, task_id=task["id"])
-        self._maybe_retry(task)
+        self._maybe_retry(task, failure_reason=failure_msg)
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
@@ -777,24 +777,76 @@ class Orchestrator:
         failed_task = self.store.get_task(int(task["id"])) or task
         self._emit_on_fail(failed_task, reason=failure_msg, stage="session_lost")
         self.store.log_event("session_lost", failure_msg, task_id=task["id"])
-        self._maybe_retry(task)
+        self._maybe_retry(task, failure_reason=failure_msg)
         if task.get("worktree_path"):
             cleanup_worktree(self._task_repo_root(task), Path(task["worktree_path"]))
 
-    def _maybe_retry(self, task: dict[str, Any]) -> None:
-        if task["attempts"] < task["max_attempts"]:
-            self.store.queue_task(task["id"])
+    def _maybe_retry(self, task: dict[str, Any], *, failure_reason: str | None = None) -> None:
+        attempts = self._as_int(task.get("attempts")) or 0
+        max_attempts = self._as_int(task.get("max_attempts")) or 0
+        task_id = int(task["id"])
+
+        if attempts < max_attempts:
+            self.store.queue_task(task_id)
             self.store.log_event(
                 "task_retry",
-                f"Attempt {task['attempts'] + 1}",
-                task_id=task["id"],
+                f"Attempt {attempts + 1}",
+                task_id=task_id,
             )
-        else:
+            return
+
+        if self._is_reconcile_task(task):
             self.store.create_alert(
                 "error",
-                f"Task {task['id']} exhausted {task['max_attempts']} retries",
-                task_id=task["id"],
+                f"Task {task_id} exhausted {max_attempts} retries",
+                task_id=task_id,
             )
+            return
+
+        failure_messages = [
+            str(message).strip()
+            for message in (task.get("last_failure"), failure_reason)
+            if isinstance(message, str) and message.strip()
+        ]
+        reconcile_task_id = self.store.create_linked_reconcile_task(
+            failed_task_id=task_id,
+            failure_threshold=max_attempts,
+            observed_attempts=attempts,
+            failure_messages=failure_messages,
+        )
+        if reconcile_task_id is None:
+            self.store.create_alert(
+                "error",
+                f"Task {task_id} exhausted {max_attempts} retries and reconcile task creation failed",
+                task_id=task_id,
+            )
+            return
+
+        self.store.queue_task(reconcile_task_id)
+        self.store.log_event(
+            "task_reconcile_queued",
+            (
+                f"Created reconcile task {reconcile_task_id} for task {task_id} "
+                f"after {attempts} failed attempts"
+            ),
+            task_id=task_id,
+        )
+        self.store.create_alert(
+            "warn",
+            (
+                f"Task {task_id} hit failure threshold ({attempts}/{max_attempts}); "
+                f"queued reconcile task {reconcile_task_id}"
+            ),
+            task_id=task_id,
+        )
+
+    @staticmethod
+    def _is_reconcile_task(task: dict[str, Any]) -> bool:
+        """Return True when task description marks it as auto-generated reconcile work."""
+        description = task.get("description")
+        if not isinstance(description, str):
+            return False
+        return "**Reconcile Source Task ID:**" in description
 
     def _check_phase_completion(self, phase_id: int) -> None:
         tasks = self.store.list_tasks_by_phase(phase_id)

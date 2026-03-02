@@ -1126,14 +1126,31 @@ def test_process_signal_failed_queues_retry(
 
     events = store.list_events(limit=10)
     assert any(event["kind"] == "task_retry" for event in events)
+    assert not any(event["kind"] == "task_reconcile_queued" for event in events)
+
+    phase_tasks = store.list_tasks_by_phase(ids["phase_id"])
+    assert not any(str(candidate["title"]).startswith("Reconcile ") for candidate in phase_tasks)
 
 
-def test_process_signal_failed_exhausted_retries_creates_alert(
+def test_process_signal_failed_exhausted_retries_queues_reconcile_task(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, repo_root = orchestrator_store
     ids = _seed_single_task(store)
+
+    blocker_id = store.create_task(ids["roadmap_id"], ids["phase_id"], "1.2", "Prepare", "desc")
+    blocked_id = store.create_task(ids["roadmap_id"], ids["phase_id"], "1.3", "Follow-up", "desc")
+    store.complete_task(blocker_id, "done")
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (ids["task_id"], blocker_id),
+    )
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (blocked_id, ids["task_id"]),
+    )
+    store._conn.commit()
 
     signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
     signal_dir.mkdir(parents=True, exist_ok=True)
@@ -1148,8 +1165,8 @@ def test_process_signal_failed_exhausted_retries_creates_alert(
         signal_dir=str(signal_dir),
     )
     store._conn.execute(
-        "UPDATE tasks SET attempts = 1, max_attempts = 1 WHERE id = ?",
-        (ids["task_id"],),
+        "UPDATE tasks SET attempts = 1, max_attempts = 1, last_failure = ? WHERE id = ?",
+        ("first failure", ids["task_id"]),
     )
     store._conn.commit()
 
@@ -1159,7 +1176,7 @@ def test_process_signal_failed_exhausted_retries_creates_alert(
             {
                 "task_id": ids["task_id"],
                 "status": "failed",
-                "summary": "error",
+                "summary": "second failure",
             },
         ),
     )
@@ -1174,9 +1191,30 @@ def test_process_signal_failed_exhausted_retries_creates_alert(
     assert task is not None
     assert task["status"] == "failed"
 
+    phase_tasks = store.list_tasks_by_phase(ids["phase_id"])
+    reconcile = next(
+        (
+            candidate
+            for candidate in phase_tasks
+            if str(candidate["title"]).startswith("Reconcile 1.1 after repeated failures")
+        ),
+        None,
+    )
+    assert reconcile is not None
+    assert reconcile["status"] == "queued"
+    assert "**Reconcile Source Task ID:**" in str(reconcile["description"])
+    assert "Failure 1: first failure" in str(reconcile["description"])
+    assert "Failure 2: second failure" in str(reconcile["description"])
+    assert "Upstream blockers: 1.2 (done) Prepare" in str(reconcile["description"])
+    assert "Downstream blocked tasks: 1.3 (pending) Follow-up" in str(reconcile["description"])
+
+    events = store.list_events(limit=20)
+    assert any(event["kind"] == "task_reconcile_queued" for event in events)
+    assert not any(event["kind"] == "task_retry" for event in events)
+
     alerts = store.list_alerts()
     assert len(alerts) == 1
-    assert "exhausted" in alerts[0]["message"]
+    assert "queued reconcile task" in alerts[0]["message"]
 
 
 def test_check_phase_completion_queues_next_phase(
