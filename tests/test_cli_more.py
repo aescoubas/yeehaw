@@ -488,6 +488,7 @@ def test_handle_status_and_alerts(db_path: Path, capsys: pytest.CaptureFixture[s
     assert "Branch" in out
     assert "Attempts" in out
     assert "Tokens" in out
+    assert "Merge" in out
     assert "n/a" in out
     assert "Total:" in out
 
@@ -674,6 +675,43 @@ def test_parse_tokens_used_supports_gemini_usage_metadata_json() -> None:
 def test_parse_tokens_used_sums_input_and_output_when_total_missing() -> None:
     text = "input tokens: 1,200\ncompletion tokens: 300\n"
     assert cli_status._parse_tokens_used(text) == 1500
+
+
+def test_handle_status_shows_latest_merge_diagnostic_summary(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(roadmap_id, phase_id, "1.1", "Merge diagnostic", "desc")
+        store.assign_task(task_id, "codex", "yeehaw/task-1.1-merge", "/tmp/w", "/tmp/s")
+        store.fail_task(task_id, "Failed to merge")
+        merge_attempt_id = store.create_task_merge_attempt(
+            task_id=task_id,
+            attempt_number=1,
+            status="running",
+            source_branch="yeehaw/task-1.1-merge",
+            target_branch="yeehaw/roadmap-1",
+        )
+        store.update_task_merge_attempt(
+            merge_attempt_id,
+            status="failed",
+            conflict_type="content conflict",
+            conflict_files=["src/a.py", "src/b.py"],
+            error_detail="Failed to rebase due to conflict",
+        )
+    finally:
+        store.close()
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+
+    row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
+    assert "Merge" in out
+    assert "failed: Failed to rebase due to conflict" in row
 
 
 def test_handle_scheduler_show_config_and_no_changes(
@@ -1046,6 +1084,83 @@ def test_handle_logs_paths(db_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert f"Log file: {log_path}" in out
     assert "line2" in out
     assert "line3" in out
+
+
+def test_handle_logs_merge_history(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ids = _seed_project_with_task(db_path, task_status="failed")
+    store = Store(db_path)
+    try:
+        failed_attempt = store.create_task_merge_attempt(
+            task_id=ids["task_id"],
+            attempt_number=2,
+            status="running",
+            source_branch="yeehaw/task-1.1-demo",
+            target_branch="yeehaw/roadmap-1",
+        )
+        store.update_task_merge_attempt(
+            failed_attempt,
+            status="failed",
+            conflict_type="content conflict",
+            conflict_files=["src/a.py", "src/b.py"],
+            error_detail="Failed to rebase due to conflict",
+        )
+        succeeded_attempt = store.create_task_merge_attempt(
+            task_id=ids["task_id"],
+            attempt_number=1,
+            status="running",
+            source_branch="yeehaw/task-1.1-demo",
+            target_branch="yeehaw/roadmap-1",
+        )
+        store.update_task_merge_attempt(
+            succeeded_attempt,
+            status="succeeded",
+            source_sha_after="abc123",
+            target_sha_after="def456",
+        )
+    finally:
+        store.close()
+
+    cli_logs.handle_logs(
+        Namespace(
+            task_id=ids["task_id"],
+            attempt=None,
+            tail=10,
+            follow=False,
+            merge_history=True,
+            history_limit=5,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert "Merge history for task" in out
+    assert "Attempt 2: failed" in out
+    assert "conflict: content conflict" in out
+    assert "files: src/a.py, src/b.py" in out
+    assert "detail: Failed to rebase due to conflict" in out
+    assert "Attempt 1: succeeded" in out
+
+
+def test_handle_logs_merge_history_not_found(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ids = _seed_project_with_task(db_path)
+    cli_logs.handle_logs(
+        Namespace(
+            task_id=ids["task_id"],
+            attempt=None,
+            tail=10,
+            follow=False,
+            merge_history=True,
+            history_limit=3,
+        ),
+        db_path,
+    )
+    out = capsys.readouterr().out
+    assert f"No merge history found for task {ids['task_id']}." in out
 
 
 def test_handle_logs_follow_mode(

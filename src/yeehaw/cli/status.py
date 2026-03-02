@@ -14,12 +14,14 @@ TITLE_WIDTH = 35
 BRANCH_WIDTH = 8
 ATTEMPTS_WIDTH = 8
 TOKENS_WIDTH = 12
+MERGE_DIAGNOSTIC_WIDTH = 44
 BRANCH_NA = "n/a"
 BRANCH_AHEAD = "ahead"
 BRANCH_DIVERGED = "diverged"
 BRANCH_MERGED = "merged"
 MAIN_BRANCH = "main"
 TOKENS_NA = "n/a"
+MERGE_DIAGNOSTIC_NA = "n/a"
 TOKEN_SCAN_WINDOW_LINES = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TOTAL_TOKEN_PATTERNS = (
@@ -50,6 +52,8 @@ OUTPUT_TOKEN_PATTERNS = (
     re.compile(r'"completion_tokens"\s*:\s*([0-9][0-9,_]*)'),
 )
 TOKEN_LINE_RE = re.compile(r"^\s*([0-9][0-9,]*)\s*$")
+MERGE_DIAGNOSTIC_WHITESPACE_RE = re.compile(r"\s+")
+MERGE_CONFLICT_FILE_PREVIEW = 3
 
 
 def _truncate_for_column(value: str, width: int) -> str:
@@ -223,6 +227,55 @@ def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path) -> None:
         task["tokens_used"] = _resolve_tokens_used(task, db_path)
 
 
+def _summarize_merge_diagnostic(attempt: dict[str, Any]) -> str | None:
+    """Render concise summary for one task merge attempt."""
+    status = str(attempt.get("status") or "").strip().lower()
+    if not status:
+        return None
+    if status == "succeeded":
+        return None
+
+    detail = attempt.get("error_detail")
+    if isinstance(detail, str) and detail.strip():
+        clean_detail = MERGE_DIAGNOSTIC_WHITESPACE_RE.sub(" ", detail.strip())
+        return f"{status}: {clean_detail}"
+
+    conflict_type = attempt.get("conflict_type")
+    if isinstance(conflict_type, str) and conflict_type.strip():
+        return f"{status}: {conflict_type.strip()}"
+
+    conflict_files = attempt.get("conflict_files")
+    if isinstance(conflict_files, list) and conflict_files:
+        preview = ", ".join(str(path) for path in conflict_files[:MERGE_CONFLICT_FILE_PREVIEW])
+        if len(conflict_files) > MERGE_CONFLICT_FILE_PREVIEW:
+            preview = f"{preview}, +{len(conflict_files) - MERGE_CONFLICT_FILE_PREVIEW} more"
+        return f"{status}: files {preview}"
+
+    source_branch = str(attempt.get("source_branch") or "").strip()
+    target_branch = str(attempt.get("target_branch") or "").strip()
+    if source_branch and target_branch:
+        return f"{status}: {source_branch} -> {target_branch}"
+
+    return status
+
+
+def _latest_merge_attempt_summary(store: Store, task_id: int) -> tuple[dict[str, Any] | None, str | None]:
+    """Return newest merge attempt row and display summary for one task."""
+    attempts = store.list_task_merge_attempts(task_id=task_id, limit=1)
+    if not attempts:
+        return None, None
+    latest = attempts[0]
+    return latest, _summarize_merge_diagnostic(latest)
+
+
+def _annotate_merge_diagnostics(tasks: list[dict[str, Any]], store: Store) -> None:
+    """Attach latest merge attempt metadata to tasks."""
+    for task in tasks:
+        latest, summary = _latest_merge_attempt_summary(store, int(task["id"]))
+        task["latest_merge_attempt"] = latest
+        task["merge_diagnostic"] = summary
+
+
 def _format_attempts(task: dict[str, Any]) -> str:
     """Format attempts as '<attempts>/<max_attempts>' for status output."""
     attempts = task.get("attempts")
@@ -250,6 +303,7 @@ def handle_status(args: Any, db_path: Path) -> None:
         )
         _annotate_branch_states(tasks, db_path)
         _annotate_token_usage(tasks, db_path)
+        _annotate_merge_diagnostics(tasks, store)
 
         if args.as_json:
             print(json_module.dumps(tasks, indent=2, default=str))
@@ -262,7 +316,8 @@ def handle_status(args: Any, db_path: Path) -> None:
         header = (
             f"{'ID':<6} {'Task':<10} {'Title':<{TITLE_WIDTH}} "
             f"{'Status':<14} {'Agent':<10} {'Branch':<{BRANCH_WIDTH}} "
-            f"{'Attempts':<{ATTEMPTS_WIDTH}} {'Tokens':<{TOKENS_WIDTH}}"
+            f"{'Attempts':<{ATTEMPTS_WIDTH}} {'Tokens':<{TOKENS_WIDTH}} "
+            f"{'Merge':<{MERGE_DIAGNOSTIC_WIDTH}}"
         )
         print(header)
         print("-" * len(header))
@@ -277,10 +332,17 @@ def handle_status(args: Any, db_path: Path) -> None:
                 if isinstance(tokens_used, int)
                 else TOKENS_NA
             )
+            merge_diagnostic = task.get("merge_diagnostic")
+            merge_display = (
+                _truncate_for_column(str(merge_diagnostic), MERGE_DIAGNOSTIC_WIDTH)
+                if isinstance(merge_diagnostic, str) and merge_diagnostic
+                else MERGE_DIAGNOSTIC_NA
+            )
             print(
                 f"{task['id']:<6} {task['task_number']:<10} {title:<{TITLE_WIDTH}} "
                 f"{task['status']:<14} {agent:<10} {branch_state:<{BRANCH_WIDTH}} "
-                f"{attempts_display:<{ATTEMPTS_WIDTH}} {tokens_display:<{TOKENS_WIDTH}}"
+                f"{attempts_display:<{ATTEMPTS_WIDTH}} {tokens_display:<{TOKENS_WIDTH}} "
+                f"{merge_display:<{MERGE_DIAGNOSTIC_WIDTH}}"
             )
 
         by_status: dict[str, int] = {}

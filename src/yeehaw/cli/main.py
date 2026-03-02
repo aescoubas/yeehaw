@@ -229,6 +229,17 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Follow log output live",
     )
+    logs_parser.add_argument(
+        "--merge-history",
+        action="store_true",
+        help="Show merge/rebase history for the task instead of log output",
+    )
+    logs_parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=20,
+        help="Max merge history rows to show with --merge-history (default: 20)",
+    )
 
     scheduler_parser = subparsers.add_parser("scheduler", help="Manage scheduler config")
     scheduler_sub = scheduler_parser.add_subparsers(

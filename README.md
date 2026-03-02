@@ -237,6 +237,7 @@ Columns:
   - `merged`: no branch-only commits remain
 - `Attempts`: attempt counter shown as `<attempts>/<max_attempts>`.
 - `Tokens`: parsed token usage from latest in-progress log (if detectable), else `n/a`.
+- `Merge`: latest merge/rebase diagnostic summary (non-success states only), else `n/a`.
 
 ### `attach`
 
@@ -265,6 +266,8 @@ Show task attempt logs:
 uv run yeehaw logs <task_id>
 uv run yeehaw logs <task_id> --attempt 2 --tail 400
 uv run yeehaw logs <task_id> --follow
+uv run yeehaw logs <task_id> --merge-history
+uv run yeehaw logs <task_id> --merge-history --history-limit 10
 ```
 
 ### `scheduler`
@@ -513,6 +516,21 @@ You are likely using a different runtime root (for example a different `YEEHAW_H
 
 ```bash
 uv run yeehaw status --project <name>
+```
+
+### Task failed during merge/rebase and you need diagnostics
+
+- Check status for the latest merge summary:
+
+```bash
+uv run yeehaw status --project <name>
+```
+
+- Inspect full merge attempt history for the task:
+
+```bash
+uv run yeehaw logs <task_id> --merge-history
+uv run yeehaw logs <task_id> --merge-history --history-limit 10
 ```
 
 ## Development
