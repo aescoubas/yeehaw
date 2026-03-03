@@ -1398,6 +1398,37 @@ def test_handle_status_shows_tokens_for_in_progress_task(
     assert "1/4" in row
 
 
+def test_handle_status_shows_tokens_for_done_task_and_backfills_store(
+    db_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = Store(db_path)
+    try:
+        project_id = store.create_project("proj-a", "/tmp/repo-a")
+        roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+        phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+        task_id = store.create_task(roadmap_id, phase_id, "1.1", "Finished task", "desc")
+        store.assign_task(task_id, "codex", "yeehaw/task-1.1-finished-task", "/tmp/w", "/tmp/s")
+        store.complete_task(task_id, "done")
+    finally:
+        store.close()
+
+    logs_dir = db_path.parent / "logs" / f"task-{task_id}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "attempt-01-codex.log").write_text("Total tokens: 1,500\n")
+
+    cli_status.handle_status(Namespace(project=None, as_json=False), db_path)
+    out = capsys.readouterr().out
+    row = next(line for line in out.splitlines() if line.startswith(f"{task_id:<6}"))
+    assert "1,500" in row
+
+    store = Store(db_path)
+    try:
+        assert store.get_task_token_usage(task_id) == 1500
+    finally:
+        store.close()
+
+
 def test_handle_status_budget_indicator_and_json_fields(
     db_path: Path,
     capsys: pytest.CaptureFixture[str],

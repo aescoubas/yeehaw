@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ def handle_init(db_path: Path) -> None:
     print(f"Initialized yeehaw at {db_path.parent}")
 
 
-def handle_project(args: Any, db_path: Path) -> None:
+def handle_project(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw project` subcommands."""
     store = Store(db_path)
     try:

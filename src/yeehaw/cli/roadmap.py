@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -37,7 +39,7 @@ class RoadmapPublishOutcome:
     pr_result: RoadmapPRPublishResult | None = None
 
 
-def handle_roadmap(args: Any, db_path: Path) -> None:
+def handle_roadmap(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw roadmap` subcommands."""
     store = Store(db_path)
     try:

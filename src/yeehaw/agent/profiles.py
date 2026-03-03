@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import shlex
+import shutil
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,23 @@ class AgentProfile:
     command: str
     prompt_flag: str
     timeout_minutes: int = 60
+
+    def executable(self) -> str:
+        """Return executable name used to launch the profile."""
+        try:
+            parts = shlex.split(self.command)
+        except ValueError:
+            return ""
+        if not parts:
+            return ""
+        return parts[0]
+
+    def is_available(self) -> bool:
+        """Return True when the profile executable is available in PATH."""
+        executable = self.executable()
+        if not executable:
+            return False
+        return shutil.which(executable) is not None
 
 
 AGENT_REGISTRY: dict[str, AgentProfile] = {
@@ -28,7 +47,7 @@ AGENT_REGISTRY: dict[str, AgentProfile] = {
     ),
     "codex": AgentProfile(
         name="codex",
-        command="codex exec --dangerously-bypass-approvals-and-sandbox",
+        command="codex exec --json --dangerously-bypass-approvals-and-sandbox",
         prompt_flag="",
     ),
 }

@@ -115,3 +115,24 @@ command = "y"
         "-c",
         "mcp_servers.beta.enabled=false",
     ]
+
+
+def test_default_no_mcp_args_codex_logs_toml_parse_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text("[mcp_servers.alpha\nbroken = true")
+
+    monkeypatch.setattr(runtime_config.Path, "home", staticmethod(lambda: tmp_path))
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["codex"], 1, "", "failed")
+
+    monkeypatch.setattr(runtime_config.subprocess, "run", fake_run)
+    caplog.set_level("WARNING", logger="yeehaw.agent.runtime_config")
+
+    assert default_no_mcp_args("codex") == []
+    assert "Failed to parse Codex MCP config" in caplog.text

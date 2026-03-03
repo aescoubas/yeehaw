@@ -56,3 +56,18 @@ def test_attach_session_and_launch_agent(monkeypatch: pytest.MonkeyPatch) -> Non
 
     tmux.launch_agent("task-1", "/tmp/work", "run agent")
     assert steps == [("task-1", "/tmp/work"), ("task-1", "run agent")]
+
+
+def test_pipe_output_quotes_log_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        captured.append(args)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(tmux.subprocess, "run", fake_run)
+
+    tmux.pipe_output("s1", "/tmp/agent logs/output.log")
+
+    assert captured
+    assert captured[0][-1] == "cat >> '/tmp/agent logs/output.log'"

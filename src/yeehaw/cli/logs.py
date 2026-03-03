@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ MERGE_HISTORY_DEFAULT_LIMIT = 20
 MERGE_CONFLICT_FILE_PREVIEW = 5
 
 
-def handle_logs(args: Any, db_path: Path) -> None:
+def handle_logs(args: argparse.Namespace, db_path: Path) -> None:
     """Show recorded agent output for a task attempt."""
     store = Store(db_path)
     try:

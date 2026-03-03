@@ -11,10 +11,16 @@ from typing import Any
 
 import pytest
 
+from yeehaw.agent.profiles import AgentProfile
 import yeehaw.orchestrator.engine as engine
 from yeehaw.orchestrator.engine import Orchestrator
 from yeehaw.orchestrator.merge_resolver import TrivialConflictResolution
 from yeehaw.store.store import Store
+
+
+@pytest.fixture(autouse=True)
+def _force_agent_profile_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(AgentProfile, "is_available", lambda _self: True)
 
 
 @pytest.fixture
@@ -256,6 +262,29 @@ def test_dispatch_queued_uses_default_agent_override(
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert task["assigned_agent"] == "codex"
+
+
+def test_dispatch_queued_fails_when_agent_binary_missing(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store, status="queued")
+
+    monkeypatch.setattr(AgentProfile, "is_available", lambda _self: False)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_integration_branch",
+        lambda _task: "yeehaw/roadmap-1",
+    )
+    orchestrator._dispatch_queued(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+    assert "is not in PATH" in str(task["last_failure"])
 
 
 def test_dispatch_queued_clears_stale_signal_file(
@@ -636,6 +665,113 @@ def test_dispatch_queued_skips_tasks_with_unsatisfied_dependencies(
     assert second is not None
     assert first["status"] == "in-progress"
     assert second["status"] == "queued"
+
+
+def test_queue_ready_pending_tasks_unblocks_active_phase_dependencies(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Task 2", "**Depends on:** 1.1")
+    store.complete_task(task_11, "done")
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (task_12, task_11),
+    )
+    store._conn.commit()
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._queue_ready_pending_tasks(project_id=None)
+
+    task = store.get_task(task_12)
+    phase = store.get_phase(phase_id)
+    assert task is not None
+    assert phase is not None
+    assert task["status"] == "queued"
+    assert phase["status"] == "executing"
+
+
+def test_queue_ready_pending_tasks_keeps_inactive_phase_pending(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._queue_ready_pending_tasks(project_id=None)
+
+    task = store.get_task(task_11)
+    phase = store.get_phase(phase_id)
+    assert task is not None
+    assert phase is not None
+    assert task["status"] == "pending"
+    assert phase["status"] == "pending"
+
+
+def test_queue_ready_pending_tasks_marks_active_phase_executing_even_when_blocked(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", None)
+    task_11 = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+    task_12 = store.create_task(roadmap_id, phase_id, "1.2", "Task 2", "**Depends on:** 1.1")
+    store.queue_task(task_11)
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (task_12, task_11),
+    )
+    store._conn.commit()
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._queue_ready_pending_tasks(project_id=None)
+
+    task = store.get_task(task_12)
+    phase = store.get_phase(phase_id)
+    assert task is not None
+    assert phase is not None
+    assert task["status"] == "pending"
+    assert phase["status"] == "executing"
+
+
+def test_queue_ready_pending_tasks_recovers_when_predecessor_done_but_failed_phase(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+
+    project_id = store.create_project("proj-a", "/tmp/repo")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_1 = store.create_phase(roadmap_id, 1, "Phase 1", "false")
+    phase_2 = store.create_phase(roadmap_id, 2, "Phase 2", None)
+    task_11 = store.create_task(roadmap_id, phase_1, "1.1", "Task 1", "desc")
+    task_21 = store.create_task(roadmap_id, phase_2, "2.1", "Task 2", "**Depends on:** 1.1")
+    store.complete_task(task_11, "done")
+    store.update_phase_status(phase_1, "failed")
+    store._conn.execute(
+        "INSERT INTO task_dependencies (blocked_task_id, blocker_task_id) VALUES (?, ?)",
+        (task_21, task_11),
+    )
+    store._conn.commit()
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._queue_ready_pending_tasks(project_id=None)
+
+    task = store.get_task(task_21)
+    phase = store.get_phase(phase_2)
+    assert task is not None
+    assert phase is not None
+    assert task["status"] == "queued"
+    assert phase["status"] == "executing"
 
 
 def test_dispatch_queued_creates_integration_branch_and_uses_as_base(
@@ -1625,6 +1761,64 @@ def test_check_phase_completion_queues_next_phase(
     assert next_task["status"] == "queued"
 
 
+def test_check_phase_completion_verifies_against_integration_branch_snapshot(
+    orchestrator_store: tuple[Store, Path],
+) -> None:
+    store, repo_root = orchestrator_store
+    _init_git_repo(repo_root)
+
+    current_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert current_branch
+
+    project_id = store.create_project("proj-a", str(repo_root))
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Phase 1", "test -f integration-only.txt")
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Task 1", "desc")
+
+    integration_branch = f"yeehaw/roadmap-{roadmap_id}"
+    subprocess.run(
+        ["git", "branch", integration_branch, "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", integration_branch], cwd=repo_root, check=True, capture_output=True)
+    (repo_root / "integration-only.txt").write_text("ok\n")
+    subprocess.run(
+        ["git", "add", "integration-only.txt"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "integration sentinel"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", current_branch], cwd=repo_root, check=True, capture_output=True)
+    assert not (repo_root / "integration-only.txt").exists()
+
+    store.set_roadmap_integration_branch(roadmap_id, integration_branch)
+    store.complete_task(task_id, "done")
+
+    orchestrator = Orchestrator(store, repo_root)
+    orchestrator._check_phase_completion(phase_id)
+
+    phase = store.get_phase(phase_id)
+    roadmap = store.get_roadmap(roadmap_id)
+    assert phase is not None
+    assert roadmap is not None
+    assert phase["status"] == "completed"
+    assert roadmap["status"] == "completed"
+
+
 def test_queue_next_phase_does_not_auto_publish_when_feature_disabled(
     orchestrator_store: tuple[Store, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -1984,6 +2178,7 @@ def test_monitor_active_token_budget_breach_fails_task_with_alert(
     task = store.get_task(ids["task_id"])
     assert task is not None
     assert task["status"] == "failed"
+    assert task["tokens_used"] == 1500
     assert "Token budget exceeded" in str(task["last_failure"] or "")
     assert "1,500" in str(task["last_failure"] or "")
     assert "1,000" in str(task["last_failure"] or "")
@@ -1998,6 +2193,52 @@ def test_monitor_active_token_budget_breach_fails_task_with_alert(
     )
     assert not any(event["kind"] == "task_retry" for event in events)
     assert len(store.list_tasks(project_id=ids["project_id"])) == 1
+
+
+def test_monitor_active_token_budget_breach_uses_cumulative_attempt_logs(
+    orchestrator_store: tuple[Store, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, repo_root = orchestrator_store
+    ids = _seed_single_task(store)
+
+    signal_dir = repo_root / ".yeehaw" / "signals" / f"task-{ids['task_id']}"
+    signal_dir.mkdir(parents=True, exist_ok=True)
+    worktree = repo_root / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+
+    store.assign_task(
+        ids["task_id"],
+        agent="claude",
+        branch="b",
+        worktree=str(worktree),
+        signal_dir=str(signal_dir),
+    )
+    assert store.set_task_budget(ids["task_id"], max_tokens=1000, max_runtime_min=None) is True
+
+    log_dir = repo_root / ".yeehaw" / "logs" / f"task-{ids['task_id']}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "attempt-01-claude.log").write_text("Total tokens: 900\n")
+    (log_dir / "attempt-02-claude.log").write_text("Total tokens: 400\n")
+
+    monkeypatch.setattr(engine, "has_session", lambda _session: True)
+    monkeypatch.setattr(engine, "capture_pane", lambda _session: "")
+    monkeypatch.setattr(engine, "kill_session", lambda _session: None)
+    monkeypatch.setattr(engine, "cleanup_worktree", lambda *_args, **_kwargs: None)
+
+    orchestrator = Orchestrator(store, repo_root)
+    monkeypatch.setattr(orchestrator.signal_watcher, "get_ready_signals", lambda: [])
+    monkeypatch.setattr(orchestrator.signal_watcher, "poll_signals", lambda: [])
+    orchestrator._monitor_active(project_id=None)
+
+    task = store.get_task(ids["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+    assert task["tokens_used"] == 1300
+    assert "Token budget exceeded" in str(task["last_failure"] or "")
+    assert "1,300" in str(task["last_failure"] or "")
+    assert "1,000" in str(task["last_failure"] or "")
+    assert "attempt-02-claude.log" in str(task["last_failure"] or "")
 
 
 def test_merge_done_task_branch_rebases_then_merges(orchestrator_store: tuple[Store, Path]) -> None:

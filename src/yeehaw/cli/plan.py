@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from yeehaw.planner.session import start_planner_session
 from yeehaw.store.store import Store
 
 
-def handle_plan(args: Any, db_path: Path) -> None:
+def handle_plan(args: argparse.Namespace, db_path: Path) -> None:
     """Launch planner agent session backed by yeehaw MCP tools."""
     briefing_arg = getattr(args, "briefing", None)
     project_name = getattr(args, "project", None)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import json
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ from yeehaw.agent.profiles import AGENT_REGISTRY
 from yeehaw.agent.runtime_config import default_no_mcp_args, resolve_worker_launch_config
 
 
-def handle_workers(args: Any, db_path: Path) -> None:
+def handle_workers(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw workers` subcommands."""
     if args.workers_command == "show":
         _show_workers(db_path.parent)

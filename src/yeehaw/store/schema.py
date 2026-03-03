@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS tasks (
                     CHECK (max_tokens IS NULL OR max_tokens > 0),
     max_runtime_min INTEGER
                     CHECK (max_runtime_min IS NULL OR max_runtime_min > 0),
+    tokens_used     INTEGER
+                    CHECK (tokens_used IS NULL OR tokens_used >= 0),
     last_failure    TEXT,
     started_at      TEXT,
     completed_at    TEXT,
@@ -251,6 +253,8 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
                                 CHECK (max_tokens IS NULL OR max_tokens > 0),
                 max_runtime_min INTEGER
                                 CHECK (max_runtime_min IS NULL OR max_runtime_min > 0),
+                tokens_used     INTEGER
+                                CHECK (tokens_used IS NULL OR tokens_used >= 0),
                 last_failure    TEXT,
                 started_at      TEXT,
                 completed_at    TEXT,
@@ -264,7 +268,7 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
             INSERT INTO tasks (
                 id, roadmap_id, phase_id, task_number, title, description, status,
                 assigned_agent, branch_name, worktree_path, signal_dir,
-                attempts, max_attempts, max_tokens, max_runtime_min,
+                attempts, max_attempts, max_tokens, max_runtime_min, tokens_used,
                 last_failure, started_at, completed_at, created_at, updated_at
             )
             SELECT id,
@@ -286,6 +290,7 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
                    max_attempts,
                    NULL,
                    NULL,
+                   NULL,
                    last_failure,
                    started_at,
                    completed_at,
@@ -301,7 +306,7 @@ def _migrate_tasks_add_paused_status(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_tasks_add_budget_columns(conn: sqlite3.Connection) -> None:
-    """Add per-task budget metadata columns when missing."""
+    """Add per-task budget and token usage columns when missing."""
     if not _table_exists(conn, "tasks"):
         return
 
@@ -312,6 +317,9 @@ def _migrate_tasks_add_budget_columns(conn: sqlite3.Connection) -> None:
         changed = True
     if "max_runtime_min" not in columns:
         conn.execute("ALTER TABLE tasks ADD COLUMN max_runtime_min INTEGER")
+        changed = True
+    if "tokens_used" not in columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN tokens_used INTEGER")
         changed = True
     if changed:
         conn.commit()

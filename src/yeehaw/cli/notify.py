@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import json
 from pathlib import Path
 from typing import Any
@@ -18,7 +20,7 @@ NOTIFICATIONS_CONFIG_DIR = "config"
 NOTIFICATIONS_SINK_CONFIG = "notifications.json"
 
 
-def handle_notify(args: Any, db_path: Path) -> None:
+def handle_notify(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw notify` subcommands."""
     config_path = _notification_config_path(db_path)
 

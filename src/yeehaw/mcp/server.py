@@ -407,11 +407,7 @@ def update_task(
             store.queue_task(task_id)
 
     if assigned_agent and task.get("status") == "pending":
-        store._conn.execute(
-            "UPDATE tasks SET assigned_agent = ?, updated_at = ? WHERE id = ?",
-            (assigned_agent, store._now(), task_id),
-        )
-        store._conn.commit()
+        store.update_task_agent(task_id, assigned_agent)
 
     return {"task_id": task_id, "updated": True}
 

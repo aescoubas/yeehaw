@@ -7,10 +7,11 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from yeehaw.roadmap.dependencies import parse_task_dependencies
 from yeehaw.store.schema import init_db
+from yeehaw.store.types import TaskRow
 
 if TYPE_CHECKING:
     from yeehaw.roadmap.parser import Roadmap, Task
@@ -48,6 +49,13 @@ class Store:
             return None
         return dict(row)
 
+    def _task_row_to_dict(self, row: sqlite3.Row | None) -> TaskRow | None:
+        """Convert a sqlite row into the typed task mapping."""
+        record = self._row_to_dict(row)
+        if record is None:
+            return None
+        return cast(TaskRow, record)
+
     @staticmethod
     def _decode_conflict_files(raw: Any) -> list[str]:
         if not isinstance(raw, str) or not raw:
@@ -82,6 +90,17 @@ class Store:
             raise ValueError(f"{field} must be an integer >= 1")
         if value < 1:
             raise ValueError(f"{field} must be >= 1")
+        return value
+
+    @staticmethod
+    def _validate_token_usage_value(value: int | None) -> int | None:
+        """Validate optional non-negative integer token usage metadata."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("tokens_used must be an integer >= 0")
+        if value < 0:
+            raise ValueError("tokens_used must be >= 0")
         return value
 
     def create_project(self, name: str, repo_root: str) -> int:
@@ -367,7 +386,7 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def list_tasks_by_phase(self, phase_id: int) -> list[dict[str, Any]]:
+    def list_tasks_by_phase(self, phase_id: int) -> list[TaskRow]:
         """List tasks for a phase in task-number order."""
         return self._list_tasks_for_phase(phase_id)
 
@@ -519,7 +538,55 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def get_task(self, task_id: int) -> dict[str, Any] | None:
+    def get_task_token_usage(self, task_id: int) -> int | None:
+        """Return persisted cumulative token usage for one task."""
+        row = self._conn.execute(
+            "SELECT tokens_used FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["tokens_used"] is None:
+            return None
+        return int(row["tokens_used"])
+
+    def set_task_token_usage(
+        self,
+        task_id: int,
+        tokens_used: int | None,
+        *,
+        only_increase: bool = True,
+    ) -> bool:
+        """Persist token usage for one task.
+
+        When `only_increase` is True, updates that would lower an existing value are ignored.
+        """
+        normalized_tokens = self._validate_token_usage_value(tokens_used)
+        row = self._conn.execute(
+            "SELECT tokens_used FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+
+        current_tokens = int(row["tokens_used"]) if row["tokens_used"] is not None else None
+        if (
+            only_increase
+            and current_tokens is not None
+            and normalized_tokens is not None
+            and normalized_tokens < current_tokens
+        ):
+            normalized_tokens = current_tokens
+
+        if current_tokens == normalized_tokens:
+            return False
+
+        cur = self._conn.execute(
+            "UPDATE tasks SET tokens_used = ? WHERE id = ?",
+            (normalized_tokens, task_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_task(self, task_id: int) -> TaskRow | None:
         """Get task plus project metadata."""
         row = self._conn.execute(
             "SELECT t.*, r.status as roadmap_status, r.integration_branch as roadmap_integration_branch, "
@@ -531,13 +598,13 @@ class Store:
             "WHERE t.id = ?",
             (task_id,),
         ).fetchone()
-        return self._row_to_dict(row)
+        return self._task_row_to_dict(row)
 
     def list_tasks(
         self,
         project_id: int | None = None,
         status: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[TaskRow]:
         """List tasks, optionally filtered by project and status."""
         query = (
             "SELECT t.*, r.status as roadmap_status, r.integration_branch as roadmap_integration_branch, "
@@ -557,7 +624,7 @@ class Store:
             params.append(status)
         query += " ORDER BY t.task_number"
         rows = self._conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
+        return [cast(TaskRow, dict(r)) for r in rows]
 
     def assign_task(
         self,
@@ -602,6 +669,15 @@ class Store:
             (self._now(), task_id),
         )
         self._conn.commit()
+
+    def update_task_agent(self, task_id: int, agent: str) -> bool:
+        """Update assigned agent for a task."""
+        cur = self._conn.execute(
+            "UPDATE tasks SET assigned_agent = ?, updated_at = ? WHERE id = ?",
+            (agent, self._now(), task_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def reset_task_attempts(self, task_id: int) -> bool:
         """Reset retry attempt metadata for a task."""
@@ -1315,13 +1391,13 @@ class Store:
                 return cycle
         return []
 
-    def _list_tasks_for_phase(self, phase_id: int) -> list[dict[str, Any]]:
+    def _list_tasks_for_phase(self, phase_id: int) -> list[TaskRow]:
         """List tasks for one phase in stable numeric order."""
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE phase_id = ?",
             (phase_id,),
         ).fetchall()
-        tasks = [dict(row) for row in rows]
+        tasks = [cast(TaskRow, dict(row)) for row in rows]
         tasks.sort(
             key=lambda task: self._task_sort_key(
                 str(task["task_number"]),
@@ -1377,7 +1453,7 @@ class Store:
     def _build_reconcile_description(
         self,
         *,
-        failed_task: dict[str, Any],
+        failed_task: TaskRow,
         failure_threshold: int,
         observed_attempts: int,
         failure_messages: list[str],

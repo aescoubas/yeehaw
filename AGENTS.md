@@ -85,9 +85,25 @@ src/yeehaw/          # Main package
 tests/               # pytest test suite
 ```
 
+Implementation reference:
+- `docs/plans/IMPLEMENTATION.md` contains full module-level behavior, CLI contract, implementation phases, and acceptance criteria.
+
 When writing code, follow these conventions:
 - Type hints on all function signatures
 - Dataclasses for structured data
 - `pathlib.Path` instead of string paths
 - `subprocess.run()` with `capture_output=True` for shell commands
 - No global mutable state; pass dependencies explicitly
+
+## Reliability Expectations
+
+- Preserve signal robustness behavior (debounce + parse retries) in `signal/protocol.py`.
+- Preserve orchestrator single-instance enforcement (PID lock) and graceful shutdown semantics.
+- Preserve retry behavior and phase-advancement logic in orchestrator dispatch flow.
+- Keep SQLite concurrency safeguards enabled (WAL mode and busy timeout).
+
+## Quality Gates
+
+- Run verification commands from the assigned task prompt before writing the completion signal.
+- At minimum run `uv run --extra dev pytest -q` for behavioral changes.
+- For broad changes, run coverage (`uv run --extra dev pytest --cov=yeehaw --cov-report=term`) and keep coverage at or above the project target (80%+).

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-import re
 import signal
 import subprocess
 import threading
@@ -39,6 +38,8 @@ from yeehaw.scm import (
 )
 from yeehaw.signal.protocol import SignalWatcher, read_signal
 from yeehaw.store.store import Store
+from yeehaw.task_repo import resolve_task_repo_root
+from yeehaw.token_usage import parse_tokens_used
 from yeehaw.tmux.session import (
     capture_pane,
     has_session,
@@ -61,40 +62,10 @@ NOTIFICATION_EVENT_TASK_RETRIES_EXHAUSTED = "task_retries_exhausted"
 NOTIFICATION_EVENT_PHASE_COMPLETED = "phase_completed"
 NOTIFICATION_EVENT_ROADMAP_COMPLETED = "roadmap_completed"
 NOTIFICATION_EVENT_DAEMON_FAILURE = "daemon_failure"
-TOKEN_SCAN_WINDOW_LINES = 400
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 GITHUB_OWNER_ENV = "YEEHAW_GITHUB_OWNER"
 GITHUB_REPO_ENV = "YEEHAW_GITHUB_REPO"
 GITHUB_TOKEN_ENV = "YEEHAW_GITHUB_TOKEN"
 GITHUB_API_BASE_URL_ENV = "YEEHAW_GITHUB_API_BASE_URL"
-TOTAL_TOKEN_PATTERNS = (
-    re.compile(r"\btokens?\s+used\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btotal\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btokens?\s+total\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btoken\s+usage\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"totalTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"totalTokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"total_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-INPUT_TOKEN_PATTERNS = (
-    re.compile(r"\binput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bprompt\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"inputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"promptTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"input_tokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"prompt_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-OUTPUT_TOKEN_PATTERNS = (
-    re.compile(r"\boutput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bcompletion\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bcandidate(?:s)?\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"outputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"completionTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"candidatesTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"output_tokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"completion_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-TOKEN_LINE_RE = re.compile(r"^\s*([0-9][0-9,]*)\s*$")
 
 
 @dataclass(frozen=True)
@@ -172,8 +143,102 @@ class Orchestrator:
 
     def _tick(self, project_id: int | None) -> None:
         self._monitor_active(project_id)
+        self._queue_ready_pending_tasks(project_id)
         self._dispatch_queued(project_id)
         self._poll_counter += 1
+
+    def _queue_ready_pending_tasks(self, project_id: int | None) -> None:
+        """Promote dependency-ready pending tasks in active phases.
+
+        A phase is treated as active when it is already marked executing, or when
+        any task in that phase has left the pending state. This self-heals stale
+        phase status after manual recovery actions and keeps dependency chains
+        advancing without requiring manual re-queue operations.
+        """
+        pending_tasks = self.store.list_tasks(project_id=project_id, status="pending")
+        if not pending_tasks:
+            return
+
+        phase_cache: dict[int, dict[str, Any] | None] = {}
+        phase_tasks_cache: dict[int, list[dict[str, Any]]] = {}
+        roadmap_phases_cache: dict[int, list[dict[str, Any]]] = {}
+
+        for task in pending_tasks:
+            phase_id = int(task["phase_id"])
+            phase = phase_cache.get(phase_id)
+            if phase_id not in phase_cache:
+                phase = self.store.get_phase(phase_id)
+                phase_cache[phase_id] = phase
+            if phase is None:
+                continue
+
+            phase_tasks = phase_tasks_cache.get(phase_id)
+            if phase_tasks is None:
+                phase_tasks = self.store.list_tasks_by_phase(phase_id)
+                phase_tasks_cache[phase_id] = phase_tasks
+
+            phase_status = str(phase.get("status") or "pending")
+            if phase_status == "completed":
+                continue
+
+            phase_active = phase_status == "executing" or any(
+                str(candidate.get("status")) != "pending" for candidate in phase_tasks
+            )
+            if not phase_active and self._phase_has_done_predecessor(
+                phase=phase,
+                phase_tasks_cache=phase_tasks_cache,
+                roadmap_phases_cache=roadmap_phases_cache,
+            ):
+                phase_active = True
+            if not phase_active:
+                continue
+
+            if phase_status in {"pending", "failed"}:
+                self.store.update_phase_status(phase_id, "executing")
+                phase["status"] = "executing"
+                phase_status = "executing"
+
+            task_id = int(task["id"])
+            if not self.store.are_task_dependencies_satisfied(task_id):
+                continue
+
+            self.store.queue_task(task_id)
+
+            for candidate in phase_tasks:
+                if int(candidate["id"]) == task_id:
+                    candidate["status"] = "queued"
+                    break
+
+    def _phase_has_done_predecessor(
+        self,
+        *,
+        phase: dict[str, Any],
+        phase_tasks_cache: dict[int, list[dict[str, Any]]],
+        roadmap_phases_cache: dict[int, list[dict[str, Any]]],
+    ) -> bool:
+        """Return True when the immediately previous phase has all tasks done."""
+        roadmap_id = int(phase["roadmap_id"])
+        phases = roadmap_phases_cache.get(roadmap_id)
+        if phases is None:
+            phases = self.store.list_phases(roadmap_id)
+            roadmap_phases_cache[roadmap_id] = phases
+
+        current_number = int(phase["phase_number"])
+        predecessor = next(
+            (candidate for candidate in phases if int(candidate["phase_number"]) == current_number - 1),
+            None,
+        )
+        if predecessor is None:
+            return False
+
+        predecessor_id = int(predecessor["id"])
+        predecessor_tasks = phase_tasks_cache.get(predecessor_id)
+        if predecessor_tasks is None:
+            predecessor_tasks = self.store.list_tasks_by_phase(predecessor_id)
+            phase_tasks_cache[predecessor_id] = predecessor_tasks
+        if not predecessor_tasks:
+            return False
+        return all(str(task.get("status")) == "done" for task in predecessor_tasks)
 
     def _monitor_active(self, project_id: int | None) -> None:
         for signal_path in self.signal_watcher.get_ready_signals():
@@ -186,6 +251,7 @@ class Orchestrator:
         active = self.store.list_tasks(project_id=project_id, status="in-progress")
         for task in active:
             session = f"yeehaw-task-{task['id']}"
+            observed_tokens = self._refresh_task_token_usage(task)
 
             if not has_session(session):
                 signal_dir = Path(task["signal_dir"])
@@ -211,7 +277,7 @@ class Orchestrator:
                 self._handle_timeout(task, session)
                 continue
 
-            token_violation = self._token_budget_violation(task)
+            token_violation = self._token_budget_violation(task, observed_tokens=observed_tokens)
             if token_violation is not None:
                 max_tokens, observed_tokens = token_violation
                 self._handle_token_budget_exceeded(
@@ -232,6 +298,7 @@ class Orchestrator:
         if task is None or task["status"] != "in-progress":
             return
 
+        self._refresh_task_token_usage(task)
         session = f"yeehaw-task-{task['id']}"
 
         if data["status"] == "done":
@@ -355,6 +422,10 @@ class Orchestrator:
         try:
             task_repo_root = self._task_repo_root(task)
             profile = resolve_profile(task.get("assigned_agent") or self.default_agent)
+            if not profile.is_available():
+                raise ValueError(
+                    f"Agent binary '{profile.executable()}' for profile '{profile.name}' is not in PATH"
+                )
             worker_cfg = resolve_worker_launch_config(self.runtime_root, profile.name)
             integration_branch = self._ensure_integration_branch(task)
             branch = str(task.get("branch_name") or branch_name(task["task_number"], task["title"]))
@@ -1009,19 +1080,25 @@ class Orchestrator:
             return None
         return (max_runtime_min, elapsed_seconds)
 
-    def _token_budget_violation(self, task: dict[str, Any]) -> tuple[int, int] | None:
+    def _token_budget_violation(
+        self,
+        task: dict[str, Any],
+        *,
+        observed_tokens: int | None = None,
+    ) -> tuple[int, int] | None:
         """Return token budget breach details when configured and exceeded."""
         max_tokens = self._as_int(task.get("max_tokens"))
         if max_tokens is None or max_tokens < 1:
             return None
-        latest_log = self._latest_task_log_path(int(task["id"]))
-        if latest_log is None:
+        resolved_tokens = observed_tokens
+        if resolved_tokens is None:
+            resolved_tokens = self._as_int(task.get("tokens_used"))
+        if resolved_tokens is None:
+            resolved_tokens = self._refresh_task_token_usage(task)
+        if resolved_tokens is None:
             return None
-        try:
-            content = latest_log.read_text(errors="replace")
-        except OSError:
-            return None
-        observed_tokens = self._parse_tokens_used(content)
+        self.store.set_task_token_usage(int(task["id"]), resolved_tokens, only_increase=True)
+        observed_tokens = resolved_tokens
         if observed_tokens is None:
             return None
         if observed_tokens <= max_tokens:
@@ -1131,6 +1208,7 @@ class Orchestrator:
         failure_msg = (
             f"Token budget exceeded: used {observed_tokens:,} tokens > limit {max_tokens:,} tokens"
         )
+        self.store.set_task_token_usage(int(task["id"]), observed_tokens, only_increase=True)
         latest_log = self._latest_task_log_path(task["id"])
         if latest_log is not None:
             failure_msg = f"{failure_msg}. Check log: {latest_log}"
@@ -1263,17 +1341,9 @@ class Orchestrator:
             return
         if all(task["status"] == "done" for task in tasks):
             phase = self.store.get_phase(phase_id)
-            verify_repo_root = self._phase_repo_root(phase_id)
             if phase and phase.get("verify_cmd"):
-                result = subprocess.run(
-                    phase["verify_cmd"],
-                    shell=True,
-                    cwd=verify_repo_root,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-                status = "completed" if result.returncode == 0 else "failed"
+                verified = self._run_phase_verification(phase_id, str(phase["verify_cmd"]))
+                status = "completed" if verified else "failed"
             else:
                 status = "completed"
             self.store.update_phase_status(phase_id, status)
@@ -1380,6 +1450,23 @@ class Orchestrator:
                 project_repo_root=Path(project_repo_root),
                 integration_branch=integration_branch,
             )
+
+    def _run_phase_verification(self, phase_id: int, verify_cmd: str) -> bool:
+        """Run phase verification, preferring an integration-branch worktree snapshot."""
+        verify_repo_root, cleanup_ctx = self._phase_verification_root(phase_id)
+        try:
+            result = subprocess.run(
+                verify_cmd,
+                shell=True,
+                cwd=verify_repo_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return result.returncode == 0
+        finally:
+            if cleanup_ctx is not None:
+                cleanup_worktree(cleanup_ctx["repo_root"], cleanup_ctx["worktree_path"])
 
     def _ensure_integration_branch(self, task: dict[str, Any]) -> str:
         """Ensure roadmap integration branch exists and return its name."""
@@ -1935,13 +2022,45 @@ class Orchestrator:
         return logs_root / f"attempt-{attempt:02d}-{agent}.log"
 
     def _latest_task_log_path(self, task_id: int) -> Path | None:
+        log_paths = self._task_log_paths(task_id)
+        if not log_paths:
+            return None
+        return log_paths[-1]
+
+    def _task_log_paths(self, task_id: int) -> list[Path]:
         logs_root = self.runtime_root / "logs" / f"task-{task_id}"
         if not logs_root.exists():
-            return None
+            return []
         candidates = sorted(logs_root.glob("attempt-*.log"))
-        if not candidates:
+        return [path for path in candidates if path.is_file()]
+
+    def _parse_task_tokens_used(self, task_id: int) -> int | None:
+        """Parse cumulative token usage from all attempt logs for one task."""
+        total_tokens = 0
+        found_usage = False
+        for log_path in self._task_log_paths(task_id):
+            try:
+                content = log_path.read_text(errors="replace")
+            except OSError:
+                continue
+            parsed = self._parse_tokens_used(content)
+            if parsed is None:
+                continue
+            found_usage = True
+            total_tokens += parsed
+        if not found_usage:
             return None
-        return candidates[-1]
+        return total_tokens
+
+    def _refresh_task_token_usage(self, task: dict[str, Any]) -> int | None:
+        """Refresh persisted token usage from task logs and return latest known value."""
+        task_id = int(task["id"])
+        observed = self._parse_task_tokens_used(task_id)
+        if observed is None:
+            return self._as_int(task.get("tokens_used"))
+        self.store.set_task_token_usage(task_id, observed, only_increase=True)
+        task["tokens_used"] = observed
+        return observed
 
     def _write_pane_snapshot(self, task_id: int, pane_text: str, kind: str) -> Path:
         logs_root = self.runtime_root / "logs" / f"task-{task_id}"
@@ -1954,57 +2073,11 @@ class Orchestrator:
     @staticmethod
     def _parse_tokens_used(text: str) -> int | None:
         """Parse token usage from task log output."""
-        clean = ANSI_ESCAPE_RE.sub("", text)
-        lines = clean.splitlines()[-TOKEN_SCAN_WINDOW_LINES:]
-        tail = "\n".join(lines)
-
-        total = Orchestrator._last_pattern_value(tail, TOTAL_TOKEN_PATTERNS)
-        if total is not None:
-            return total
-
-        for idx in range(len(lines) - 1, -1, -1):
-            line = lines[idx]
-            if "tokens used" not in line.lower():
-                continue
-            for next_idx in range(idx + 1, min(idx + 4, len(lines))):
-                match = TOKEN_LINE_RE.match(lines[next_idx])
-                if match is None:
-                    continue
-                parsed = Orchestrator._parse_int_token(match.group(1))
-                if parsed is not None:
-                    return parsed
-
-        input_tokens = Orchestrator._last_pattern_value(tail, INPUT_TOKEN_PATTERNS)
-        output_tokens = Orchestrator._last_pattern_value(tail, OUTPUT_TOKEN_PATTERNS)
-        if input_tokens is not None and output_tokens is not None:
-            return input_tokens + output_tokens
-        return None
-
-    @staticmethod
-    def _parse_int_token(value: str) -> int | None:
-        normalized = value.replace(",", "").replace("_", "").strip()
-        if not normalized.isdigit():
-            return None
-        return int(normalized)
-
-    @staticmethod
-    def _last_pattern_value(text: str, patterns: tuple[re.Pattern[str], ...]) -> int | None:
-        best: tuple[int, int] | None = None
-        for pattern in patterns:
-            for match in pattern.finditer(text):
-                parsed = Orchestrator._parse_int_token(match.group(1))
-                if parsed is None:
-                    continue
-                if best is None or match.start() > best[0]:
-                    best = (match.start(), parsed)
-        return None if best is None else best[1]
+        return parse_tokens_used(text)
 
     def _task_repo_root(self, task: dict[str, Any]) -> Path:
         """Resolve git repo root for a task from project metadata."""
-        candidate = task.get("project_repo_root")
-        if isinstance(candidate, str) and candidate:
-            return Path(candidate)
-        return self.repo_root
+        return resolve_task_repo_root(task, fallback=self.repo_root)
 
     def _phase_repo_root(self, phase_id: int) -> Path:
         """Resolve git repo root for phase verification."""
@@ -2015,6 +2088,44 @@ class Orchestrator:
         if first is None:
             return self.repo_root
         return self._task_repo_root(first)
+
+    def _phase_verification_root(
+        self,
+        phase_id: int,
+    ) -> tuple[Path, dict[str, Path] | None]:
+        """Return verification cwd and optional cleanup context for phase checks.
+
+        When the roadmap integration branch exists, phase verification runs in a
+        temporary detached worktree at that branch so commands validate merged
+        roadmap state (not the project's current main checkout).
+        """
+        phase_tasks = self.store.list_tasks_by_phase(phase_id)
+        if not phase_tasks:
+            return self.repo_root, None
+
+        first = self.store.get_task(int(phase_tasks[0]["id"]))
+        if first is None:
+            return self.repo_root, None
+
+        repo_root = self._task_repo_root(first)
+        integration_branch = first.get("roadmap_integration_branch")
+        if not isinstance(integration_branch, str) or not integration_branch:
+            return repo_root, None
+        if not self._git_branch_exists(repo_root, integration_branch):
+            return repo_root, None
+
+        verify_root = self.runtime_root / MERGE_WORKTREE_DIR / (
+            f"phase-verify-{phase_id}-{uuid4().hex[:8]}"
+        )
+        verify_root.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(verify_root), integration_branch],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return verify_root, {"repo_root": repo_root, "worktree_path": verify_root}
 
     def _task_verification_root(self, task: dict[str, Any]) -> Path:
         """Resolve verification cwd, preferring the task worktree when available."""

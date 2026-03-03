@@ -209,7 +209,7 @@ class TrivialConflictAutoResolver:
             ours_normalized = WHITESPACE_PATTERN.sub("", "".join(hunk.ours))
             theirs_normalized = WHITESPACE_PATTERN.sub("", "".join(hunk.theirs))
             if not ours_normalized and not theirs_normalized:
-                return False
+                continue
             if ours_normalized != theirs_normalized:
                 return False
         return True

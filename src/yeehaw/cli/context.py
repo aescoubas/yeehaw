@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import os
 import re
 import shlex
@@ -26,7 +28,7 @@ _TEMPLATED_SECTION_LABELS: tuple[str, ...] = (
 )
 
 
-def handle_context(args: Any, db_path: Path) -> None:
+def handle_context(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw context` subcommands."""
     project_name = _normalize_project_name(args.project)
     if project_name is None:

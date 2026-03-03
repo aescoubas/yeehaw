@@ -9,6 +9,24 @@ It provides:
 - Task monitoring (`status`, `logs`, `attach`, `alerts`).
 - MCP tools to inspect/update roadmaps and pause/resume tasks.
 
+## Architecture Snapshot
+
+Yeehaw runs a planner-worker loop:
+1. Ingest roadmap/planning input and persist tasks and phases in SQLite.
+2. Dispatch queued tasks to agent CLIs in isolated git worktrees + tmux sessions.
+3. Watch worker signal files and logs to track completion, retries, and failures.
+4. Advance roadmap phases when prerequisite tasks complete.
+5. Expose orchestration state and controls through CLI commands and MCP tools.
+
+Core technology decisions:
+- Python 3.12+ with stdlib `argparse` CLI.
+- `sqlite3` persistence (WAL mode + busy timeout for concurrent access).
+- `fastmcp` for planner/supervisor tool integration.
+- `watchdog` for file-based signal monitoring.
+- `tmux` and git worktrees for worker isolation.
+
+Detailed implementation reference: `docs/plans/IMPLEMENTATION.md`.
+
 ## Requirements
 
 - Python 3.12+
@@ -705,8 +723,25 @@ uv run yeehaw policy explain --task <task_id>
 
 ## Development
 
+Reference docs:
+- `docs/plans/IMPLEMENTATION.md` (full implementation guide + acceptance criteria)
+- `ARCHITECTURE/10-edge-cases.md` (failure handling details)
+- `ARCHITECTURE/11-testing.md` (test strategy)
+
 Run tests:
 
 ```bash
 uv run --extra dev pytest -q
+```
+
+Run with coverage:
+
+```bash
+uv run --extra dev pytest --cov=yeehaw --cov-report=term
+```
+
+Skip integration tests (git/tmux heavy):
+
+```bash
+uv run --extra dev pytest -m "not integration"
 ```

@@ -2,18 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-FEATURE_FLAG_NAMES: tuple[str, ...] = (
-    "hooks",
-    "policies",
-    "conflict_scheduler",
-    "trivial_conflict_resolver",
-    "budgets",
-    "notifications",
-    "pr_automation",
-    "memory_packs",
-)
+from dataclasses import dataclass, fields
 
 
 @dataclass(frozen=True)
@@ -28,3 +17,6 @@ class FeatureFlags:
     notifications: bool = False
     pr_automation: bool = False
     memory_packs: bool = False
+
+
+FEATURE_FLAG_NAMES: tuple[str, ...] = tuple(field.name for field in fields(FeatureFlags))

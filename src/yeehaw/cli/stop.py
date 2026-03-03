@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
 from yeehaw.git.worktree import cleanup_worktree
 from yeehaw.store.store import Store
+from yeehaw.task_repo import resolve_task_repo_root
 from yeehaw.tmux.session import has_session, kill_session
 
 
-def handle_stop(args: Any, db_path: Path) -> None:
+def handle_stop(args: argparse.Namespace, db_path: Path) -> None:
     """Stop one or all in-progress tasks and clean resources."""
     store = Store(db_path)
 
@@ -48,7 +51,5 @@ def handle_stop(args: Any, db_path: Path) -> None:
 
 def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
     """Resolve repo root for a task, falling back to the local harness repo."""
-    candidate = task.get("project_repo_root")
-    if isinstance(candidate, str) and candidate:
-        return Path(candidate)
-    return Path.cwd()
+    _ = db_path
+    return resolve_task_repo_root(task, fallback=Path.cwd())

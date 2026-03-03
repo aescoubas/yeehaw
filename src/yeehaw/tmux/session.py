@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 
 
@@ -64,8 +65,9 @@ def launch_agent(session_name: str, working_dir: str, command: str) -> None:
 
 def pipe_output(session_name: str, log_path: str) -> None:
     """Pipe tmux pane output to a log file."""
+    quoted_log_path = shlex.quote(log_path)
     subprocess.run(
-        ["tmux", "pipe-pane", "-o", "-t", session_name, f"cat >> {log_path}"],
+        ["tmux", "pipe-pane", "-o", "-t", session_name, f"cat >> {quoted_log_path}"],
         check=True,
         capture_output=True,
     )

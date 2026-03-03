@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import json as json_module
 import re
 import subprocess
@@ -9,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from yeehaw.task_repo import resolve_task_repo_root
+from yeehaw.token_usage import parse_tokens_used
 from yeehaw.store.store import Store
 
 TITLE_WIDTH = 35
@@ -35,42 +39,12 @@ RECONCILE_STATE_SOURCE_CLOSED = "source_closed"
 RECONCILE_ACTIVE_STATUSES = frozenset({"queued", "in-progress", "paused"})
 MERGE_DIAGNOSTIC_NA = "n/a"
 HOLD_REASON_OVERLAP_CONFLICT = "conflict_in_progress_overlap"
-TOKEN_SCAN_WINDOW_LINES = 400
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RECONCILE_SOURCE_TASK_ID_RE = re.compile(
     r"\*\*Reconcile Source Task ID:\*\*\s*([0-9]+)"
 )
 RECONCILE_SOURCE_TASK_NUMBER_RE = re.compile(
     r"\*\*Reconcile Source Task:\*\*\s*([Pp]?[0-9]+\.[0-9]+)\b"
 )
-TOTAL_TOKEN_PATTERNS = (
-    re.compile(r"\btokens?\s+used\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btotal\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btokens?\s+total\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\btoken\s+usage\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"totalTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"totalTokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"total_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-INPUT_TOKEN_PATTERNS = (
-    re.compile(r"\binput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bprompt\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"inputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"promptTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"input_tokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"prompt_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-OUTPUT_TOKEN_PATTERNS = (
-    re.compile(r"\boutput\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bcompletion\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r"\bcandidate(?:s)?\s+tokens?\b[^0-9]{0,20}([0-9][0-9,_]*)", re.IGNORECASE),
-    re.compile(r'"outputTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"completionTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"candidatesTokenCount"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"output_tokens"\s*:\s*([0-9][0-9,_]*)'),
-    re.compile(r'"completion_tokens"\s*:\s*([0-9][0-9,_]*)'),
-)
-TOKEN_LINE_RE = re.compile(r"^\s*([0-9][0-9,]*)\s*$")
 MERGE_DIAGNOSTIC_WHITESPACE_RE = re.compile(r"\s+")
 MERGE_CONFLICT_FILE_PREVIEW = 3
 
@@ -88,10 +62,8 @@ def _truncate_for_column(value: str, width: int) -> str:
 
 def _task_repo_root(task: dict[str, Any], db_path: Path) -> Path:
     """Resolve git repo root for a task."""
-    candidate = task.get("project_repo_root")
-    if isinstance(candidate, str) and candidate:
-        return Path(candidate)
-    return Path.cwd()
+    _ = db_path
+    return resolve_task_repo_root(task, fallback=Path.cwd())
 
 
 def _resolve_branch_state(repo_root: Path, branch_name: str, target_branch: str) -> str:
@@ -165,85 +137,50 @@ def _annotate_branch_states(tasks: list[dict[str, Any]], db_path: Path) -> None:
         task["branch_state"] = cache[key]
 
 
-def _latest_task_log_path(task_id: int, db_path: Path) -> Path | None:
-    """Return latest attempt log path for a task."""
+def _task_log_paths(task_id: int, db_path: Path) -> list[Path]:
+    """Return attempt log paths for one task in chronological order."""
     logs_root = db_path.parent / "logs" / f"task-{task_id}"
     if not logs_root.exists():
-        return None
+        return []
     candidates = sorted(logs_root.glob("attempt-*.log"))
-    if not candidates:
-        return None
-    return candidates[-1]
+    return [path for path in candidates if path.is_file()]
 
 
 def _parse_tokens_used(text: str) -> int | None:
     """Parse token usage from agent log text."""
-    clean = ANSI_ESCAPE_RE.sub("", text)
-    lines = clean.splitlines()[-TOKEN_SCAN_WINDOW_LINES:]
-    tail = "\n".join(lines)
-
-    total = _last_pattern_value(tail, TOTAL_TOKEN_PATTERNS)
-    if total is not None:
-        return total
-
-    for idx in range(len(lines) - 1, -1, -1):
-        line = lines[idx]
-        if "tokens used" not in line.lower():
-            continue
-        for next_idx in range(idx + 1, min(idx + 4, len(lines))):
-            match = TOKEN_LINE_RE.match(lines[next_idx])
-            if match:
-                parsed = _parse_int_token(match.group(1))
-                if parsed is not None:
-                    return parsed
-
-    input_tokens = _last_pattern_value(tail, INPUT_TOKEN_PATTERNS)
-    output_tokens = _last_pattern_value(tail, OUTPUT_TOKEN_PATTERNS)
-    if input_tokens is not None and output_tokens is not None:
-        return input_tokens + output_tokens
-
-    return None
-
-
-def _parse_int_token(value: str) -> int | None:
-    """Parse integer token values with optional separators."""
-    normalized = value.replace(",", "").replace("_", "").strip()
-    if not normalized.isdigit():
-        return None
-    return int(normalized)
-
-
-def _last_pattern_value(text: str, patterns: tuple[re.Pattern[str], ...]) -> int | None:
-    """Return the most recent numeric value matched by any regex in patterns."""
-    best: tuple[int, int] | None = None
-    for pattern in patterns:
-        for match in pattern.finditer(text):
-            parsed = _parse_int_token(match.group(1))
-            if parsed is None:
-                continue
-            if best is None or match.start() > best[0]:
-                best = (match.start(), parsed)
-    return None if best is None else best[1]
+    return parse_tokens_used(text)
 
 
 def _resolve_tokens_used(task: dict[str, Any], db_path: Path) -> int | None:
-    """Resolve observed token usage from latest task log."""
-    if task.get("status") != "in-progress":
+    """Resolve cumulative token usage for one task."""
+    persisted = task.get("tokens_used")
+    if isinstance(persisted, int) and not isinstance(persisted, bool) and persisted >= 0:
+        return int(persisted)
+
+    total_tokens = 0
+    found_usage = False
+    for log_path in _task_log_paths(int(task["id"]), db_path):
+        try:
+            content = log_path.read_text(errors="replace")
+        except OSError:
+            continue
+        parsed = _parse_tokens_used(content)
+        if parsed is None:
+            continue
+        found_usage = True
+        total_tokens += parsed
+    if not found_usage:
         return None
-    log_path = _latest_task_log_path(int(task["id"]), db_path)
-    if log_path is None:
-        return None
-    try:
-        content = log_path.read_text(errors="replace")
-    except OSError:
-        return None
-    return _parse_tokens_used(content)
+    return total_tokens
 
 
-def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path) -> None:
+def _annotate_token_usage(tasks: list[dict[str, Any]], db_path: Path, store: Store) -> None:
     """Attach token usage metadata for status rendering."""
     for task in tasks:
-        task["tokens_used"] = _resolve_tokens_used(task, db_path)
+        resolved_tokens = _resolve_tokens_used(task, db_path)
+        task["tokens_used"] = resolved_tokens
+        if isinstance(resolved_tokens, int):
+            store.set_task_token_usage(int(task["id"]), resolved_tokens, only_increase=True)
 
 
 def _parse_started_at(value: Any) -> datetime | None:
@@ -643,7 +580,7 @@ def _format_attempts(task: dict[str, Any]) -> str:
     return f"{attempts}/{max_attempts}"
 
 
-def handle_status(args: Any, db_path: Path) -> None:
+def handle_status(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw status` output."""
     store = Store(db_path)
     try:
@@ -660,7 +597,7 @@ def handle_status(args: Any, db_path: Path) -> None:
             key=lambda task: int(task["id"]),
         )
         _annotate_branch_states(tasks, db_path)
-        _annotate_token_usage(tasks, db_path)
+        _annotate_token_usage(tasks, db_path, store)
         _annotate_budget_metadata(tasks)
         _annotate_hold_metadata(tasks, store)
         _annotate_reconcile_metadata(tasks)
@@ -725,7 +662,7 @@ def handle_status(args: Any, db_path: Path) -> None:
         store.close()
 
 
-def handle_alerts(args: Any, db_path: Path) -> None:
+def handle_alerts(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw alerts` output and acknowledgements."""
     store = Store(db_path)
     try:

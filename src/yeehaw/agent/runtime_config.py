@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -123,7 +126,8 @@ def _codex_mcp_names_via_toml() -> list[str]:
         return []
     try:
         payload = tomllib.loads(config_path.read_text())
-    except (tomllib.TOMLDecodeError, OSError):
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse Codex MCP config %s: %s", config_path, exc)
         return []
 
     servers = payload.get("mcp_servers")

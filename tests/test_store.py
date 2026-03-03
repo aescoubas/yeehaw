@@ -117,6 +117,20 @@ def test_pause_and_resume_task(store: Store) -> None:
     assert paused_again["status"] == "paused"
 
 
+def test_update_task_agent(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    assert store.update_task_agent(task_id, "gemini") is True
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["assigned_agent"] == "gemini"
+
+    assert store.update_task_agent(999_999, "gemini") is False
+
+
 def test_task_budget_metadata_round_trip(store: Store) -> None:
     project_id = store.create_project("proj-a", "/tmp/repo-a")
     roadmap_id = store.create_roadmap(project_id, "# Roadmap")
@@ -166,6 +180,33 @@ def test_task_budget_validation(store: Store) -> None:
     task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
     with pytest.raises(ValueError, match="max_runtime_min"):
         store.set_task_budget(task_id, max_tokens=500, max_runtime_min=0)
+
+
+def test_task_token_usage_round_trip(store: Store) -> None:
+    project_id = store.create_project("proj-a", "/tmp/repo-a")
+    roadmap_id = store.create_roadmap(project_id, "# Roadmap")
+    phase_id = store.create_phase(roadmap_id, 1, "Foundation", None)
+    task_id = store.create_task(roadmap_id, phase_id, "1.1", "Build", "desc")
+
+    assert store.get_task_token_usage(task_id) is None
+
+    assert store.set_task_token_usage(task_id, 900) is True
+    assert store.get_task_token_usage(task_id) == 900
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["tokens_used"] == 900
+
+    assert store.set_task_token_usage(task_id, 850, only_increase=True) is False
+    assert store.get_task_token_usage(task_id) == 900
+
+    assert store.set_task_token_usage(task_id, 850, only_increase=False) is True
+    assert store.get_task_token_usage(task_id) == 850
+
+    assert store.set_task_token_usage(task_id, None, only_increase=False) is True
+    assert store.get_task_token_usage(task_id) is None
+
+    with pytest.raises(ValueError, match="tokens_used"):
+        store.set_task_token_usage(task_id, -1)
 
 
 def test_create_roadmap_supersedes_previous_for_same_project(store: Store) -> None:

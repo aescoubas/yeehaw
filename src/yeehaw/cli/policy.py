@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from yeehaw.policy.checks import (
 from yeehaw.policy.loader import load_policy_pack
 from yeehaw.policy.models import PolicyPack
 from yeehaw.store.store import Store
+from yeehaw.task_repo import resolve_task_repo_root
 
 DEFAULT_TARGET_BRANCH = "main"
 POLICY_EVENT_KIND = "task_policy_violation"
@@ -32,7 +35,7 @@ class BuiltInCheckSpec:
     failure_codes: tuple[str, ...]
 
 
-def handle_policy(args: Any, db_path: Path) -> None:
+def handle_policy(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw policy` subcommands."""
     if args.policy_command == "lint":
         _handle_lint(project_name=str(args.project), db_path=db_path)
@@ -295,10 +298,7 @@ def _latest_policy_event_message(store: Store, *, task_id: int) -> str | None:
 
 def _task_repo_root(task: dict[str, Any]) -> Path:
     """Resolve repository root for policy git checks."""
-    candidate = task.get("project_repo_root")
-    if isinstance(candidate, str) and candidate:
-        return Path(candidate)
-    return Path.cwd()
+    return resolve_task_repo_root(task, fallback=Path.cwd())
 
 
 def _preview_values(values: tuple[str, ...], *, limit: int = 4) -> str:

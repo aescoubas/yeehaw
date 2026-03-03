@@ -126,6 +126,7 @@ def write_launcher(
     """Write a launcher script that feeds long prompts via heredoc."""
     extra_args = extra_args or []
     env = env or {}
+    delimiter = _heredoc_delimiter(prompt)
     command_parts = [
         *shlex.split(profile.command),
         *extra_args,
@@ -140,7 +141,7 @@ def write_launcher(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
         f"{env_exports}"
-        f"PROMPT=\"$(cat <<'YEEHAW_PROMPT_EOF'\n{prompt}\nYEEHAW_PROMPT_EOF\n)\"\n"
+        f"PROMPT=\"$(cat <<'{delimiter}'\n{prompt}\n{delimiter}\n)\"\n"
         f"exec {quoted_cmd} \"$PROMPT\"\n",
     )
     script_path.chmod(0o755)
@@ -149,3 +150,14 @@ def write_launcher(
 def _iso_now_placeholder() -> str:
     """Return template placeholder for ISO timestamp in prompts."""
     return "ISO-8601-timestamp-here"
+
+
+def _heredoc_delimiter(prompt: str) -> str:
+    """Generate a delimiter that is guaranteed not to occur in prompt."""
+    base = "YEEHAW_PROMPT_EOF"
+    delimiter = base
+    suffix = 0
+    while delimiter in prompt:
+        suffix += 1
+        delimiter = f"{base}_{suffix}"
+    return delimiter

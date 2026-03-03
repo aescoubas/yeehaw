@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import json
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ from yeehaw.runtime import runtime_config_path
 _BOOL_LITERALS: dict[str, bool] = {"true": True, "false": False}
 
 
-def handle_config(args: Any, db_path: Path) -> None:
+def handle_config(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw config` subcommands."""
     _ = db_path
     config_path = runtime_config_path()

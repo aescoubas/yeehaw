@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
 from yeehaw.store.store import Store
 
 
-def handle_scheduler(args: Any, db_path: Path) -> None:
+def handle_scheduler(args: argparse.Namespace, db_path: Path) -> None:
     """Handle scheduler config show/update commands."""
     store = Store(db_path)
     try:

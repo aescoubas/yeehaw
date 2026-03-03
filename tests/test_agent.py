@@ -11,7 +11,7 @@ from yeehaw.agent.launcher import (
     build_task_prompt,
     write_launcher,
 )
-from yeehaw.agent.profiles import resolve_profile
+from yeehaw.agent.profiles import AgentProfile, resolve_profile
 
 
 def test_resolve_profile_default_and_named() -> None:
@@ -20,6 +20,7 @@ def test_resolve_profile_default_and_named() -> None:
 
     assert default_profile.name == "claude"
     assert codex_profile.command.startswith("codex exec")
+    assert "--json" in codex_profile.command
     assert codex_profile.prompt_flag == ""
 
 
@@ -115,3 +116,29 @@ def test_write_launcher_creates_executable_script(tmp_path: Path) -> None:
     assert "YEEHAW_PROMPT_EOF" in content
     assert "exec gemini --model gemini-pro -p" in content
     assert script_path.stat().st_mode & 0o111
+
+
+def test_write_launcher_uses_unique_heredoc_delimiter_on_collision(tmp_path: Path) -> None:
+    script_path = tmp_path / "launch.sh"
+    profile = resolve_profile("codex")
+
+    write_launcher(
+        script_path,
+        profile,
+        "header\nYEEHAW_PROMPT_EOF\nfooter",
+    )
+
+    content = script_path.read_text()
+    assert "YEEHAW_PROMPT_EOF_1" in content
+    assert "<<'YEEHAW_PROMPT_EOF_1'" in content
+
+
+def test_agent_profile_availability_uses_executable_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = AgentProfile(name="demo", command="demo-cli --mode run", prompt_flag="-p")
+
+    monkeypatch.setattr("yeehaw.agent.profiles.shutil.which", lambda name: "/usr/bin/demo-cli")
+    assert profile.executable() == "demo-cli"
+    assert profile.is_available() is True
+
+    monkeypatch.setattr("yeehaw.agent.profiles.shutil.which", lambda name: None)
+    assert profile.is_available() is False

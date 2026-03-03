@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from yeehaw.orchestrator.engine import Orchestrator
 from yeehaw.store.store import Store
 
 
-def handle_run(args: Any, db_path: Path) -> None:
+def handle_run(args: argparse.Namespace, db_path: Path) -> None:
     """Launch orchestrator loop."""
     store = Store(db_path)
     repo_root = Path.cwd()

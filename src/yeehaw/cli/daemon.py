@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import os
 from pathlib import Path
 import shutil
@@ -10,7 +12,7 @@ import sys
 from typing import Any
 
 
-def handle_daemon(args: Any, db_path: Path) -> None:
+def handle_daemon(args: argparse.Namespace, db_path: Path) -> None:
     """Handle `yeehaw daemon` subcommands."""
     try:
         command = str(args.daemon_command)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from yeehaw.store.store import Store
 from yeehaw.tmux.session import attach_session, has_session
 
 
-def handle_attach(args: Any, db_path: Path) -> None:
+def handle_attach(args: argparse.Namespace, db_path: Path) -> None:
     """Attach terminal to the selected task's tmux session."""
     store = Store(db_path)
     try:

@@ -7,6 +7,8 @@ import re
 import subprocess
 from pathlib import Path
 
+GIT_SUBPROCESS_TIMEOUT_SEC = 60
+
 
 def branch_name(task_number: str, title: str) -> str:
     """Generate a sanitized git branch name for a task."""
@@ -31,6 +33,7 @@ def prepare_worktree(
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=repo_root,
             capture_output=True,
+            timeout=GIT_SUBPROCESS_TIMEOUT_SEC,
         )
 
     subprocess.run(
@@ -38,6 +41,7 @@ def prepare_worktree(
         cwd=repo_root,
         check=True,
         capture_output=True,
+        timeout=GIT_SUBPROCESS_TIMEOUT_SEC,
     )
 
     subprocess.run(
@@ -45,6 +49,7 @@ def prepare_worktree(
         cwd=repo_root,
         check=True,
         capture_output=True,
+        timeout=GIT_SUBPROCESS_TIMEOUT_SEC,
     )
 
     return worktree_path
@@ -56,11 +61,13 @@ def cleanup_worktree(repo_root: Path, worktree_path: Path) -> None:
         ["git", "worktree", "remove", "--force", str(worktree_path)],
         cwd=repo_root,
         capture_output=True,
+        timeout=GIT_SUBPROCESS_TIMEOUT_SEC,
     )
     subprocess.run(
         ["git", "worktree", "prune"],
         cwd=repo_root,
         capture_output=True,
+        timeout=GIT_SUBPROCESS_TIMEOUT_SEC,
     )
 
 
